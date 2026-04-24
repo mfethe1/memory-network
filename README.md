@@ -12,7 +12,7 @@ Project-memory summary: [`CLAUDE.md`](CLAUDE.md).
 
 First working vertical slice. `init`, `update`, `grep`, `symbol`, `query`,
 `doctor`, `watch`, `impact`, `tests`, `repo-map`, `embed`, `similar`,
-`ask`, `mcp-serve`, and `import-scip` are live. See
+`ask`, `mcp-serve`, `import-scip`, and `scip-python-index` are live. See
 [Known Limitations](#known-limitations).
 
 ## Quick start
@@ -38,6 +38,10 @@ python -m code_index query "chunk upsert" --limit 5
 
 # Import a SCIP semantic index exported as JSON
 python -m code_index import-scip --json-index index.scip.json
+
+# Or generate a Python SCIP sidecar index, then import the raw index.scip
+python -m code_index scip-python-index --project-name my-project
+python -m code_index import-scip --from .code_index/external/scip-python/index.scip
 
 # Literal / regex fast path (ripgrep when available, Python re fallback)
 python -m code_index grep "BM25" --ignore-case
@@ -118,14 +122,21 @@ Install on demand; the core CLI keeps working without them.
 `code_index doctor` reports which extras are installed and whether `ripgrep`
 and `ctags` are on PATH.
 
+External code-intelligence tools are optional sidecars:
+
+| Tool | Install | Unlocks |
+|---|---|---|
+| `scip-python` | `npm install -g @sourcegraph/scip-python` | `code_index scip-python-index` writes `.code_index/external/scip-python/index.scip` |
+| `scip` | Install from the SCIP releases | `import-scip --from index.scip` and `scip-python-index --import-index` |
+
 ## Known limitations
 
 Tracked as TODOs rather than silent gaps:
 
-- **SCIP ingestion is JSON-first.** `import-scip --json-index` can ingest
-  `scip print --json` output into the semantic spine. Running `scip-python`
-  and consuming raw `index.scip` are optional tool-backed paths, not required
-  for the core CLI.
+- **SCIP ingestion is an optional semantic sidecar.** `import-scip --json-index`
+  can ingest `scip print --json` output directly. Raw `index.scip` import
+  requires the `scip` CLI, and Python SCIP generation requires `scip-python`.
+  The stdlib AST parser remains the zero-dependency fallback.
 - **No Tree-sitter extraction.** Adapter is a scaffold; `query --ast`
   currently returns a clear error telling you what to install.
 - **No Universal Ctags extraction.** Detection is live in `doctor`; the

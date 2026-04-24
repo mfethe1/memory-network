@@ -184,7 +184,7 @@ def _external_tools_report() -> dict:
             "scip-python",
             commands=("scip-python",),
             role="Produce Python SCIP indexes using Pyright-backed semantic analysis.",
-            hint="Install with `npm install -g @sourcegraph/scip-python`; keep Python AST as the zero-dependency fallback.",
+            hint="Install with `npm install -g @sourcegraph/scip-python`; run `code_index scip-python-index` to write .code_index/external/scip-python/index.scip.",
         ),
         "ast_grep": _external_tool(
             "ast-grep",

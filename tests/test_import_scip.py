@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import textwrap
 from pathlib import Path
 
@@ -103,6 +105,21 @@ def _write_scip_json(root: Path) -> Path:
     return path
 
 
+def _write_fake_scip(tool_dir: Path) -> Path:
+    tool_dir.mkdir()
+    if os.name == "nt":
+        script = tool_dir / "scip.cmd"
+        script.write_text(
+            "@echo off\r\ntype \"%SCIP_FAKE_JSON%\"\r\n",
+            encoding="utf-8",
+        )
+    else:
+        script = tool_dir / "scip"
+        script.write_text("#!/bin/sh\ncat \"$SCIP_FAKE_JSON\"\n", encoding="utf-8")
+        script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return script
+
+
 def test_canonical_from_scip_symbol_parses_descriptor_path() -> None:
     assert canonical_from_scip_symbol(FOO_SYMBOL) == "pkg.mod.foo"
     assert canonical_from_scip_symbol(IMPL_SYMBOL) == "pkg.mod.Impl"
@@ -179,3 +196,40 @@ def test_import_scip_json_populates_semantic_spine(tmp_path: Path, capsys) -> No
         }
     finally:
         db_mod.close(conn)
+
+
+def test_import_scip_raw_index_uses_scip_cli(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _write_repo(tmp_path)
+    scip_json = _write_scip_json(tmp_path)
+    index_path = tmp_path / "index.scip"
+    index_path.write_bytes(b"fake binary payload")
+
+    tool_dir = tmp_path / "tools"
+    _write_fake_scip(tool_dir)
+    monkeypatch.setenv("SCIP_FAKE_JSON", str(scip_json))
+    monkeypatch.setenv(
+        "PATH", f"{tool_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+    )
+
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "import-scip",
+            "--root",
+            str(tmp_path),
+            "--from",
+            str(index_path),
+            "--json",
+        ]
+    )
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+
+    assert rc == 0
+    assert payload["source"] == str(index_path)
+    assert payload["stats"]["documents_seen"] == 1
+    assert payload["stats"]["symbols_upserted"] == 2

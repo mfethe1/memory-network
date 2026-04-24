@@ -24,6 +24,7 @@ from code_index.commands import (
     rebuild_tests_cmd,
     repo_map_cmd,
     similar_cmd,
+    scip_python_cmd,
     symbol_cmd,
     tests_cmd,
     update_cmd,
@@ -290,6 +291,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="path to index.scip; requires the `scip` CLI on PATH",
     )
     p_import_scip.set_defaults(func=import_scip_cmd.run)
+
+    p_scip_python = subparsers.add_parser(
+        "scip-python-index",
+        help="run scip-python into .code_index/external/scip-python/index.scip",
+    )
+    _add_common(p_scip_python)
+    p_scip_python.add_argument(
+        "--project-name",
+        help="project name passed to scip-python (default: repo directory name)",
+    )
+    p_scip_python.add_argument(
+        "--project-version",
+        help="optional project version passed to scip-python",
+    )
+    p_scip_python.add_argument(
+        "--project-namespace",
+        help="optional project namespace passed to scip-python",
+    )
+    p_scip_python.add_argument(
+        "--environment",
+        help="optional scip-python environment JSON path",
+    )
+    p_scip_python.add_argument(
+        "--target-only",
+        help="optional repo-relative subdirectory passed to scip-python",
+    )
+    p_scip_python.add_argument(
+        "--output-dir",
+        help="directory where index.scip should be written (default: .code_index/external/scip-python)",
+    )
+    p_scip_python.add_argument(
+        "--extra-arg",
+        action="append",
+        default=[],
+        help="additional argument to append to `scip-python index` (repeatable)",
+    )
+    p_scip_python.add_argument(
+        "--import-index",
+        action="store_true",
+        help="after generation, import index.scip via the `scip` CLI",
+    )
+    p_scip_python.set_defaults(func=scip_python_cmd.run)
 
     p_hooks = subparsers.add_parser(
         "install-hooks",
