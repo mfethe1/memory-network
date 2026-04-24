@@ -70,17 +70,66 @@ def test_edit_produces_edit_row_and_updated_hash(tmp_repo: Path):
         db_mod.close(conn)
 
 
-def test_file_delete_tombstones_chunks(tmp_repo: Path):
+def test_file_delete_tombstones_chunks_and_symbols(tmp_repo: Path):
     config, conn = _init(tmp_repo)
     try:
         reindex(conn, config, paths=None, event_source="init")
         (tmp_repo / "pkg" / "mod.py").unlink()
         stats = reindex(conn, config, paths=None, event_source="update")
         assert stats.chunks_tombstoned >= 1
+        assert stats.symbols_tombstoned >= 1
         tombstones = conn.execute(
             "SELECT COUNT(*) FROM chunks WHERE deleted_at IS NOT NULL"
         ).fetchone()[0]
         assert tombstones >= 1
+        assert not symbol_search.lookup(conn, "pkg.mod.greet")
+        assert not symbol_search.lookup(conn, "pkg.mod.Counter")
+    finally:
+        db_mod.close(conn)
+
+
+def test_targeted_delete_tombstones_file_chunks_and_symbols(tmp_repo: Path):
+    config, conn = _init(tmp_repo)
+    try:
+        reindex(conn, config, paths=None, event_source="init")
+        target = tmp_repo / "pkg" / "mod.py"
+        target.unlink()
+        stats = reindex(conn, config, paths=[target], event_source="update")
+        assert stats.files_seen == 0
+        assert stats.chunks_tombstoned >= 1
+        assert stats.symbols_tombstoned >= 1
+        row = conn.execute(
+            "SELECT deleted_at, parse_status FROM files WHERE file_path = ?",
+            ("pkg/mod.py",),
+        ).fetchone()
+        assert row["deleted_at"] is not None
+        assert row["parse_status"] == "deleted"
+        assert not symbol_search.lookup(conn, "pkg.mod.greet")
+        assert not symbol_search.lookup(conn, "pkg.mod.Counter")
+    finally:
+        db_mod.close(conn)
+
+
+def test_deleted_file_reindex_repairs_legacy_live_symbols(tmp_repo: Path):
+    config, conn = _init(tmp_repo)
+    try:
+        reindex(conn, config, paths=None, event_source="init")
+        target = tmp_repo / "pkg" / "mod.py"
+        target.unlink()
+        conn.execute(
+            """
+            UPDATE files
+               SET deleted_at = 'legacy', parse_status = 'deleted'
+             WHERE file_path = 'pkg/mod.py'
+            """
+        )
+        assert symbol_search.lookup(conn, "pkg.mod.greet")
+
+        stats = reindex(conn, config, paths=[target], event_source="update")
+
+        assert stats.symbols_tombstoned >= 1
+        assert not symbol_search.lookup(conn, "pkg.mod.greet")
+        assert not symbol_search.lookup(conn, "pkg.mod.Counter")
     finally:
         db_mod.close(conn)
 

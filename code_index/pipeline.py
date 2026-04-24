@@ -102,6 +102,26 @@ def _resolve_paths(
     ]
 
 
+def _missing_explicit_paths(config: Config, paths: list[Path] | None) -> set[str]:
+    """Return repo-relative paths explicitly requested but absent on disk."""
+    if not paths:
+        return set()
+    root = config.root.resolve()
+    missing: set[str] = set()
+    for raw in paths:
+        p = raw if raw.is_absolute() else (config.root / raw)
+        p = p.resolve()
+        if p.exists():
+            continue
+        try:
+            rel = p.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        if rel:
+            missing.add(rel)
+    return missing
+
+
 def _read_source(path: Path) -> tuple[str | None, bytes | None, str | None]:
     try:
         data = path.read_bytes()
@@ -609,6 +629,96 @@ def _apply_parsed_file(
                 diag.message,
                 now,
             ),
+        )
+
+
+def _tombstone_file(
+    conn: sqlite3.Connection,
+    *,
+    file_pk: int,
+    now: str,
+    event_source: str,
+    stats: ReindexStats,
+) -> None:
+    """Soft-delete a file and semantic state derived from its definitions."""
+    definition_rows = conn.execute(
+        """
+        SELECT DISTINCT symbol_pk
+          FROM occurrences
+         WHERE file_pk = ? AND role = 'definition'
+        """,
+        (file_pk,),
+    ).fetchall()
+    definition_pks = [int(row["symbol_pk"]) for row in definition_rows]
+
+    conn.execute(
+        "UPDATE files SET deleted_at = ?, parse_status = 'deleted' WHERE file_pk = ?",
+        (now, file_pk),
+    )
+    conn.execute("DELETE FROM diagnostics WHERE file_pk = ?", (file_pk,))
+    conn.execute("DELETE FROM unresolved_calls WHERE file_pk = ?", (file_pk,))
+    conn.execute("DELETE FROM occurrences WHERE file_pk = ?", (file_pk,))
+
+    for chunk_row in conn.execute(
+        """
+        SELECT chunk_pk, chunk_uid, raw_hash
+          FROM chunks
+         WHERE file_pk = ? AND deleted_at IS NULL
+        """,
+        (file_pk,),
+    ).fetchall():
+        conn.execute(
+            "UPDATE chunks SET deleted_at = ? WHERE chunk_pk = ?",
+            (now, chunk_row["chunk_pk"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO chunk_edits(
+                chunk_pk, chunk_uid, timestamp, event_source,
+                old_raw_hash, new_raw_hash, change_type, diff_summary
+            ) VALUES (?, ?, ?, ?, ?, NULL, 'delete', 'file deleted')
+            """,
+            (
+                chunk_row["chunk_pk"],
+                chunk_row["chunk_uid"],
+                now,
+                event_source,
+                chunk_row["raw_hash"],
+            ),
+        )
+        stats.chunks_tombstoned += 1
+        stats.edits_recorded += 1
+
+    for symbol_pk in definition_pks:
+        still_defined = conn.execute(
+            """
+            SELECT 1
+              FROM occurrences o
+              JOIN files f ON f.file_pk = o.file_pk
+             WHERE o.symbol_pk = ?
+               AND o.role = 'definition'
+               AND f.deleted_at IS NULL
+             LIMIT 1
+            """,
+            (symbol_pk,),
+        ).fetchone()
+        if still_defined is not None:
+            continue
+        cur = conn.execute(
+            """
+            UPDATE symbols
+               SET deleted_at = ?
+             WHERE symbol_pk = ? AND deleted_at IS NULL
+            """,
+            (now, symbol_pk),
+        )
+        if cur.rowcount:
+            stats.symbols_tombstoned += 1
+
+    if definition_pks:
+        conn.executemany(
+            "DELETE FROM relations WHERE src_symbol_pk = ?",
+            [(pk,) for pk in definition_pks],
         )
 
 
@@ -1674,6 +1784,7 @@ def _reindex_body(
         include_hidden=config.include_hidden,
     )
     targets = _resolve_paths(config, matcher, paths)
+    missing_explicit = _missing_explicit_paths(config, paths)
     stats = ReindexStats()
 
     # Git metadata resolver. Non-git repos get an always-disabled instance
@@ -1848,6 +1959,31 @@ def _reindex_body(
         else:
             stats.files_skipped += 1
 
+    # Targeted tombstone: explicit deleted file/dir paths from update --files
+    # and watch delete events.
+    if missing_explicit:
+        now = _now_iso()
+        for rel in sorted(missing_explicit):
+            prefix = rel.rstrip("/") + "/%"
+            rows = conn.execute(
+                """
+                SELECT file_pk, file_path
+                  FROM files
+                 WHERE file_path = ? OR file_path LIKE ?
+                """,
+                (rel, prefix),
+            ).fetchall()
+            for file_row in rows:
+                with transaction(conn):
+                    _tombstone_file(
+                        conn,
+                        file_pk=int(file_row["file_pk"]),
+                        now=now,
+                        event_source=event_source,
+                        stats=stats,
+                    )
+                touched_file_pks.add(int(file_row["file_pk"]))
+
     # Full-scan tombstone: only when no explicit path list was given.
     if paths is None:
         existing_paths = {
@@ -1866,35 +2002,36 @@ def _reindex_body(
                 ).fetchone()
                 if file_row is None:
                     continue
-                conn.execute(
-                    "UPDATE files SET deleted_at = ?, parse_status = 'deleted' WHERE file_pk = ?",
-                    (now, file_row["file_pk"]),
+                _tombstone_file(
+                    conn,
+                    file_pk=int(file_row["file_pk"]),
+                    now=now,
+                    event_source=event_source,
+                    stats=stats,
                 )
-                for chunk_row in conn.execute(
-                    "SELECT chunk_pk, chunk_uid, raw_hash FROM chunks WHERE file_pk = ? AND deleted_at IS NULL",
-                    (file_row["file_pk"],),
-                ).fetchall():
-                    conn.execute(
-                        "UPDATE chunks SET deleted_at = ? WHERE chunk_pk = ?",
-                        (now, chunk_row["chunk_pk"]),
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO chunk_edits(
-                            chunk_pk, chunk_uid, timestamp, event_source,
-                            old_raw_hash, new_raw_hash, change_type, diff_summary
-                        ) VALUES (?, ?, ?, ?, ?, NULL, 'delete', 'file deleted')
-                        """,
-                        (
-                            chunk_row["chunk_pk"],
-                            chunk_row["chunk_uid"],
-                            now,
-                            event_source,
-                            chunk_row["raw_hash"],
-                        ),
-                    )
-                    stats.chunks_tombstoned += 1
-                    stats.edits_recorded += 1
+
+    legacy_deleted_rows = conn.execute(
+        """
+        SELECT DISTINCT f.file_pk
+          FROM files f
+          JOIN occurrences o ON o.file_pk = f.file_pk
+          JOIN symbols s ON s.symbol_pk = o.symbol_pk
+         WHERE f.deleted_at IS NOT NULL
+           AND o.role = 'definition'
+           AND s.deleted_at IS NULL
+        """
+    ).fetchall()
+    if legacy_deleted_rows:
+        now = _now_iso()
+        for file_row in legacy_deleted_rows:
+            with transaction(conn):
+                _tombstone_file(
+                    conn,
+                    file_pk=int(file_row["file_pk"]),
+                    now=now,
+                    event_source=event_source,
+                    stats=stats,
+                )
 
     now = _now_iso()
     with transaction(conn):
