@@ -1,0 +1,110 @@
+{
+  "description": "Relevance benchmark queries against the code_index codebase. 'target' is the canonical_name the retrieval system should return as the best hit. 'category' tags the expected retrieval personality: literal (BM25 should dominate), semantic (embeddings should help), or mixed.",
+  "queries": [
+    {
+      "id": "q01",
+      "text": "symbol_uid hashing",
+      "target": "code_index.symbols.SymbolIdentity.symbol_uid",
+      "category": "literal",
+      "rationale": "Uses the exact symbol name and a content-word. BM25 should trivially hit."
+    },
+    {
+      "id": "q02",
+      "text": "writer_lock",
+      "target": "code_index.locking.writer_lock",
+      "category": "literal",
+      "rationale": "Bare identifier match. BM25 weight on symbol_name is 10x content."
+    },
+    {
+      "id": "q03",
+      "text": "normalized_hash function",
+      "target": "code_index.hashing.normalized_hash",
+      "category": "literal",
+      "rationale": "Identifier + generic word."
+    },
+    {
+      "id": "q04",
+      "text": "bm25 fts5 search over chunks",
+      "target": "code_index.search.fts.search",
+      "category": "literal",
+      "rationale": "Docstring-aligned keywords from fts.py."
+    },
+    {
+      "id": "q05",
+      "text": "apply_schema migration",
+      "target": "code_index.db.apply_schema",
+      "category": "literal",
+      "rationale": "Identifier-first query."
+    },
+    {
+      "id": "q06",
+      "text": "function that finds which files to index while respecting ignore rules",
+      "target": "code_index.scanner.iter_files",
+      "category": "semantic",
+      "rationale": "Natural-language description with no direct identifier overlap."
+    },
+    {
+      "id": "q07",
+      "text": "compute cosine similarity between a query vector and stored chunk vectors",
+      "target": "code_index.embeddings.store.search",
+      "category": "semantic",
+      "rationale": "Describes mechanism; function name is just 'search'."
+    },
+    {
+      "id": "q08",
+      "text": "how do we figure out what breaks when a function changes",
+      "target": "code_index.commands.impact_cmd.compute_impact",
+      "category": "semantic",
+      "rationale": "Blast-radius paraphrase with no term overlap with 'impact'."
+    },
+    {
+      "id": "q09",
+      "text": "backfill cross-file calls that could not be resolved on first parse",
+      "target": "code_index.pipeline._backfill_unresolved",
+      "category": "semantic",
+      "rationale": "Docstring paraphrase; identifier starts with underscore."
+    },
+    {
+      "id": "q10",
+      "text": "walk a BFS graph from test functions down to the symbol they exercise",
+      "target": "code_index.pipeline._rebuild_test_edges",
+      "category": "semantic",
+      "rationale": "Algorithmic description; no obvious identifier overlap."
+    },
+    {
+      "id": "q11",
+      "text": "auth token for MCP server",
+      "target": "code_index.commands.mcp_serve_cmd._validate_bearer",
+      "category": "mixed",
+      "rationale": "'MCP' and 'token' are literal; 'auth' is semantic for 'bearer'."
+    },
+    {
+      "id": "q12",
+      "text": "pipeline reindex entrypoint",
+      "target": "code_index.pipeline.reindex",
+      "category": "mixed",
+      "rationale": "Identifier + concept word."
+    },
+    {
+      "id": "q13",
+      "text": "class that decides whether a path matches gitignore patterns",
+      "target": "code_index.ignore.IgnoreMatcher",
+      "category": "mixed",
+      "rationale": "Concept description with one literal keyword ('gitignore')."
+    },
+    {
+      "id": "q14",
+      "text": "classify a natural-language question into an intent",
+      "target": "code_index.nl.classify.classify",
+      "category": "mixed",
+      "rationale": "Function name is 'classify'; description uses common words."
+    },
+    {
+      "id": "q15",
+      "text": "run the tests command and return affected pytest node ids",
+      "target": "code_index.commands.tests_cmd.run",
+      "category": "mixed",
+      "rationale": "'tests' and 'pytest node ids' are literal; 'affected' is concept."
+    }
+  ]
+}

@@ -1,0 +1,1397 @@
+{
+  "status": "ok",
+  "corpus": "self",
+  "limit": 20,
+  "repo_root": "E:\\Projects\\hackathon\\memory-claude",
+  "corpus_root": "E:\\Projects\\hackathon\\memory-claude\\bench\\embeddings\\.corpus\\self",
+  "embedding": {
+    "provider": "sentence-transformers",
+    "model": "BAAI/bge-small-en-v1.5",
+    "dimension": 384,
+    "prep": {
+      "status": "populated",
+      "populate_stats": {
+        "embedded": 630,
+        "errors": 0,
+        "batches": 20
+      },
+      "coverage": {
+        "total_chunks": 630,
+        "embedded_chunks": 630,
+        "stale_count": 0,
+        "coverage_pct": 100.0,
+        "dimensions": [
+          384
+        ]
+      },
+      "seconds": 5.23,
+      "provider": "sentence-transformers",
+      "model": "BAAI/bge-small-en-v1.5",
+      "dimension": 384
+    }
+  },
+  "aggregate": {
+    "overall": {
+      "bm25": {
+        "recall_at_1": 0.0,
+        "recall_at_5": 0.0,
+        "mrr": 0.0083,
+        "n": 15
+      },
+      "embeddings": {
+        "recall_at_1": 0.4667,
+        "recall_at_5": 0.7333,
+        "mrr": 0.6218,
+        "n": 15
+      },
+      "hybrid": {
+        "recall_at_1": 0.2667,
+        "recall_at_5": 0.6667,
+        "mrr": 0.4825,
+        "n": 15
+      }
+    },
+    "by_category": {
+      "bm25": {
+        "literal": {
+          "recall_at_1": 0.0,
+          "recall_at_5": 0.0,
+          "mrr": 0.025,
+          "n": 5
+        },
+        "mixed": {
+          "recall_at_1": 0.0,
+          "recall_at_5": 0.0,
+          "mrr": 0.0,
+          "n": 5
+        },
+        "semantic": {
+          "recall_at_1": 0.0,
+          "recall_at_5": 0.0,
+          "mrr": 0.0,
+          "n": 5
+        }
+      },
+      "embeddings": {
+        "literal": {
+          "recall_at_1": 0.8,
+          "recall_at_5": 1.0,
+          "mrr": 0.9,
+          "n": 5
+        },
+        "mixed": {
+          "recall_at_1": 0.4,
+          "recall_at_5": 0.6,
+          "mrr": 0.5487,
+          "n": 5
+        },
+        "semantic": {
+          "recall_at_1": 0.2,
+          "recall_at_5": 0.6,
+          "mrr": 0.4167,
+          "n": 5
+        }
+      },
+      "hybrid": {
+        "literal": {
+          "recall_at_1": 0.4,
+          "recall_at_5": 0.8,
+          "mrr": 0.5833,
+          "n": 5
+        },
+        "mixed": {
+          "recall_at_1": 0.2,
+          "recall_at_5": 0.6,
+          "mrr": 0.4476,
+          "n": 5
+        },
+        "semantic": {
+          "recall_at_1": 0.2,
+          "recall_at_5": 0.6,
+          "mrr": 0.4167,
+          "n": 5
+        }
+      }
+    }
+  },
+  "per_query": [
+    {
+      "id": "q01",
+      "text": "symbol_uid hashing",
+      "target": "code_index.symbols.SymbolIdentity.symbol_uid",
+      "category": "literal",
+      "bm25": {
+        "mode": "bm25",
+        "rank": null,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.symbols",
+            "chunk_uid": "b8a7629b8d2e3c6889cc",
+            "score": -6.2419152082010605
+          },
+          {
+            "symbol_path": "code_index.parsers.heuristic",
+            "chunk_uid": "1c54bab8cd771880b718",
+            "score": -5.601926592288323
+          },
+          {
+            "symbol_path": "code_index.parsers.python_ast",
+            "chunk_uid": "8ff29fc0b2dbe633bf87",
+            "score": -3.9204183823952277
+          },
+          {
+            "symbol_path": "code_index.pipeline",
+            "chunk_uid": "9ddc9b22499ec7be1181",
+            "score": -2.6059560106880664
+          }
+        ]
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": 2,
+        "seconds": 1.312,
+        "top5": [
+          {
+            "symbol_path": "code_index.hashing.short_uid",
+            "chunk_uid": "fe57beb615ed8762dbef",
+            "score": 0.7954638962365118
+          },
+          {
+            "symbol_path": "code_index.symbols.SymbolIdentity.symbol_uid",
+            "chunk_uid": "fd4267b19acfa6b8a3b3",
+            "score": 0.7826132693169499
+          },
+          {
+            "symbol_path": "code_index.symbols",
+            "chunk_uid": "b8a7629b8d2e3c6889cc",
+            "score": 0.7748183413475352
+          },
+          {
+            "symbol_path": "code_index.symbols.SymbolIdentity",
+            "chunk_uid": "72f34c9fd8215f694612",
+            "score": 0.7412592378539646
+          },
+          {
+            "symbol_path": "tests.test_hashing.test_short_uid_deterministic",
+            "chunk_uid": "f217dc4f94653e4a90de",
+            "score": 0.7346068544179492
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": 4,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.symbols",
+            "chunk_uid": "b8a7629b8d2e3c6889cc",
+            "score": 0.909094800329221
+          },
+          {
+            "symbol_path": "code_index.hashing.short_uid",
+            "chunk_uid": "fe57beb615ed8762dbef",
+            "score": 0.5
+          },
+          {
+            "symbol_path": "code_index.parsers.heuristic",
+            "chunk_uid": "1c54bab8cd771880b718",
+            "score": 0.49363885487241865
+          },
+          {
+            "symbol_path": "code_index.symbols.SymbolIdentity.symbol_uid",
+            "chunk_uid": "fd4267b19acfa6b8a3b3",
+            "score": 0.4434169334610034
+          },
+          {
+            "symbol_path": "code_index.symbols.SymbolIdentity",
+            "chunk_uid": "72f34c9fd8215f694612",
+            "score": 0.2613294813411491
+          }
+        ]
+      }
+    },
+    {
+      "id": "q02",
+      "text": "writer_lock",
+      "target": "code_index.locking.writer_lock",
+      "category": "literal",
+      "bm25": {
+        "mode": "bm25",
+        "rank": 8,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "tests.test_migration_repair.test_ensure_schema_slow_path_takes_writer_lock",
+            "chunk_uid": "bf458abe76179d7ae269",
+            "score": -5.888288723327582
+          },
+          {
+            "symbol_path": "tests.test_writer_lock_integration.test_mcp_rebuild_fts_tool_is_lock_guarded._tracker",
+            "chunk_uid": "0557e8e21d1f31c585f4",
+            "score": -5.807198670066119
+          },
+          {
+            "symbol_path": "tests.test_writer_lock._make_config",
+            "chunk_uid": "c0ec1fc4fa790735afd8",
+            "score": -5.798920175902285
+          },
+          {
+            "symbol_path": "tests.test_writer_lock.test_lock_released_even_on_exception",
+            "chunk_uid": "06a5852908c840709d3e",
+            "score": -5.797017274263906
+          },
+          {
+            "symbol_path": "tests.test_writer_lock.test_lock_is_acquired_and_released",
+            "chunk_uid": "e581120009c174a72c83",
+            "score": -5.794815106287955
+          }
+        ]
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": 1,
+        "seconds": 0.047,
+        "top5": [
+          {
+            "symbol_path": "code_index.locking.writer_lock",
+            "chunk_uid": "59a7ff9d6a1d659c5a58",
+            "score": 0.7909008434169469
+          },
+          {
+            "symbol_path": "code_index.locking.LockTimeoutError",
+            "chunk_uid": "daf1fed13908af03d55e",
+            "score": 0.7866235878296651
+          },
+          {
+            "symbol_path": "tests.test_migration_repair.test_ensure_schema_slow_path_takes_writer_lock",
+            "chunk_uid": "bf458abe76179d7ae269",
+            "score": 0.7801961271093897
+          },
+          {
+            "symbol_path": "code_index.locking",
+            "chunk_uid": "b4785aa6137b692d67c5",
+            "score": 0.7778713555759297
+          },
+          {
+            "symbol_path": "tests.test_writer_lock",
+            "chunk_uid": "e53f9a5494d30a01de84",
+            "score": 0.774531810609215
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": 1,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.locking.writer_lock",
+            "chunk_uid": "59a7ff9d6a1d659c5a58",
+            "score": 0.9630508048373678
+          },
+          {
+            "symbol_path": "tests.test_migration_repair.test_ensure_schema_slow_path_takes_writer_lock",
+            "chunk_uid": "bf458abe76179d7ae269",
+            "score": 0.9423958213580819
+          },
+          {
+            "symbol_path": "tests.test_writer_lock",
+            "chunk_uid": "e53f9a5494d30a01de84",
+            "score": 0.8749562374795721
+          },
+          {
+            "symbol_path": "tests.test_writer_lock_integration.test_mcp_update_tool_returns_error_on_lock_timeout",
+            "chunk_uid": "2dbd7fc39b88a125c985",
+            "score": 0.7598228693854157
+          },
+          {
+            "symbol_path": "tests.test_writer_lock_integration",
+            "chunk_uid": "f2629c29eafc938df826",
+            "score": 0.7261131976327988
+          }
+        ]
+      }
+    },
+    {
+      "id": "q03",
+      "text": "normalized_hash function",
+      "target": "code_index.hashing.normalized_hash",
+      "category": "literal",
+      "bm25": {
+        "mode": "bm25",
+        "rank": null,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.parsers.python_ast._walk",
+            "chunk_uid": "27b334aeac27317be9fe",
+            "score": -6.163635159630422
+          },
+          {
+            "symbol_path": "code_index.parsers.python_ast.PythonAstParser.parse",
+            "chunk_uid": "b508838cdb492791e3a8",
+            "score": -5.222353689232095
+          },
+          {
+            "symbol_path": "code_index.parsers.python_ast.PythonAstParser",
+            "chunk_uid": "199b370bbf80bd21dd5e",
+            "score": -5.14322191460601
+          },
+          {
+            "symbol_path": "code_index.parsers.python_ast",
+            "chunk_uid": "8ff29fc0b2dbe633bf87",
+            "score": -4.486398305090012
+          },
+          {
+            "symbol_path": "code_index/schema.sql",
+            "chunk_uid": "70e9493e2b8245d96fa4",
+            "score": -2.2062447096741677
+          }
+        ]
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": 1,
+        "seconds": 0.063,
+        "top5": [
+          {
+            "symbol_path": "code_index.hashing.normalized_hash",
+            "chunk_uid": "7d296d0228d8732481af",
+            "score": 0.8304083562142714
+          },
+          {
+            "symbol_path": "tests.test_hashing.test_normalized_hash_stable_under_formatting",
+            "chunk_uid": "7817e5ccb906da1e4560",
+            "score": 0.7886311428511356
+          },
+          {
+            "symbol_path": "tests.test_hashing.test_normalized_hash_detects_real_change",
+            "chunk_uid": "f06b86a9dae4074fa7e1",
+            "score": 0.7795650426908415
+          },
+          {
+            "symbol_path": "code_index.hashing",
+            "chunk_uid": "e376655cc18d6d35d1ac",
+            "score": 0.7630656716004393
+          },
+          {
+            "symbol_path": "tests.test_hashing",
+            "chunk_uid": "7c5ae6e76bd1625ced24",
+            "score": 0.7618417654583494
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": 2,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.parsers.python_ast._walk",
+            "chunk_uid": "27b334aeac27317be9fe",
+            "score": 0.5
+          },
+          {
+            "symbol_path": "code_index.hashing.normalized_hash",
+            "chunk_uid": "7d296d0228d8732481af",
+            "score": 0.5
+          },
+          {
+            "symbol_path": "code_index.parsers.python_ast.PythonAstParser.parse",
+            "chunk_uid": "b508838cdb492791e3a8",
+            "score": 0.38599613081853845
+          },
+          {
+            "symbol_path": "tests.test_hashing.test_normalized_hash_stable_under_formatting",
+            "chunk_uid": "7817e5ccb906da1e4560",
+            "score": 0.38304202502400203
+          },
+          {
+            "symbol_path": "code_index.parsers.python_ast.PythonAstParser",
+            "chunk_uid": "199b370bbf80bd21dd5e",
+            "score": 0.37641203852917093
+          }
+        ]
+      }
+    },
+    {
+      "id": "q04",
+      "text": "bm25 fts5 search over chunks",
+      "target": "code_index.search.fts.search",
+      "category": "literal",
+      "bm25": {
+        "mode": "bm25",
+        "rank": null,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd",
+            "chunk_uid": "b7f2727c2377e7b0726f",
+            "score": -7.529466967504522
+          }
+        ]
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": 1,
+        "seconds": 0.047,
+        "top5": [
+          {
+            "symbol_path": "code_index.search.fts.search",
+            "chunk_uid": "6241e129b9f1fb364212",
+            "score": 0.7762249344317953
+          },
+          {
+            "symbol_path": "code_index.embeddings.store.search",
+            "chunk_uid": "47597d7da465bee87271",
+            "score": 0.7313956710497429
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd._tool_search_query",
+            "chunk_uid": "a762a628fe10c95adbba",
+            "score": 0.7241613431717526
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd._resource_chunk",
+            "chunk_uid": "b99f4672882ae2a465e1",
+            "score": 0.7140245476621707
+          },
+          {
+            "symbol_path": "code_index.search.fts",
+            "chunk_uid": "95b3285dcf22eba0cb3c",
+            "score": 0.7017191023804811
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": 1,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.search.fts.search",
+            "chunk_uid": "6241e129b9f1fb364212",
+            "score": 0.5
+          },
+          {
+            "symbol_path": "code_index.embeddings.store.search",
+            "chunk_uid": "47597d7da465bee87271",
+            "score": 0.2954765781547703
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd._tool_search_query",
+            "chunk_uid": "a762a628fe10c95adbba",
+            "score": 0.26247158586330044
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd",
+            "chunk_uid": "b7f2727c2377e7b0726f",
+            "score": 0.25
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd._resource_chunk",
+            "chunk_uid": "b99f4672882ae2a465e1",
+            "score": 0.216224738430267
+          }
+        ]
+      }
+    },
+    {
+      "id": "q05",
+      "text": "apply_schema migration",
+      "target": "code_index.db.apply_schema",
+      "category": "literal",
+      "bm25": {
+        "mode": "bm25",
+        "rank": null,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "tests.test_migration_repair.test_apply_schema_repairs_dropped_additive_column",
+            "chunk_uid": "e643fdb83af33ba13bc6",
+            "score": -10.261852830770081
+          },
+          {
+            "symbol_path": "tests.test_migration_repair.test_read_commands_call_apply_schema",
+            "chunk_uid": "92d0a1119541a42f2cf6",
+            "score": -10.244891619380208
+          },
+          {
+            "symbol_path": "tests.test_embeddings.test_migration_backfills_embedding_norm",
+            "chunk_uid": "f51aabbd7b365808d1ec",
+            "score": -9.506685054787862
+          },
+          {
+            "symbol_path": "tests.test_embeddings_staleness.test_v4_to_v5_migration_backfills_content_hash",
+            "chunk_uid": "f2d33bfed03b1d4e28b3",
+            "score": -9.482052930168733
+          },
+          {
+            "symbol_path": "tests.test_migration_repair._init_index",
+            "chunk_uid": "9bfb6f47b6b17fa2d8b9",
+            "score": -9.449785375472535
+          }
+        ]
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": 1,
+        "seconds": 0.062,
+        "top5": [
+          {
+            "symbol_path": "code_index.db.apply_schema",
+            "chunk_uid": "10148f2c608fd05a6f6a",
+            "score": 0.8063202560838865
+          },
+          {
+            "symbol_path": "code_index.db._migrate_if_needed",
+            "chunk_uid": "1c7c2b611241a1a1615b",
+            "score": 0.7955848801829281
+          },
+          {
+            "symbol_path": "tests.test_migration_repair",
+            "chunk_uid": "950540d15e0450e2b558",
+            "score": 0.7743471605272677
+          },
+          {
+            "symbol_path": "tests.test_migration_repair.test_apply_schema_repairs_dropped_additive_column",
+            "chunk_uid": "e643fdb83af33ba13bc6",
+            "score": 0.7444589163459603
+          },
+          {
+            "symbol_path": "tests.test_embeddings_staleness.test_v4_to_v5_migration_backfills_content_hash",
+            "chunk_uid": "f2d33bfed03b1d4e28b3",
+            "score": 0.7386375987465932
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": 6,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "tests.test_migration_repair",
+            "chunk_uid": "950540d15e0450e2b558",
+            "score": 0.7596790488578851
+          },
+          {
+            "symbol_path": "tests.test_migration_repair.test_apply_schema_repairs_dropped_additive_column",
+            "chunk_uid": "e643fdb83af33ba13bc6",
+            "score": 0.7139016530409414
+          },
+          {
+            "symbol_path": "tests.test_migration_repair.test_read_commands_call_apply_schema",
+            "chunk_uid": "92d0a1119541a42f2cf6",
+            "score": 0.6705544579820291
+          },
+          {
+            "symbol_path": "tests.test_embeddings_staleness.test_v4_to_v5_migration_backfills_content_hash",
+            "chunk_uid": "f2d33bfed03b1d4e28b3",
+            "score": 0.6298113794385438
+          },
+          {
+            "symbol_path": "tests.test_embeddings.test_migration_backfills_embedding_norm",
+            "chunk_uid": "f51aabbd7b365808d1ec",
+            "score": 0.5318676676589766
+          }
+        ]
+      }
+    },
+    {
+      "id": "q06",
+      "text": "function that finds which files to index while respecting ignore rules",
+      "target": "code_index.scanner.iter_files",
+      "category": "semantic",
+      "bm25": {
+        "mode": "bm25",
+        "rank": null,
+        "seconds": 0.0,
+        "top5": []
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": 12,
+        "seconds": 0.047,
+        "top5": [
+          {
+            "symbol_path": "tests.test_pipeline.test_ignored_files_not_indexed",
+            "chunk_uid": "74d1f0f85698a55aa8b8",
+            "score": 0.7777248991275225
+          },
+          {
+            "symbol_path": "code_index.ignore.IgnoreMatcher.is_ignored",
+            "chunk_uid": "26ce1826c9ef5e262d8e",
+            "score": 0.7657005254377067
+          },
+          {
+            "symbol_path": "code_index.ignore.IgnoreMatcher",
+            "chunk_uid": "a09bce8994a291efed17",
+            "score": 0.7603530394582838
+          },
+          {
+            "symbol_path": "code_index.pipeline._resolve_paths",
+            "chunk_uid": "1bfee9b38aa82b3212ab",
+            "score": 0.7533613859029854
+          },
+          {
+            "symbol_path": "code_index.ignore",
+            "chunk_uid": "f826488ce78e3df9faa3",
+            "score": 0.7461125983941091
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": 12,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "tests.test_pipeline.test_ignored_files_not_indexed",
+            "chunk_uid": "74d1f0f85698a55aa8b8",
+            "score": 0.5
+          },
+          {
+            "symbol_path": "code_index.ignore.IgnoreMatcher.is_ignored",
+            "chunk_uid": "26ce1826c9ef5e262d8e",
+            "score": 0.4165508472808143
+          },
+          {
+            "symbol_path": "code_index.ignore.IgnoreMatcher",
+            "chunk_uid": "a09bce8994a291efed17",
+            "score": 0.37943929488964745
+          },
+          {
+            "symbol_path": "code_index.pipeline._resolve_paths",
+            "chunk_uid": "1bfee9b38aa82b3212ab",
+            "score": 0.3309172196159978
+          },
+          {
+            "symbol_path": "code_index.ignore",
+            "chunk_uid": "f826488ce78e3df9faa3",
+            "score": 0.28061063471923325
+          }
+        ]
+      }
+    },
+    {
+      "id": "q07",
+      "text": "compute cosine similarity between a query vector and stored chunk vectors",
+      "target": "code_index.embeddings.store.search",
+      "category": "semantic",
+      "bm25": {
+        "mode": "bm25",
+        "rank": null,
+        "seconds": 0.0,
+        "top5": []
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": 2,
+        "seconds": 0.047,
+        "top5": [
+          {
+            "symbol_path": "code_index.embeddings.store",
+            "chunk_uid": "430b1cf4a347758df748",
+            "score": 0.7780898323316139
+          },
+          {
+            "symbol_path": "code_index.embeddings.store.search",
+            "chunk_uid": "47597d7da465bee87271",
+            "score": 0.7335975058357753
+          },
+          {
+            "symbol_path": "code_index.embeddings",
+            "chunk_uid": "7ded9e0f22cb69de8799",
+            "score": 0.7024501029221315
+          },
+          {
+            "symbol_path": "code_index.embeddings.store.populate",
+            "chunk_uid": "3cbc047151b4234c9225",
+            "score": 0.6940266366476375
+          },
+          {
+            "symbol_path": "code_index.embeddings.store.coverage",
+            "chunk_uid": "afd8abc163823adb2572",
+            "score": 0.6853723289111301
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": 2,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.embeddings.store",
+            "chunk_uid": "430b1cf4a347758df748",
+            "score": 0.5
+          },
+          {
+            "symbol_path": "code_index.embeddings.store.search",
+            "chunk_uid": "47597d7da465bee87271",
+            "score": 0.33759046850010527
+          },
+          {
+            "symbol_path": "code_index.embeddings",
+            "chunk_uid": "7ded9e0f22cb69de8799",
+            "score": 0.2238936692303145
+          },
+          {
+            "symbol_path": "code_index.embeddings.store.populate",
+            "chunk_uid": "3cbc047151b4234c9225",
+            "score": 0.19314564324489686
+          },
+          {
+            "symbol_path": "code_index.embeddings.store.coverage",
+            "chunk_uid": "afd8abc163823adb2572",
+            "score": 0.16155498086239478
+          }
+        ]
+      }
+    },
+    {
+      "id": "q08",
+      "text": "how do we figure out what breaks when a function changes",
+      "target": "code_index.commands.impact_cmd.compute_impact",
+      "category": "semantic",
+      "bm25": {
+        "mode": "bm25",
+        "rank": null,
+        "seconds": 0.016,
+        "top5": []
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": null,
+        "seconds": 0.046,
+        "top5": [
+          {
+            "symbol_path": "tests.test_python_ast.test_syntax_error_recorded_as_diagnostic",
+            "chunk_uid": "9b7671e559e5deae2ba2",
+            "score": 0.6856145236771616
+          },
+          {
+            "symbol_path": "tests.test_nl.test_classifier_extracts_top_n_hint",
+            "chunk_uid": "63d2e6728f7ce96f4dcc",
+            "score": 0.676257818695911
+          },
+          {
+            "symbol_path": "tests.test_hashing.test_normalized_hash_detects_real_change",
+            "chunk_uid": "f06b86a9dae4074fa7e1",
+            "score": 0.674800185899647
+          },
+          {
+            "symbol_path": "code_index.commands.rebuild_tests_cmd.run",
+            "chunk_uid": "d4988bd2a93c50e022e5",
+            "score": 0.6687296192999387
+          },
+          {
+            "symbol_path": "tests.test_hashing.test_raw_hash_detects_whitespace_changes",
+            "chunk_uid": "bf6ed82f18e9d3febdff",
+            "score": 0.6674340684782889
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": null,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "tests.test_python_ast.test_syntax_error_recorded_as_diagnostic",
+            "chunk_uid": "9b7671e559e5deae2ba2",
+            "score": 0.5
+          },
+          {
+            "symbol_path": "tests.test_nl.test_classifier_extracts_top_n_hint",
+            "chunk_uid": "63d2e6728f7ce96f4dcc",
+            "score": 0.3623439481124702
+          },
+          {
+            "symbol_path": "tests.test_hashing.test_normalized_hash_detects_real_change",
+            "chunk_uid": "f06b86a9dae4074fa7e1",
+            "score": 0.3408992219789055
+          },
+          {
+            "symbol_path": "code_index.commands.rebuild_tests_cmd.run",
+            "chunk_uid": "d4988bd2a93c50e022e5",
+            "score": 0.2515889110830655
+          },
+          {
+            "symbol_path": "tests.test_hashing.test_raw_hash_detects_whitespace_changes",
+            "chunk_uid": "bf6ed82f18e9d3febdff",
+            "score": 0.23252873856663792
+          }
+        ]
+      }
+    },
+    {
+      "id": "q09",
+      "text": "backfill cross-file calls that could not be resolved on first parse",
+      "target": "code_index.pipeline._backfill_unresolved",
+      "category": "semantic",
+      "bm25": {
+        "mode": "bm25",
+        "rank": null,
+        "seconds": 0.0,
+        "top5": []
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": 1,
+        "seconds": 0.063,
+        "top5": [
+          {
+            "symbol_path": "code_index.pipeline._backfill_unresolved",
+            "chunk_uid": "1d2c2fa2f98d46d52eb9",
+            "score": 0.7637178092846214
+          },
+          {
+            "symbol_path": "tests.test_convergence.test_cross_file_call_backfills_on_targeted_update",
+            "chunk_uid": "b69a73748713bdea1449",
+            "score": 0.7550926975167928
+          },
+          {
+            "symbol_path": "code_index.pipeline.ReindexStats",
+            "chunk_uid": "2cd4520cd84e9150e9dc",
+            "score": 0.7180288352158278
+          },
+          {
+            "symbol_path": "tests.test_pipeline.test_syntax_error_file_recorded_without_aborting",
+            "chunk_uid": "de60e5c84d61a1232dff",
+            "score": 0.714181972871148
+          },
+          {
+            "symbol_path": "code_index.embeddings.store._flush",
+            "chunk_uid": "235d0b35de84758953e6",
+            "score": 0.7111101939248422
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": 1,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.pipeline._backfill_unresolved",
+            "chunk_uid": "1d2c2fa2f98d46d52eb9",
+            "score": 0.5
+          },
+          {
+            "symbol_path": "tests.test_convergence.test_cross_file_call_backfills_on_targeted_update",
+            "chunk_uid": "b69a73748713bdea1449",
+            "score": 0.44592162543818464
+          },
+          {
+            "symbol_path": "code_index.pipeline.ReindexStats",
+            "chunk_uid": "2cd4520cd84e9150e9dc",
+            "score": 0.21353583355832845
+          },
+          {
+            "symbol_path": "tests.test_pipeline.test_syntax_error_file_recorded_without_aborting",
+            "chunk_uid": "de60e5c84d61a1232dff",
+            "score": 0.18941648666020605
+          },
+          {
+            "symbol_path": "code_index.embeddings.store._flush",
+            "chunk_uid": "235d0b35de84758953e6",
+            "score": 0.17015681595668716
+          }
+        ]
+      }
+    },
+    {
+      "id": "q10",
+      "text": "walk a BFS graph from test functions down to the symbol they exercise",
+      "target": "code_index.pipeline._rebuild_test_edges",
+      "category": "semantic",
+      "bm25": {
+        "mode": "bm25",
+        "rank": null,
+        "seconds": 0.0,
+        "top5": []
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": 2,
+        "seconds": 0.062,
+        "top5": [
+          {
+            "symbol_path": "code_index.parsers.python_ast._walk",
+            "chunk_uid": "27b334aeac27317be9fe",
+            "score": 0.7124602302065302
+          },
+          {
+            "symbol_path": "code_index.pipeline._rebuild_test_edges",
+            "chunk_uid": "4a7874d3be4df5d91812",
+            "score": 0.7106884855596114
+          },
+          {
+            "symbol_path": "tests.test_tests_cmd.test_test_edges_direct_and_transitive",
+            "chunk_uid": "7ffbfe235b88689dc792",
+            "score": 0.7018897324249602
+          },
+          {
+            "symbol_path": "tests.test_pipeline.test_symbol_and_fts_lookup_after_init",
+            "chunk_uid": "427ccfb5999da1b1c555",
+            "score": 0.7017996725813013
+          },
+          {
+            "symbol_path": "code_index.commands.impact_cmd.run",
+            "chunk_uid": "7170f241b3df87bfce2e",
+            "score": 0.6761960102103125
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": 2,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.parsers.python_ast._walk",
+            "chunk_uid": "27b334aeac27317be9fe",
+            "score": 0.5
+          },
+          {
+            "symbol_path": "code_index.pipeline._rebuild_test_edges",
+            "chunk_uid": "4a7874d3be4df5d91812",
+            "score": 0.4811469639931613
+          },
+          {
+            "symbol_path": "tests.test_tests_cmd.test_test_edges_direct_and_transitive",
+            "chunk_uid": "7ffbfe235b88689dc792",
+            "score": 0.3875199224489125
+          },
+          {
+            "symbol_path": "tests.test_pipeline.test_symbol_and_fts_lookup_after_init",
+            "chunk_uid": "427ccfb5999da1b1c555",
+            "score": 0.38656160067369205
+          },
+          {
+            "symbol_path": "code_index.commands.impact_cmd.run",
+            "chunk_uid": "7170f241b3df87bfce2e",
+            "score": 0.11411445687863851
+          }
+        ]
+      }
+    },
+    {
+      "id": "q11",
+      "text": "auth token for MCP server",
+      "target": "code_index.commands.mcp_serve_cmd._validate_bearer",
+      "category": "mixed",
+      "bm25": {
+        "mode": "bm25",
+        "rank": null,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "tests.test_mcp_auth",
+            "chunk_uid": "5cac6ad7cd3d7bc63844",
+            "score": -19.63413188573204
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd",
+            "chunk_uid": "b7f2727c2377e7b0726f",
+            "score": -15.169851183816933
+          }
+        ]
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": 6,
+        "seconds": 0.063,
+        "top5": [
+          {
+            "symbol_path": "tests.test_mcp_auth",
+            "chunk_uid": "5cac6ad7cd3d7bc63844",
+            "score": 0.741598807521972
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd._build_bearer_middleware._BearerAuthMiddleware",
+            "chunk_uid": "1c6d7ad43bdb2c01f9d1",
+            "score": 0.741076098434934
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd._run_http",
+            "chunk_uid": "6aa0eeb38a8e2fa7cc97",
+            "score": 0.7147744485232747
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd._build_bearer_middleware._BearerAuthMiddleware.dispatch",
+            "chunk_uid": "10cd914d767309d1cc76",
+            "score": 0.7127723947764449
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd._resolve_bearer_token",
+            "chunk_uid": "0d56174ea8f0025e4f92",
+            "score": 0.7117952494787975
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": 6,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "tests.test_mcp_auth",
+            "chunk_uid": "5cac6ad7cd3d7bc63844",
+            "score": 1.0
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd._build_bearer_middleware._BearerAuthMiddleware",
+            "chunk_uid": "1c6d7ad43bdb2c01f9d1",
+            "score": 0.49632061030463104
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd._run_http",
+            "chunk_uid": "6aa0eeb38a8e2fa7cc97",
+            "score": 0.3111812621357579
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd._build_bearer_middleware._BearerAuthMiddleware.dispatch",
+            "chunk_uid": "10cd914d767309d1cc76",
+            "score": 0.2970886509523511
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd._resolve_bearer_token",
+            "chunk_uid": "0d56174ea8f0025e4f92",
+            "score": 0.2902104496197215
+          }
+        ]
+      }
+    },
+    {
+      "id": "q12",
+      "text": "pipeline reindex entrypoint",
+      "target": "code_index.pipeline.reindex",
+      "category": "mixed",
+      "bm25": {
+        "mode": "bm25",
+        "rank": null,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.commands.watch_cmd",
+            "chunk_uid": "6b459cd6e8cae0430a4e",
+            "score": -5.173637731342741
+          },
+          {
+            "symbol_path": "code_index.commands.mcp_serve_cmd",
+            "chunk_uid": "b7f2727c2377e7b0726f",
+            "score": -1.8357727769255798
+          }
+        ]
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": 1,
+        "seconds": 0.062,
+        "top5": [
+          {
+            "symbol_path": "code_index.pipeline.reindex",
+            "chunk_uid": "92f6c1106941d7b45c95",
+            "score": 0.7715207824923137
+          },
+          {
+            "symbol_path": "code_index.pipeline._reindex_body",
+            "chunk_uid": "3b56f56a1c4398ec9ca1",
+            "score": 0.7701575011294421
+          },
+          {
+            "symbol_path": "code_index.pipeline.ReindexStats",
+            "chunk_uid": "2cd4520cd84e9150e9dc",
+            "score": 0.7691316916246688
+          },
+          {
+            "symbol_path": "code_index.pipeline",
+            "chunk_uid": "9ddc9b22499ec7be1181",
+            "score": 0.76691245346873
+          },
+          {
+            "symbol_path": "tests.test_pipeline",
+            "chunk_uid": "d5f53cd0ae5d4dd2e21a",
+            "score": 0.7206001603644203
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": 2,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.commands.watch_cmd",
+            "chunk_uid": "6b459cd6e8cae0430a4e",
+            "score": 0.6517971470516534
+          },
+          {
+            "symbol_path": "code_index.pipeline.reindex",
+            "chunk_uid": "92f6c1106941d7b45c95",
+            "score": 0.5
+          },
+          {
+            "symbol_path": "code_index.pipeline._reindex_body",
+            "chunk_uid": "3b56f56a1c4398ec9ca1",
+            "score": 0.4915895852537876
+          },
+          {
+            "symbol_path": "code_index.pipeline.ReindexStats",
+            "chunk_uid": "2cd4520cd84e9150e9dc",
+            "score": 0.4852611165893453
+          },
+          {
+            "symbol_path": "code_index.pipeline",
+            "chunk_uid": "9ddc9b22499ec7be1181",
+            "score": 0.47157009592377286
+          }
+        ]
+      }
+    },
+    {
+      "id": "q13",
+      "text": "class that decides whether a path matches gitignore patterns",
+      "target": "code_index.ignore.IgnoreMatcher",
+      "category": "mixed",
+      "bm25": {
+        "mode": "bm25",
+        "rank": null,
+        "seconds": 0.0,
+        "top5": []
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": 2,
+        "seconds": 0.063,
+        "top5": [
+          {
+            "symbol_path": "tests.test_ignore.test_gitignore_patterns",
+            "chunk_uid": "c4a879d35fed3ea94a6c",
+            "score": 0.8260528151283066
+          },
+          {
+            "symbol_path": "code_index.ignore.IgnoreMatcher",
+            "chunk_uid": "a09bce8994a291efed17",
+            "score": 0.809313108552044
+          },
+          {
+            "symbol_path": "code_index.ignore",
+            "chunk_uid": "f826488ce78e3df9faa3",
+            "score": 0.7948290392096609
+          },
+          {
+            "symbol_path": "code_index.ignore.build",
+            "chunk_uid": "74204027e943c34421c2",
+            "score": 0.7795541960338415
+          },
+          {
+            "symbol_path": "code_index.ignore._match",
+            "chunk_uid": "0d9aff37cde9f4265ab8",
+            "score": 0.7772430966507845
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": 2,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "tests.test_ignore.test_gitignore_patterns",
+            "chunk_uid": "c4a879d35fed3ea94a6c",
+            "score": 0.5
+          },
+          {
+            "symbol_path": "code_index.ignore.IgnoreMatcher",
+            "chunk_uid": "a09bce8994a291efed17",
+            "score": 0.43140165228421945
+          },
+          {
+            "symbol_path": "code_index.ignore",
+            "chunk_uid": "f826488ce78e3df9faa3",
+            "score": 0.3720467752699951
+          },
+          {
+            "symbol_path": "code_index.ignore.build",
+            "chunk_uid": "74204027e943c34421c2",
+            "score": 0.309451352900721
+          },
+          {
+            "symbol_path": "code_index.ignore._match",
+            "chunk_uid": "0d9aff37cde9f4265ab8",
+            "score": 0.29998060152509787
+          }
+        ]
+      }
+    },
+    {
+      "id": "q14",
+      "text": "classify a natural-language question into an intent",
+      "target": "code_index.nl.classify.classify",
+      "category": "mixed",
+      "bm25": {
+        "mode": "bm25",
+        "rank": null,
+        "seconds": 0.0,
+        "top5": []
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": 1,
+        "seconds": 0.062,
+        "top5": [
+          {
+            "symbol_path": "code_index.nl.classify.classify",
+            "chunk_uid": "cf68698ca56db60ec50f",
+            "score": 0.8537856262550064
+          },
+          {
+            "symbol_path": "code_index.nl.classify.Intent.unknown",
+            "chunk_uid": "2a375eb3867c40a753d2",
+            "score": 0.8111320456361399
+          },
+          {
+            "symbol_path": "code_index.nl.classify.Intent",
+            "chunk_uid": "e4d6ae85aec9bd141692",
+            "score": 0.7944828133708892
+          },
+          {
+            "symbol_path": "code_index.nl.classify",
+            "chunk_uid": "c3283de80cc622f089e9",
+            "score": 0.7701384681050694
+          },
+          {
+            "symbol_path": "code_index.nl.synthesize.answer",
+            "chunk_uid": "656eafecb406fe35900c",
+            "score": 0.7498548331584138
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": 1,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.nl.classify.classify",
+            "chunk_uid": "cf68698ca56db60ec50f",
+            "score": 0.5
+          },
+          {
+            "symbol_path": "code_index.nl.classify.Intent.unknown",
+            "chunk_uid": "2a375eb3867c40a753d2",
+            "score": 0.3946725285833992
+          },
+          {
+            "symbol_path": "code_index.nl.classify.Intent",
+            "chunk_uid": "e4d6ae85aec9bd141692",
+            "score": 0.35355941427780013
+          },
+          {
+            "symbol_path": "code_index.nl.classify",
+            "chunk_uid": "c3283de80cc622f089e9",
+            "score": 0.29344421895449496
+          },
+          {
+            "symbol_path": "code_index.nl.synthesize.answer",
+            "chunk_uid": "656eafecb406fe35900c",
+            "score": 0.24335641978099146
+          }
+        ]
+      }
+    },
+    {
+      "id": "q15",
+      "text": "run the tests command and return affected pytest node ids",
+      "target": "code_index.commands.tests_cmd.run",
+      "category": "mixed",
+      "bm25": {
+        "mode": "bm25",
+        "rank": null,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.cli.build_parser",
+            "chunk_uid": "498fb99f59427d20399e",
+            "score": -9.040950772453705
+          },
+          {
+            "symbol_path": "code_index.cli",
+            "chunk_uid": "ae16826b402557bc720c",
+            "score": -8.62731487864664
+          }
+        ]
+      },
+      "embeddings": {
+        "mode": "embeddings",
+        "rank": 13,
+        "seconds": 0.063,
+        "top5": [
+          {
+            "symbol_path": "code_index.runners.pytest",
+            "chunk_uid": "c4e5ea65e047b0b47a49",
+            "score": 0.8375107409833731
+          },
+          {
+            "symbol_path": "code_index.runners.pytest.build_pytest_invocation",
+            "chunk_uid": "7134f3e6b905aa69fb71",
+            "score": 0.8169902606387542
+          },
+          {
+            "symbol_path": "tests.test_parametrize_ids.test_runner_uses_explicit_ids_for_node_ids",
+            "chunk_uid": "b0a9bfe235e5f42475a9",
+            "score": 0.801505181481503
+          },
+          {
+            "symbol_path": "tests.test_parametrize_ids.test_runner_skips_callable_ids_but_still_expands_from_cases",
+            "chunk_uid": "1cb05af623c2faecdfe2",
+            "score": 0.7975358376725902
+          },
+          {
+            "symbol_path": "tests.test_pytest_runner",
+            "chunk_uid": "a0764a9365f620610071",
+            "score": 0.7962195669348197
+          }
+        ]
+      },
+      "hybrid": {
+        "mode": "hybrid",
+        "rank": 14,
+        "seconds": 0.0,
+        "top5": [
+          {
+            "symbol_path": "code_index.cli.build_parser",
+            "chunk_uid": "498fb99f59427d20399e",
+            "score": 0.5
+          },
+          {
+            "symbol_path": "code_index.runners.pytest",
+            "chunk_uid": "c4e5ea65e047b0b47a49",
+            "score": 0.5
+          },
+          {
+            "symbol_path": "code_index.runners.pytest.build_pytest_invocation",
+            "chunk_uid": "7134f3e6b905aa69fb71",
+            "score": 0.3960641502278665
+          },
+          {
+            "symbol_path": "tests.test_parametrize_ids.test_runner_uses_explicit_ids_for_node_ids",
+            "chunk_uid": "b0a9bfe235e5f42475a9",
+            "score": 0.31763251344506976
+          },
+          {
+            "symbol_path": "tests.test_parametrize_ids.test_runner_skips_callable_ids_but_still_expands_from_cases",
+            "chunk_uid": "1cb05af623c2faecdfe2",
+            "score": 0.29752786117140634
+          }
+        ]
+      }
+    }
+  ]
+}

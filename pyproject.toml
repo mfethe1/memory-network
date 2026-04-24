@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "code-index"
+version = "0.1.0"
+description = "Local-first hybrid code-memory system. Symbols are primary, chunks are projections."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "code_index contributors" }]
+keywords = ["code-search", "sqlite", "fts5", "tree-sitter", "indexing", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development",
+    "Topic :: Text Processing :: Indexing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+tree-sitter = ["tree-sitter>=0.22", "tree-sitter-languages>=1.10"]
+watch = ["watchdog>=4.0"]
+mcp = ["mcp>=1.0"]
+jedi = ["jedi>=0.19"]
+embeddings = ["fastembed>=0.3"]
+embeddings-st = ["sentence-transformers>=3.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[project.scripts]
+code_index = "code_index.cli:main"
+code-index = "code_index.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["code_index*"]
+exclude = ["tests*", "plans*", "docs*"]
+
+[tool.setuptools.package-data]
+code_index = ["schema.sql", "hooks/*"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
