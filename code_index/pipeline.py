@@ -227,9 +227,9 @@ def _upsert_symbol(
     sym,  # SymbolDraft
     container_pk: int | None,
     now: str,
-) -> int:
+) -> tuple[int, bool]:
     row = conn.execute(
-        "SELECT symbol_pk FROM symbols WHERE symbol_uid = ?",
+        "SELECT symbol_pk, deleted_at FROM symbols WHERE symbol_uid = ?",
         (sym.symbol_uid,),
     ).fetchone()
     if row is None:
@@ -255,7 +255,8 @@ def _upsert_symbol(
                 now,
             ),
         )
-        return int(cur.lastrowid)
+        return int(cur.lastrowid), True
+    reactivated = row["deleted_at"] is not None
     conn.execute(
         """
         UPDATE symbols SET
@@ -284,7 +285,7 @@ def _upsert_symbol(
             row["symbol_pk"],
         ),
     )
-    return int(row["symbol_pk"])
+    return int(row["symbol_pk"]), reactivated
 
 
 def _apply_parsed_file(
@@ -295,6 +296,7 @@ def _apply_parsed_file(
     parsed: ParseResult,
     event_source: str,
     stats: ReindexStats,
+    new_symbol_candidates: set[str] | None = None,
 ) -> None:
     now = _now_iso()
 
@@ -312,9 +314,13 @@ def _apply_parsed_file(
     uid_to_pk: dict[str, int] = {}
     for sym in parsed.symbols:
         container_pk = uid_to_pk.get(sym.container_uid or "")
-        symbol_pk = _upsert_symbol(conn, sym, container_pk, now)
+        symbol_pk, newly_available = _upsert_symbol(conn, sym, container_pk, now)
         uid_to_pk[sym.symbol_uid] = symbol_pk
         stats.symbols_upserted += 1
+        if newly_available and new_symbol_candidates is not None:
+            new_symbol_candidates.add(sym.canonical_name)
+            if sym.display_name:
+                new_symbol_candidates.add(sym.display_name)
 
     # Insert occurrences.
     for occ in parsed.occurrences:
@@ -639,7 +645,8 @@ def _tombstone_file(
     now: str,
     event_source: str,
     stats: ReindexStats,
-) -> None:
+    test_symbols_to_rebuild: set[int] | None = None,
+) -> int:
     """Soft-delete a file and semantic state derived from its definitions."""
     definition_rows = conn.execute(
         """
@@ -650,6 +657,20 @@ def _tombstone_file(
         (file_pk,),
     ).fetchall()
     definition_pks = [int(row["symbol_pk"]) for row in definition_rows]
+    symbols_tombstoned = 0
+
+    if definition_pks and test_symbols_to_rebuild is not None:
+        placeholders = ",".join("?" for _ in definition_pks)
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT test_symbol_pk
+              FROM test_edges
+             WHERE test_symbol_pk IN ({placeholders})
+                OR target_symbol_pk IN ({placeholders})
+            """,
+            (*definition_pks, *definition_pks),
+        ).fetchall()
+        test_symbols_to_rebuild.update(int(row["test_symbol_pk"]) for row in rows)
 
     conn.execute(
         "UPDATE files SET deleted_at = ?, parse_status = 'deleted' WHERE file_pk = ?",
@@ -714,12 +735,14 @@ def _tombstone_file(
         )
         if cur.rowcount:
             stats.symbols_tombstoned += 1
+            symbols_tombstoned += 1
 
     if definition_pks:
         conn.executemany(
             "DELETE FROM relations WHERE src_symbol_pk = ?",
             [(pk,) for pk in definition_pks],
         )
+    return symbols_tombstoned
 
 
 def _record_diagnostics_only(
@@ -1038,7 +1061,7 @@ def _resolve_pending(
     now: str,
     reexport_map: dict[str, str] | None = None,
     config: Config | None = None,
-    jedi_touched_files: set[int] | None = None,
+    relation_touched_files: set[int] | None = None,
 ) -> None:
     """Resolve pending relations from the current parse.
 
@@ -1120,10 +1143,10 @@ def _resolve_pending(
             weight=0.9 if used_jedi else rel.weight,
         ):
             stats.relations_inserted += 1
+            if relation_touched_files is not None:
+                relation_touched_files.add(int(file_pk))
             if used_jedi:
                 stats.relations_resolved_by_jedi += 1
-                if jedi_touched_files is not None:
-                    jedi_touched_files.add(int(file_pk))
             if rel.relation_kind == "calls":
                 _insert_call_reference_occurrence(
                     conn,
@@ -1139,7 +1162,8 @@ def _backfill_unresolved(
     now: str,
     reexport_map: dict[str, str] | None = None,
     config: Config | None = None,
-    jedi_touched_files: set[int] | None = None,
+    relation_touched_files: set[int] | None = None,
+    candidate_names: set[str] | None = None,
 ) -> None:
     """Re-attempt every still-unresolved pending relation in the DB.
 
@@ -1150,14 +1174,24 @@ def _backfill_unresolved(
     """
     import json as _json
 
-    rows = conn.execute(
-        """
+    sql = """
         SELECT unresolved_pk, file_pk, src_symbol_uid, relation_kind,
                dst_candidates_json, site_line, provenance
           FROM unresolved_calls
          WHERE resolved_at IS NULL
-        """
-    ).fetchall()
+    """
+    params: list[str] = []
+    if candidate_names is not None:
+        names = sorted(name for name in candidate_names if name)
+        if not names:
+            return
+        if len(names) <= 100:
+            clauses = []
+            for name in names:
+                clauses.append("dst_candidates_json LIKE ?")
+                params.append(f'%"{name}"%')
+            sql += " AND (" + " OR ".join(clauses) + ")"
+    rows = conn.execute(sql, params).fetchall()
 
     # Build one Jedi lookup over every calls-row with a known file+line.
     jedi_records: list[dict] = []
@@ -1228,10 +1262,10 @@ def _backfill_unresolved(
             weight=0.9 if used_jedi else 1.0,
         ):
             stats.relations_inserted += 1
+            if relation_touched_files is not None and row["file_pk"] is not None:
+                relation_touched_files.add(int(row["file_pk"]))
             if used_jedi:
                 stats.relations_resolved_by_jedi += 1
-                if jedi_touched_files is not None and row["file_pk"] is not None:
-                    jedi_touched_files.add(int(row["file_pk"]))
             if row["relation_kind"] == "calls":
                 _insert_call_reference_occurrence(
                     conn,
@@ -1453,14 +1487,13 @@ def _insert_test_edges_for(
     return inserted
 
 
-def _rebuild_test_edges_scoped(
+def _collect_scoped_test_symbols(
     conn: sqlite3.Connection,
-    stats: ReindexStats,
     touched_file_pks: set[int],
-    *,
-    max_depth: int = 4,
-) -> None:
-    """Scoped rebuild: recompute test_edges only for test symbols whose
+) -> set[int]:
+    """Return test symbols whose affected-test edges may depend on touched files.
+
+    Scope: test symbols whose
     definition OR whose existing edge target lives in a touched file.
 
     Correctness: a test T's reachability to some target X can change only if
@@ -1469,8 +1502,7 @@ def _rebuild_test_edges_scoped(
     Test symbols that can't satisfy either condition keep their edges.
     """
     if not touched_file_pks:
-        stats.test_edges_rebuilt_scope = "scoped"
-        return
+        return set()
     placeholders = ",".join("?" for _ in touched_file_pks)
     file_pk_params = list(touched_file_pks)
 
@@ -1489,7 +1521,7 @@ def _rebuild_test_edges_scoped(
         file_pk_params,
     ).fetchall()
 
-    impacted: dict[int, str] = {}
+    impacted: set[int] = set()
     for r in defn_tests:
         fp = conn.execute(
             """
@@ -1501,12 +1533,12 @@ def _rebuild_test_edges_scoped(
             (r["symbol_pk"],),
         ).fetchone()
         if fp and _is_test_path(fp["file_path"]):
-            impacted[int(r["symbol_pk"])] = r["canonical_name"]
+            impacted.add(int(r["symbol_pk"]))
 
     # Test symbols whose existing edges target a symbol defined in a touched file.
     target_tests = conn.execute(
         f"""
-        SELECT DISTINCT te.test_symbol_pk, s.canonical_name
+        SELECT DISTINCT te.test_symbol_pk
           FROM test_edges te
           JOIN symbols s ON s.symbol_pk = te.test_symbol_pk
           JOIN occurrences o ON o.symbol_pk = te.target_symbol_pk
@@ -1517,26 +1549,47 @@ def _rebuild_test_edges_scoped(
         file_pk_params,
     ).fetchall()
     for r in target_tests:
-        impacted.setdefault(int(r["test_symbol_pk"]), r["canonical_name"])
+        impacted.add(int(r["test_symbol_pk"]))
+    return impacted
 
-    if not impacted:
-        stats.test_edges_rebuilt_scope = "scoped"
+
+def _rebuild_test_edges_for_test_symbols(
+    conn: sqlite3.Connection,
+    stats: ReindexStats,
+    test_symbol_pks: set[int],
+    *,
+    max_depth: int = 4,
+) -> None:
+    """Recompute outbound affected-test edges for specific test symbols."""
+    if not test_symbol_pks:
         return
 
-    # Delete outbound edges for impacted test symbols.
-    impacted_placeholders = ",".join("?" for _ in impacted)
+    impacted_placeholders = ",".join("?" for _ in test_symbol_pks)
+    impacted_params = list(test_symbol_pks)
     before = conn.execute(
         f"SELECT COUNT(*) FROM test_edges WHERE test_symbol_pk IN ({impacted_placeholders})",
-        list(impacted),
+        impacted_params,
     ).fetchone()[0]
     conn.execute(
         f"DELETE FROM test_edges WHERE test_symbol_pk IN ({impacted_placeholders})",
-        list(impacted),
+        impacted_params,
     )
+
+    live_tests = conn.execute(
+        f"""
+        SELECT symbol_pk, canonical_name
+          FROM symbols
+         WHERE deleted_at IS NULL
+           AND symbol_pk IN ({impacted_placeholders})
+        """,
+        impacted_params,
+    ).fetchall()
 
     def_file_cache: dict[int, str | None] = {}
     inserted = 0
-    for test_pk, test_name in impacted.items():
+    for row in live_tests:
+        test_pk = int(row["symbol_pk"])
+        test_name = row["canonical_name"]
         chunk_row = conn.execute(
             "SELECT chunk_pk FROM chunks WHERE primary_symbol_pk = ? AND deleted_at IS NULL LIMIT 1",
             (test_pk,),
@@ -1557,8 +1610,24 @@ def _rebuild_test_edges_scoped(
             best_targets=targets,
         )
 
-    stats.test_edges_inserted = inserted
-    stats.test_edges_removed = before
+    stats.test_edges_inserted += inserted
+    stats.test_edges_removed += before
+
+
+def _rebuild_test_edges_scoped(
+    conn: sqlite3.Connection,
+    stats: ReindexStats,
+    touched_file_pks: set[int],
+    *,
+    max_depth: int = 4,
+) -> None:
+    impacted = _collect_scoped_test_symbols(conn, touched_file_pks)
+    _rebuild_test_edges_for_test_symbols(
+        conn,
+        stats,
+        impacted,
+        max_depth=max_depth,
+    )
     stats.test_edges_rebuilt_scope = "scoped"
 
 
@@ -1811,6 +1880,10 @@ def _reindex_body(
     #     whether this parse actually introduced a new symbol. Used to
     #     short-circuit the backfill pass on targeted updates.
     touched_file_pks: set[int] = set()
+    relation_touched_file_pks: set[int] = set()
+    test_symbols_to_rebuild: set[int] = set()
+    new_symbol_candidates: set[str] = set()
+    symbols_tombstoned_by_deleted_files = 0
     symbols_count_before = conn.execute(
         "SELECT COUNT(*) FROM symbols WHERE deleted_at IS NULL"
     ).fetchone()[0]
@@ -1938,6 +2011,7 @@ def _reindex_body(
                     parsed=parsed,
                     event_source=event_source,
                     stats=stats,
+                    new_symbol_candidates=new_symbol_candidates,
                 )
                 touched_file_pks.add(file_pk)
                 if parsed.pending_relations:
@@ -1975,12 +2049,13 @@ def _reindex_body(
             ).fetchall()
             for file_row in rows:
                 with transaction(conn):
-                    _tombstone_file(
+                    symbols_tombstoned_by_deleted_files += _tombstone_file(
                         conn,
                         file_pk=int(file_row["file_pk"]),
                         now=now,
                         event_source=event_source,
                         stats=stats,
+                        test_symbols_to_rebuild=test_symbols_to_rebuild,
                     )
                 touched_file_pks.add(int(file_row["file_pk"]))
 
@@ -2002,13 +2077,15 @@ def _reindex_body(
                 ).fetchone()
                 if file_row is None:
                     continue
-                _tombstone_file(
+                symbols_tombstoned_by_deleted_files += _tombstone_file(
                     conn,
                     file_pk=int(file_row["file_pk"]),
                     now=now,
                     event_source=event_source,
                     stats=stats,
+                    test_symbols_to_rebuild=test_symbols_to_rebuild,
                 )
+                touched_file_pks.add(int(file_row["file_pk"]))
 
     legacy_deleted_rows = conn.execute(
         """
@@ -2025,23 +2102,21 @@ def _reindex_body(
         now = _now_iso()
         for file_row in legacy_deleted_rows:
             with transaction(conn):
-                _tombstone_file(
+                symbols_tombstoned_by_deleted_files += _tombstone_file(
                     conn,
                     file_pk=int(file_row["file_pk"]),
                     now=now,
                     event_source=event_source,
                     stats=stats,
+                    test_symbols_to_rebuild=test_symbols_to_rebuild,
                 )
+                touched_file_pks.add(int(file_row["file_pk"]))
 
     now = _now_iso()
     with transaction(conn):
         # Build re-export map once per reindex so cross-file lookups through
         # `__init__.py` alias chains resolve correctly.
         reexport_map = _build_reexport_map(conn)
-
-        # Track file_pks where Jedi added a relation so the scoped
-        # test_edges rebuild can pick up any new test→target reachability.
-        jedi_touched_files: set[int] = set()
 
         if all_pending:
             _resolve_pending(
@@ -2051,7 +2126,7 @@ def _reindex_body(
                 now,
                 reexport_map=reexport_map,
                 config=config,
-                jedi_touched_files=jedi_touched_files,
+                relation_touched_files=relation_touched_file_pks,
             )
         # Move dead edges (live src, tombstoned dst) into unresolved_calls so
         # the backfill step can heal them when the target reappears (e.g. stub
@@ -2059,47 +2134,66 @@ def _reindex_body(
         _repair_dead_edges(conn, stats, now)
 
         # Conditional backfill:
-        #   * Full scan (`paths is None`): always backfill — the whole graph
-        #     may have shifted.
+        #   * Force or topology change: retry unresolved rows because new or
+        #     repaired symbols may have made previously-open edges resolvable.
         #   * Targeted update: only backfill if the parse actually changed
         #     the symbol inventory (new symbol or tombstone). Otherwise the
         #     graph topology is identical and the 15k-row walk is wasted work.
         symbols_count_after = conn.execute(
             "SELECT COUNT(*) FROM symbols WHERE deleted_at IS NULL"
         ).fetchone()[0]
+        parsed_symbol_tombstones = (
+            stats.symbols_tombstoned > symbols_tombstoned_by_deleted_files
+        )
+        symbols_added = symbols_count_after > symbols_count_before
         topology_changed = (
-            symbols_count_after != symbols_count_before
-            or stats.symbols_tombstoned > 0
+            symbols_added
+            or parsed_symbol_tombstones
             or stats.relations_queued_for_repair > 0
         )
-        if paths is None or topology_changed:
+        backfill_candidates: set[str] | None = new_symbol_candidates
+        if (
+            force
+            or parsed_symbol_tombstones
+            or stats.relations_queued_for_repair > 0
+            or symbols_count_before == 0
+        ):
+            backfill_candidates = None
+
+        if force or topology_changed:
             _backfill_unresolved(
                 conn,
                 stats,
                 now,
                 reexport_map=reexport_map,
                 config=config,
-                jedi_touched_files=jedi_touched_files,
+                relation_touched_files=relation_touched_file_pks,
+                candidate_names=backfill_candidates,
             )
         else:
             stats.relations_backfill_skipped = True
 
         # Scoped vs full test_edges rebuild:
-        #   * Full scan, force=True, or topology change ⇒ full rebuild.
-        #   * Targeted update with no topology change ⇒ only touch edges
-        #     whose test_symbol or target_symbol lives in a touched file.
-        if paths is None or topology_changed or force:
+        #   * Force, initial build, or in-file symbol removals ⇒ full rebuild.
+        #   * Otherwise rebuild only tests whose own file, existing target
+        #     file, backfilled source file, or deleted target/test symbol was
+        #     touched.
+        if force or symbols_count_before == 0 or parsed_symbol_tombstones:
             _rebuild_test_edges(conn, stats)
             stats.test_edges_rebuilt_scope = "full"
-        elif touched_file_pks or jedi_touched_files:
-            # Union in any files where Jedi landed new relations so tests
-            # that now have a resolved call chain get their edges refreshed.
-            _rebuild_test_edges_scoped(
-                conn, stats, touched_file_pks | jedi_touched_files
-            )
-            stats.test_edges_rebuilt_scope = "scoped"
         else:
-            # Nothing parsed at all — leave test_edges untouched.
+            scoped_test_pks = set(test_symbols_to_rebuild)
+            edge_scope_files = touched_file_pks | relation_touched_file_pks
+            if edge_scope_files:
+                scoped_test_pks.update(
+                    _collect_scoped_test_symbols(conn, edge_scope_files)
+                )
+            if scoped_test_pks:
+                _rebuild_test_edges_for_test_symbols(
+                    conn,
+                    stats,
+                    scoped_test_pks,
+                )
             stats.test_edges_rebuilt_scope = "scoped"
 
     return stats

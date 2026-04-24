@@ -70,10 +70,31 @@ Doctor after cleanup:
 
 ## Next Slices
 
-1. Skip full `test_edges` rebuild when `update --all` finds zero parsed,
-   tombstoned, or topology-changing files.
-2. Make topology-changing targeted updates rebuild only affected test-edge
-   neighborhoods instead of dropping/rebuilding the full table.
-3. Suppress or lazy-load noisy embedding backend imports in `doctor`.
-4. Run this same pressure profile after installing `scip` + `scip-python` to
+1. Suppress or lazy-load noisy embedding backend imports in `doctor`.
+2. Run this same pressure profile after installing `scip` + `scip-python` to
    compare unresolved-call reduction.
+3. Improve scoped affected-test precision for changed intermediate helper
+   paths. The current scoped path handles touched test files, existing target
+   files, deleted target/test symbols, and backfilled source files.
+
+## Follow-Up: Backfill/Test-Edge Bottleneck
+
+Implemented after the first pressure run:
+
+- No-op full scans now skip global unresolved-call backfill and global
+  `test_edges` rebuild when no files changed.
+- Topology-changing updates rebuild affected tests from the touched/backfilled
+  scope instead of dropping and rebuilding the full `test_edges` table.
+- Backfill is filtered to newly-available symbol names when possible, avoiding
+  a full scan of all unresolved calls for unrelated new symbols.
+
+FastAPI clone before/after:
+
+| Scenario | Before | After |
+|---|---:|---:|
+| no-op `update --all` | 31.394s | 3.285s |
+| one-file new-symbol add | 26.047s | 0.410s |
+| one-file delete | 25.251s | 0.262s |
+
+The remaining 3.3s no-op full scan is mostly filesystem/stat + SQLite lookup
+over 2,765 indexed files.

@@ -97,13 +97,92 @@ def test_backfill_runs_when_new_symbol_appears(tmp_path: Path):
         db_mod.close(conn)
 
 
-def test_full_scan_always_runs_backfill(tmp_path: Path):
+def test_noop_full_scan_skips_backfill_and_test_edge_rebuild(tmp_path: Path):
     _write_repo(tmp_path)
     config, conn = _init(tmp_path)
     try:
         reindex(conn, config, paths=None, event_source="init")
         stats = reindex(conn, config, paths=None, event_source="update")
-        assert stats.relations_backfill_skipped is False
+        assert stats.files_unchanged > 0
+        assert stats.relations_backfill_skipped is True
+        assert stats.test_edges_rebuilt_scope == "scoped"
+        assert stats.test_edges_removed == 0
+        assert stats.test_edges_inserted == 0
+    finally:
+        db_mod.close(conn)
+
+
+def test_targeted_backfill_rebuilds_affected_tests_scoped(tmp_path: Path):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "service.py").write_text(
+        textwrap.dedent(
+            """
+            from pkg.util import helper
+
+            def run():
+                return helper(1)
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_service.py").write_text(
+        textwrap.dedent(
+            """
+            from pkg.service import run
+
+            def test_run():
+                assert run() == 2
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    config, conn = _init(tmp_path)
+    try:
+        reindex(conn, config, paths=None, event_source="init")
+        util = tmp_path / "pkg" / "util.py"
+        util.write_text("def helper(x):\n    return x + 1\n", encoding="utf-8")
+
+        stats = reindex(conn, config, paths=[util], event_source="update")
+
+        assert stats.relations_backfilled >= 1
+        assert stats.test_edges_rebuilt_scope == "scoped"
+        helper_edge = conn.execute(
+            """
+            SELECT 1
+              FROM test_edges te
+              JOIN symbols test_s ON test_s.symbol_pk = te.test_symbol_pk
+              JOIN symbols target_s ON target_s.symbol_pk = te.target_symbol_pk
+             WHERE test_s.canonical_name = 'tests.test_service.test_run'
+               AND target_s.canonical_name = 'pkg.util.helper'
+            """
+        ).fetchone()
+        assert helper_edge is not None
+    finally:
+        db_mod.close(conn)
+
+
+def test_targeted_delete_rebuilds_affected_tests_scoped(tmp_path: Path):
+    _write_repo(tmp_path)
+    config, conn = _init(tmp_path)
+    try:
+        reindex(conn, config, paths=None, event_source="init")
+        target = tmp_path / "pkg" / "mod0.py"
+        target.unlink()
+
+        stats = reindex(conn, config, paths=[target], event_source="update")
+
+        assert stats.test_edges_rebuilt_scope == "scoped"
+        stale_edge = conn.execute(
+            """
+            SELECT 1
+              FROM test_edges te
+              JOIN symbols target_s ON target_s.symbol_pk = te.target_symbol_pk
+             WHERE target_s.canonical_name = 'pkg.mod0.fn0'
+            """
+        ).fetchone()
+        assert stale_edge is None
     finally:
         db_mod.close(conn)
 
