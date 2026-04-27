@@ -262,12 +262,15 @@ def run(args: argparse.Namespace) -> int:
             db_mod.ensure_schema(conn, config)
             stored_version = db_mod.get_schema_version(conn)
             columns_ok, missing = db_mod.expected_column_health(conn)
+            tables_ok, missing_tables = db_mod.expected_table_health(conn)
             report["schema_version"] = stored_version
             report["schema_health"] = {
                 "version": stored_version,
                 "expected": db_mod.SCHEMA_VERSION,
                 "columns_ok": columns_ok,
                 "missing": missing,
+                "tables_ok": tables_ok,
+                "missing_tables": missing_tables,
             }
             report["parse_status"] = _parse_status_counts(conn)
             report["semantic_sources"] = _semantic_source_counts(conn)

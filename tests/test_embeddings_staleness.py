@@ -192,11 +192,11 @@ def test_stale_count_doctor_metric(tmp_path: Path):
         db_mod.close(conn)
 
 
-def test_schema_version_is_5(tmp_path: Path):
+def test_schema_version_is_current(tmp_path: Path):
     _write_v1(tmp_path)
     _config, conn = _init(tmp_path)
     try:
-        assert db_mod.get_schema_version(conn) == "5"
+        assert db_mod.get_schema_version(conn) == db_mod.SCHEMA_VERSION
         cols = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)")}
         assert "content_hash" in cols
     finally:

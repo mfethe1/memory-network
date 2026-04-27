@@ -12,8 +12,8 @@ Project-memory summary: [`CLAUDE.md`](CLAUDE.md).
 
 First working vertical slice. `init`, `update`, `grep`, `symbol`, `query`,
 `doctor`, `watch`, `impact`, `tests`, `repo-map`, `embed`, `similar`,
-`ask`, `mcp-serve`, `import-scip`, and `scip-python-index` are live. See
-[Known Limitations](#known-limitations).
+`ask`, `graph`, `graph-server`, `agent`, `mcp-serve`, `import-scip`, and
+`scip-python-index` are live. See [Known Limitations](#known-limitations).
 
 ## Quick start
 
@@ -36,6 +36,22 @@ python -m code_index symbol reindex
 # Ranked FTS5 retrieval over chunks
 python -m code_index query "chunk upsert" --limit 5
 
+# Interactive file graph with importance and care guidance.
+# HTML output also writes .code_index/repo-graph.json as a refresh sidecar.
+python -m code_index graph --output .code_index/repo-graph.html
+
+# Keep the graph artifact current while agents work (pair with code_index watch)
+python -m code_index graph --watch --output .code_index/repo-graph.html
+
+# Serve the graph with live SSE refreshes and durable node notes.
+# Node notes sync to .code_index/graph-notes.json.
+python -m code_index graph-server --port 8767
+
+# Record agent activity so the graph can show live movement before reindexing
+python -m code_index agent start --agent-name Codex --prompt "refactor graph"
+python -m code_index agent event --type edit --file code_index/commands/graph_cmd.py --message "updating graph"
+python -m code_index agent recent
+
 # Import a SCIP semantic index exported as JSON
 python -m code_index import-scip --json-index index.scip.json
 
@@ -53,11 +69,30 @@ python -m code_index doctor
 Every subcommand accepts `--json` for machine-readable output. The JSON shape
 is the stable interface for agents; human output is unstable across versions.
 
+## Live code graph
+
+`code_index graph` writes a standalone HTML/JSON artifact for review. The HTML
+shows a tree navigator, graph nodes, recent agent/file edits, node summaries,
+embedded source where allowed, and a notes tab that exports agent-task JSON.
+
+`code_index graph-server` is the interactive local mode. It serves
+`/repo-graph.html`, `/repo-graph.json`, `/notes.json`, and `/events`. The
+browser receives Server-Sent Events when agent activity or notes change, then
+refreshes the graph data without a page reload. Saved node notes are durable in
+`.code_index/graph-notes.json`, and note saves are also recorded as
+`agent_events` so the recent activity panel can show user guidance next to
+agent work.
+
+Agents can write activity through the CLI, MCP mutating tools when explicitly
+enabled, or `POST /api/agent-events` on the graph server. The current graph
+uses this to highlight active files and the last edited files before the index
+has been refreshed.
+
 ## Architecture (this slice)
 
 ```
           ┌──────────────────────────────────────────────────────┐
-          │                     cli.py (argparse)                │
+          │          cli.py dispatch + cli_parser.py (argparse)  │
           └──────────────────────────────────────────────────────┘
                                     │
           ┌──────────────────────────────────────────────────────┐
@@ -70,12 +105,16 @@ is the stable interface for agents; human output is unstable across versions.
 
                   Durable spine  →  files · symbols · occurrences · relations · diagnostics
                   Projection     →  chunks · chunks_fts · chunk_edits · chunk_lineage
+                  Activity       →  agent_runs · agent_events
                   Reserved       →  embeddings · test_edges · repo_map_snapshots · commits · file_versions
 
           Search fan-out:
               grep    → search/lexical.py  (ripgrep ▸ Python re fallback)
               symbol  → search/symbol_search.py (symbols/occurrences join)
               query   → search/fts.py  (weighted BM25 over chunks_fts)
+              graph   → commands/graph_cmd.py + graph_model/html/server helpers
+              agent   → agent_activity.py + commands/agent_cmd.py
+              mcp     → code_graph/agent_activity tools + codeindex://graph resources
 ```
 
 ### Parser priority
@@ -141,16 +180,11 @@ Tracked as TODOs rather than silent gaps:
   currently returns a clear error telling you what to install.
 - **No Universal Ctags extraction.** Detection is live in `doctor`; the
   adapter is scaffolded only.
-- **No `watch` command.** The shared `pipeline.reindex()` entrypoint is
-  already in place; `watch` just needs a debounced dispatcher.
-- **No `impact` / `tests` commands.** The `relations` and `test_edges` tables
-  exist in the schema but only `contains` is populated so far.
-- **No `mcp-serve` command.** Tools/resources/prompts surface is designed in
-  `plans/code-index-repo-plan.md` §12.
-- **No git hook installer yet.** Hooks directory is reserved; installation
-  via `core.hooksPath` lands next.
-- **No embeddings retrieval.** Table is reserved; v1 explicitly keeps
-  embeddings off the hot path.
+- **Graph-server is local-first.** It supports SSE, durable notes, and local
+  POST adapters, but it is not yet a hosted multi-user collaboration service.
+- **Provider routing is adapter-level.** The graph can export node task JSON
+  and record activity, but choosing Codex vs Claude still belongs in a thin
+  orchestration/webhook layer above `code_index`.
 - **Call graph / override / implements relations not yet extracted.**
 - **Inner-block chunks are de-scoped in v1** per the spec; oversized
   functions are not split.
@@ -161,25 +195,27 @@ Tracked as TODOs rather than silent gaps:
 python -m pytest tests/
 ```
 
-19 tests covering hashing stability, ignore rules, Python AST extraction,
-pipeline upsert/tombstone/rewrite semantics, and CLI smoke. Tests run with
-the Python stdlib only.
+255 tests cover hashing stability, ignore rules, Python AST extraction,
+pipeline upsert/tombstone/rewrite semantics, graph notes/activity, MCP auth,
+schema repair, and CLI smoke. Tests run with the Python stdlib only.
 
 ## Repo layout
 
 ```
 code_index/           core package
-  cli.py              argparse entrypoint
+  cli.py              thin CLI dispatch
+  cli_parser.py       argparse command surface
   pipeline.py         shared init/update/watch pipeline
   db.py               sqlite + schema application
   schema.sql          full schema (spine + projection + reserved)
+  agent_activity.py   graph-facing agent run/event records
   ignore.py           gitignore-ish matcher
   scanner.py          file discovery
   symbols.py          symbol_uid / chunk_uid
   hashing.py          raw + normalized content hashes
   parsers/            per-language adapters + registry
   search/             lexical, FTS, symbol search
-  commands/           one file per subcommand
+  commands/           subcommands plus graph/MCP helper modules
 tests/                pytest suite
 plans/                implementation plan
 docs/                 authoritative spec + long context

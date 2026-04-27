@@ -35,6 +35,8 @@ def test_describe_surface_default_omits_mutating_tools() -> None:
         "affected_tests",
         "doctor",
         "ask",
+        "code_graph",
+        "agent_activity",
     ):
         assert read_tool in names, f"missing read tool {read_tool!r} in default surface"
 
@@ -44,9 +46,18 @@ def test_describe_surface_with_allow_writes_includes_mutating_tools() -> None:
     names = {t["name"] for t in surface["tools"]}
     assert "update" in names
     assert "rebuild_fts" in names
+    assert "agent_start" in names
+    assert "agent_event" in names
+    assert "agent_end" in names
     # Mutating tool descriptions must warn the caller.
     for tool in surface["tools"]:
-        if tool["name"] in ("update", "rebuild_fts"):
+        if tool["name"] in (
+            "update",
+            "rebuild_fts",
+            "agent_start",
+            "agent_event",
+            "agent_end",
+        ):
             assert "MUTATING" in tool["description"].upper()
 
 
@@ -80,8 +91,12 @@ def test_build_fastmcp_default_does_not_register_mutating_tools(tmp_path) -> Non
     names = _registered_tool_names(mcp)
     assert "update" not in names
     assert "rebuild_fts" not in names
+    assert "agent_start" not in names
+    assert "agent_event" not in names
+    assert "agent_end" not in names
     assert "search_text" in names
     assert "doctor" in names
+    assert "agent_activity" in names
 
 
 def test_build_fastmcp_allow_writes_registers_mutating_tools(tmp_path) -> None:
@@ -93,6 +108,7 @@ def test_build_fastmcp_allow_writes_registers_mutating_tools(tmp_path) -> None:
     names = _registered_tool_names(mcp)
     assert "update" in names
     assert "rebuild_fts" in names
+    assert "agent_event" in names
 
 
 # ---------- CLI subparser exposes the flag ----------

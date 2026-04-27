@@ -80,6 +80,27 @@ def test_expected_column_health_reports_missing(tmp_path: Path):
         db_mod.close(conn)
 
 
+def test_apply_schema_repairs_dropped_additive_table(tmp_path: Path):
+    config, conn = _init_index(tmp_path)
+    try:
+        assert db_mod.schema_is_ready(conn) is True
+        conn.execute("DROP TABLE agent_events")
+
+        tables_ok, missing = db_mod.expected_table_health(conn)
+        assert tables_ok is False
+        assert "agent_events" in missing
+        assert db_mod.schema_is_ready(conn) is False
+
+        db_mod.apply_schema(conn)
+
+        tables_ok, missing = db_mod.expected_table_health(conn)
+        assert tables_ok is True
+        assert missing == []
+        assert db_mod.get_schema_version(conn) == db_mod.SCHEMA_VERSION
+    finally:
+        db_mod.close(conn)
+
+
 def test_doctor_json_includes_schema_health(tmp_path: Path):
     config, conn = _init_index(tmp_path)
     db_mod.close(conn)

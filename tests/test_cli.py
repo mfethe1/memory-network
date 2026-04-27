@@ -88,9 +88,22 @@ def test_mcp_serve_describe_emits_tool_and_resource_surface(
         "impact",
         "affected_tests",
         "doctor",
+        "code_graph",
+        "agent_activity",
     } <= tool_names
     assert "update" not in tool_names
     assert "rebuild_fts" not in tool_names
     resource_uris = {r["uri"] for r in payload["resources"]}
     assert "codeindex://repo-map" in resource_uris
     assert "codeindex://doctor" in resource_uris
+    assert "codeindex://graph" in resource_uris
+
+
+def test_graph_server_subparser_exists():
+    from code_index.cli import build_parser
+
+    parser = build_parser()
+    ns = parser.parse_args(["graph-server", "--port", "8767", "--quiet"])
+    assert ns.command == "graph-server"
+    assert ns.port == 8767
+    assert ns.quiet is True

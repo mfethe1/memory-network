@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 SCHEMA_FILE = Path(__file__).with_name("schema.sql")
 
 
@@ -54,7 +54,7 @@ def apply_schema(conn: sqlite3.Connection) -> None:
 
 def schema_is_ready(conn: sqlite3.Connection) -> bool:
     """Read-only health probe: version matches AND all expected additive
-    columns are present. Used by read-only commands to skip the
+    columns/tables are present. Used by read-only commands to skip the
     `apply_schema` write path in the common case.
     """
     try:
@@ -63,15 +63,16 @@ def schema_is_ready(conn: sqlite3.Connection) -> bool:
         return False
     if stored != SCHEMA_VERSION:
         return False
-    ok, _missing = expected_column_health(conn)
-    return ok
+    columns_ok, _missing_columns = expected_column_health(conn)
+    tables_ok, _missing_tables = expected_table_health(conn)
+    return columns_ok and tables_ok
 
 
 def ensure_schema(conn: sqlite3.Connection, config=None) -> None:
     """Idempotent schema-readiness for read-only callers.
 
     Fast path: if the DB is already at the current version with every
-    additive column present, do nothing — no writes, no lock.
+    additive column/table present, do nothing — no writes, no lock.
 
     Slow path (stale or partially-corrupt DB): acquire the writer lock
     and run `apply_schema`. Writer lock is required because the repair
@@ -149,6 +150,10 @@ def _migrate_if_needed(conn: sqlite3.Connection, prior: str | None) -> None:
         if _table_exists(conn, "embeddings"):
             _migrate_embeddings_v5(conn)
         return
+    if prior == "5":
+        # v5 → v6 only adds append-only agent activity tables. `schema.sql`
+        # creates them idempotently; do not drop derived graph/index tables.
+        return
     # Unknown older version: safest local policy is to drop the derived tables
     # and let the next reindex rebuild them. Canonical tables survive.
     for t in ("test_edges", "unresolved_calls"):
@@ -164,6 +169,11 @@ _EXPECTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("files", "git_author", "TEXT"),
     ("embeddings", "embedding_norm", "REAL"),
     ("embeddings", "content_hash", "TEXT"),
+)
+
+_EXPECTED_TABLES: tuple[str, ...] = (
+    "agent_runs",
+    "agent_events",
 )
 
 
@@ -183,6 +193,17 @@ def expected_column_health(
         cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in cols:
             missing.append(f"{table}.{column}")
+    return (not missing, missing)
+
+
+def expected_table_health(conn: sqlite3.Connection) -> tuple[bool, list[str]]:
+    """Return (ok, missing) for additive tables the schema expects.
+
+    A same-version DB can be missing an additive table after an interrupted
+    upgrade or manual repair. `schema_is_ready()` checks this so read commands
+    can fall back to the locked `apply_schema()` repair path.
+    """
+    missing = [table for table in _EXPECTED_TABLES if not _table_exists(conn, table)]
     return (not missing, missing)
 
 

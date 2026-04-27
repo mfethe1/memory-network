@@ -35,128 +35,85 @@ Transports:
 from __future__ import annotations
 
 import argparse
-import ipaddress
 import json
 import os
-import secrets
-import stat
 import sys
 from pathlib import Path
 from typing import Any
 
-from code_index import __version__ as _code_index_version
 from code_index import config as cfg_mod
 from code_index import db as db_mod
-from code_index.commands.impact_cmd import _resolve_target, compute_impact
+from code_index.commands import mcp_tool_impl as _mcp_tool_impl
 from code_index.locking import LockTimeoutError, writer_lock
-from code_index.pipeline import reindex
-from code_index.runners.pytest import build_pytest_invocation
-from code_index.search import fts, lexical, symbol_search
-from code_index.structural import ts_python
+from code_index.commands.mcp_auth import (
+    TOKEN_ENV_VAR,
+    TOKEN_FILENAME,
+    _generate_token,
+    _is_loopback,
+    _read_token_file,
+    _resolve_bearer_token,
+    _validate_bearer,
+    _write_token_file,
+)
+from code_index.commands.mcp_surface import (
+    _READ_TOOL_DESCRIPTIONS,
+    _RESOURCE_DESCRIPTIONS,
+    _TOOL_DESCRIPTIONS,
+    _WRITE_TOOL_DESCRIPTIONS,
+    _tool_descriptions,
+    describe_surface,
+)
+from code_index.commands.mcp_tool_impl import (
+    _resource_chunk,
+    _resource_repo_map,
+    _resource_symbol,
+    _tool_affected_tests,
+    _tool_agent_activity,
+    _tool_agent_end,
+    _tool_agent_event,
+    _tool_agent_start,
+    _tool_code_graph,
+    _tool_doctor,
+    _tool_find_symbol,
+    _tool_impact,
+    _tool_search_ast,
+    _tool_search_query,
+    _tool_search_text,
+)
 
 
-# ---------- HTTP auth helpers (pure functions; tested directly) ----------
 
 
-TOKEN_FILENAME = "mcp-token"
-TOKEN_ENV_VAR = "CODE_INDEX_MCP_TOKEN"
+def _with_local_writer_lock(fn, *args, **kwargs):
+    """Run moved MCP tool implementations with this module's writer_lock.
 
-
-def _generate_token() -> str:
-    """Return a 32-byte hex-encoded random token (64 hex chars)."""
-    return secrets.token_hex(32)
-
-
-def _write_token_file(path: Path, token: str) -> None:
-    """Write token to path with mode 0600 on POSIX. Creates parent dirs.
-
-    Note: On Windows the chmod to 0600 is a best-effort no-op — NTFS ACLs
-    provide the real protection and we don't try to set them here. Callers
-    should rely on the file living under `.code_index/` (which inherits the
-    repo's existing ACLs).
+    Some tests and debuggers monkeypatch `mcp_serve_cmd.writer_lock`
+    directly. This adapter preserves that seam after moving implementation
+    code into `mcp_tool_impl`.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(token, encoding="utf-8")
+    original = _mcp_tool_impl.writer_lock
+    _mcp_tool_impl.writer_lock = writer_lock
     try:
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
-    except (OSError, NotImplementedError):
-        # Windows / odd filesystems: best-effort only.
-        pass
+        return fn(*args, **kwargs)
+    finally:
+        _mcp_tool_impl.writer_lock = original
 
 
-def _read_token_file(path: Path) -> str:
-    token = path.read_text(encoding="utf-8").strip()
-    if not token:
-        raise ValueError(f"bearer token file is empty: {path}")
-    return token
-
-
-def _is_loopback(bind: str) -> bool:
-    """True iff bind is a literal loopback address ('127.0.0.1', '::1', 'localhost')."""
-    if bind in ("localhost", "127.0.0.1", "::1"):
-        return True
-    try:
-        return ipaddress.ip_address(bind).is_loopback
-    except ValueError:
-        return False
-
-
-def _resolve_bearer_token(
-    *,
-    flag_token: str | None,
-    flag_token_file: str | None,
-    env_token: str | None,
+def _tool_update(
     config: cfg_mod.Config,
-    generate_if_missing: bool,
-    stderr,
-) -> tuple[str | None, str]:
-    """Return (token, source). Source is one of: 'flag', 'file', 'env', 'generated'.
-
-    If `generate_if_missing` is True and no other source is set, generate a
-    new token, persist it to `.code_index/mcp-token` with 0600 perms, and
-    print it ONCE to `stderr` so the user can copy it.
-
-    If `generate_if_missing` is False, returns (None, 'none') when nothing is
-    set — caller decides what to do.
-    """
-    if flag_token:
-        return flag_token.strip(), "flag"
-    if flag_token_file:
-        return _read_token_file(Path(flag_token_file)), "file"
-    if env_token:
-        return env_token.strip(), "env"
-    if not generate_if_missing:
-        return None, "none"
-    token = _generate_token()
-    token_path = config.index_dir / TOKEN_FILENAME
-    _write_token_file(token_path, token)
-    print(
-        f"code_index mcp-serve: generated bearer token (copy this):\n"
-        f"  token: {token}\n"
-        f"  file:  {token_path} (mode 0600 on POSIX)\n"
-        f"  env:   export {TOKEN_ENV_VAR}={token}\n",
-        file=stderr,
+    files: list[str] | None = None,
+    all: bool = False,
+) -> dict:
+    return _with_local_writer_lock(
+        _mcp_tool_impl._tool_update,
+        config,
+        files,
+        all,
     )
-    return token, "generated"
 
 
-def _validate_bearer(auth_header: str | None, expected: str) -> bool:
-    """Return True iff `auth_header` is a well-formed `Bearer <expected>`.
-
-    Uses `secrets.compare_digest` to avoid timing leaks.
-    """
-    if not auth_header or not expected:
-        return False
-    parts = auth_header.split(None, 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        return False
-    return secrets.compare_digest(parts[1].strip(), expected)
-
-
-_UNAVAILABLE = {
-    "error": "MCP SDK not installed",
-    "hint": "install with: pip install 'code-index[mcp]'  (or: pip install mcp)",
-}
+def _tool_rebuild_fts(config: cfg_mod.Config) -> dict:
+    return _with_local_writer_lock(_mcp_tool_impl._tool_rebuild_fts, config)
 
 
 def _mcp_available() -> bool:
@@ -181,357 +138,6 @@ def _resolve_config(root_hint: Path) -> tuple[cfg_mod.Config | None, dict | None
     finally:
         db_mod.close(conn)
     return config, None
-
-
-# ---------- Pure tool implementations (plain functions; no MCP imports) ----------
-
-
-def _tool_search_text(
-    config: cfg_mod.Config,
-    pattern: str,
-    path: str | None = None,
-    max_count: int = 50,
-    ignore_case: bool = False,
-    fixed_strings: bool = False,
-) -> dict:
-    return lexical.grep(
-        config,
-        pattern=pattern,
-        path_glob=path,
-        max_count=max_count,
-        case_insensitive=ignore_case,
-        fixed_strings=fixed_strings,
-    )
-
-
-def _tool_search_query(
-    config: cfg_mod.Config,
-    query: str,
-    limit: int = 20,
-    language: str | None = None,
-    chunk_type: str | None = None,
-) -> dict:
-    conn = db_mod.connect(config.db_path)
-    try:
-        results = fts.search(
-            conn, query, limit=limit, language=language, chunk_type=chunk_type
-        )
-    finally:
-        db_mod.close(conn)
-    return {"engine": "fts5", "query": query, "results": results}
-
-
-def _tool_search_ast(config: cfg_mod.Config, pattern: str, limit: int = 100) -> dict:
-    if not ts_python.available():
-        return {
-            "error": "tree-sitter not available",
-            "reason": ts_python._unavailable_reason(),
-        }
-    from code_index.ignore import build as build_matcher
-    from code_index.scanner import iter_files
-
-    matcher = build_matcher(
-        config.root, extra=config.extra_ignore, include_hidden=config.include_hidden
-    )
-    files = [
-        (s.path, s.rel_path)
-        for s in iter_files(config.root, matcher, max_bytes=config.max_file_bytes)
-        if s.rel_path.lower().endswith((".py", ".pyi"))
-    ]
-    try:
-        result = ts_python.query_files(files, pattern)
-    except Exception as exc:
-        return {"error": "invalid tree-sitter query", "detail": repr(exc)}
-    caps = [
-        {
-            "file": c.file_path,
-            "start_line": c.start_line,
-            "end_line": c.end_line,
-            "capture_name": c.capture_name,
-            "node_kind": c.node_kind,
-            "preview": c.text[:120].replace("\n", " "),
-        }
-        for c in result.captures[:limit]
-    ]
-    return {
-        "engine": "tree-sitter",
-        "query": result.query,
-        "expanded_query": result.expanded_query,
-        "total_captures": len(result.captures),
-        "returned": len(caps),
-        "results": caps,
-    }
-
-
-def _tool_find_symbol(
-    config: cfg_mod.Config,
-    name: str,
-    kind: str | None = None,
-    language: str | None = None,
-    limit: int = 50,
-    references: bool = False,
-) -> dict:
-    conn = db_mod.connect(config.db_path)
-    try:
-        results = symbol_search.lookup(
-            conn,
-            name,
-            kind=kind,
-            language=language,
-            limit=limit,
-            include_references=references,
-        )
-    finally:
-        db_mod.close(conn)
-    return {"query": name, "results": results}
-
-
-def _tool_impact(
-    config: cfg_mod.Config,
-    symbol: str,
-    max_depth: int = 2,
-    no_imports: bool = False,
-) -> dict:
-    conn = db_mod.connect(config.db_path)
-    try:
-        candidates = _resolve_target(conn, symbol)
-        if not candidates:
-            return {"error": "no matching symbol", "query": symbol}
-        target_pk = int(candidates[0]["symbol_pk"])
-        result = compute_impact(
-            conn,
-            target_pk,
-            max_depth=max_depth,
-            include_imports=not no_imports,
-        )
-        result["query"] = symbol
-        return result
-    finally:
-        db_mod.close(conn)
-
-
-def _tool_affected_tests(config: cfg_mod.Config, symbol: str) -> dict:
-    from code_index.commands.tests_cmd import _affected, _resolve_input
-
-    conn = db_mod.connect(config.db_path)
-    try:
-        candidates = _resolve_input(conn, symbol)
-        if not candidates:
-            return {"error": "no matching symbol", "query": symbol}
-        target = candidates[0]
-        affected = _affected(conn, int(target["symbol_pk"]))
-    finally:
-        db_mod.close(conn)
-    return {
-        "query": symbol,
-        "target": {
-            "symbol_uid": target["symbol_uid"],
-            "canonical_name": target["canonical_name"],
-            "kind": target["kind"],
-        },
-        "affected_tests": affected,
-        "runner": build_pytest_invocation(affected),
-    }
-
-
-def _tool_doctor(config: cfg_mod.Config) -> dict:
-    from code_index.commands.doctor_cmd import (
-        _fts_consistency,
-        _language_counts,
-        _parse_status_counts,
-        _relation_counts,
-        _semantic_source_counts,
-    )
-
-    conn = db_mod.connect(config.db_path)
-    try:
-        return {
-            "root": str(config.root),
-            "schema_version": db_mod.get_schema_version(conn),
-            "parse_status": _parse_status_counts(conn),
-            "semantic_sources": _semantic_source_counts(conn),
-            "languages": _language_counts(conn),
-            "relations": _relation_counts(conn),
-            "fts_consistency": _fts_consistency(conn),
-            "test_edges": conn.execute("SELECT COUNT(*) FROM test_edges").fetchone()[0],
-            "unresolved_calls_open": conn.execute(
-                "SELECT COUNT(*) FROM unresolved_calls WHERE resolved_at IS NULL"
-            ).fetchone()[0],
-        }
-    finally:
-        db_mod.close(conn)
-
-
-def _tool_update(
-    config: cfg_mod.Config,
-    files: list[str] | None = None,
-    all: bool = False,
-) -> dict:
-    paths = [Path(p) for p in files] if files else (None if all else [])
-    try:
-        with writer_lock(config):
-            conn = db_mod.connect(config.db_path)
-            try:
-                db_mod.apply_schema(conn)
-                stats = reindex(conn, config, paths=paths, event_source="mcp")
-            finally:
-                db_mod.close(conn)
-    except LockTimeoutError as exc:
-        return {
-            "error": "another writer holds the lock",
-            "lock_path": str(exc.lock_path),
-            "timeout_s": exc.timeout_s,
-        }
-    return {"stats": stats.to_dict()}
-
-
-def _tool_rebuild_fts(config: cfg_mod.Config) -> dict:
-    from code_index.commands.rebuild_fts_cmd import _rebuild
-
-    try:
-        with writer_lock(config):
-            conn = db_mod.connect(config.db_path)
-            try:
-                db_mod.apply_schema(conn)
-                return _rebuild(conn)
-            finally:
-                db_mod.close(conn)
-    except LockTimeoutError as exc:
-        return {
-            "error": "another writer holds the lock",
-            "lock_path": str(exc.lock_path),
-            "timeout_s": exc.timeout_s,
-        }
-
-
-# ---------- Resource implementations ----------
-
-
-def _resource_repo_map(config: cfg_mod.Config) -> dict:
-    conn = db_mod.connect(config.db_path)
-    try:
-        rows = conn.execute(
-            """
-            SELECT canonical_name, kind, display_name
-              FROM symbols
-             WHERE deleted_at IS NULL
-               AND kind IN ('module', 'class', 'function', 'method')
-             ORDER BY canonical_name ASC
-            """
-        ).fetchall()
-    finally:
-        db_mod.close(conn)
-    return {
-        "symbols": [
-            {
-                "canonical_name": r["canonical_name"],
-                "kind": r["kind"],
-                "display_name": r["display_name"],
-            }
-            for r in rows
-        ],
-        "count": len(rows),
-    }
-
-
-def _resource_symbol(config: cfg_mod.Config, name: str) -> dict:
-    return _tool_find_symbol(config, name, references=True, limit=10)
-
-
-def _resource_chunk(config: cfg_mod.Config, chunk_uid: str) -> dict:
-    conn = db_mod.connect(config.db_path)
-    try:
-        row = conn.execute(
-            """
-            SELECT chunk_uid, file_path, chunk_type, symbol_name, symbol_path,
-                   signature, start_line, end_line, context_json, content
-              FROM chunks
-             WHERE chunk_uid = ? AND deleted_at IS NULL
-            """,
-            (chunk_uid,),
-        ).fetchone()
-    finally:
-        db_mod.close(conn)
-    if row is None:
-        return {"error": "chunk not found", "chunk_uid": chunk_uid}
-    return dict(row)
-
-
-# ---------- Static surface (used by `--describe` and by FastMCP registration) ----------
-
-
-# Read-only tool descriptions — always exposed.
-_READ_TOOL_DESCRIPTIONS: dict[str, str] = {
-    "search_text": "Lexical search (ripgrep fast path, python-re fallback). Returns hits and an rg_resolution trail.",
-    "search_query": "Ranked FTS5 retrieval (BM25) over chunks; symbol-name hits rank above body.",
-    "search_ast": "Tree-sitter structural query for Python. Pattern is a bundled name (class|function|method|call|import|...) or raw S-expression.",
-    "find_symbol": "Look up a symbol by canonical name, display name, or substring. Set references=True to include up to 50 call-site occurrences.",
-    "impact": "Blast-radius analysis: walks inbound calls/inherits/contains (+imports) from a symbol. Returns impacted_symbols + impacted_files + rationale.",
-    "affected_tests": "Tests that reach a symbol (direct + transitive). Returns affected_tests plus a ready-to-run pytest invocation.",
-    "doctor": "Index health snapshot: parse_status, semantic_sources, relation counts, FTS consistency + rebuild recommendation.",
-    "ask": "Natural-language query synthesis. Pass a question string (e.g. 'who calls reindex', 'tests for apply_schema', 'find code like jwt expiry'); returns intent classification + the right primitive's results + a one-paragraph narrative.",
-}
-
-# Mutating tool descriptions — only exposed when --allow-writes is passed.
-# The "MUTATING —" prefix makes the warning visible to agents in the tool list.
-_WRITE_TOOL_DESCRIPTIONS: dict[str, str] = {
-    "update": "MUTATING — reindexes the repo (takes the writer lock). `files=[...]` for targeted update; `all=True` for a full sweep. Empty call pulses the pipeline.",
-    "rebuild_fts": "MUTATING — drops + recreates chunks_fts to prune tombstone drift. Holds the writer lock while running.",
-}
-
-
-def _tool_descriptions(*, allow_writes: bool) -> dict[str, str]:
-    """Single source of truth for the exposed tool surface.
-
-    `describe_surface()` and `_build_fastmcp()` both consume this so the
-    advertised surface and the actually-registered surface can never drift.
-    """
-    if allow_writes:
-        return {**_READ_TOOL_DESCRIPTIONS, **_WRITE_TOOL_DESCRIPTIONS}
-    return dict(_READ_TOOL_DESCRIPTIONS)
-
-
-# Back-compat alias. External callers (tests, docs tooling) may still import
-# the old name; it now reflects the full-superset surface.
-_TOOL_DESCRIPTIONS: dict[str, str] = _tool_descriptions(allow_writes=True)
-
-_RESOURCE_DESCRIPTIONS: list[tuple[str, str]] = [
-    (
-        "codeindex://repo-map",
-        "Compact list of every live symbol (module/class/function/method).",
-    ),
-    (
-        "codeindex://doctor",
-        "Snapshot of index health: parse status, relations, FTS drift.",
-    ),
-    (
-        "codeindex://symbol/{canonical}",
-        "Symbol lookup by canonical name; includes references.",
-    ),
-    ("codeindex://chunk/{chunk_uid}", "Canonical chunk content + context_json."),
-]
-
-
-def describe_surface(*, allow_writes: bool = False) -> dict:
-    """Return the static surface description. Pure function; used by
-    `--describe` and by `tests/test_cli.py`.
-
-    When `allow_writes=False` (the default), mutating tools (`update`,
-    `rebuild_fts`) are omitted. The FastMCP registration in
-    `_build_fastmcp` uses the same selector so the advertised and
-    actually-exposed surfaces stay in sync.
-    """
-    tools = _tool_descriptions(allow_writes=allow_writes)
-    return {
-        "server": "code_index",
-        "version": _code_index_version,
-        "transport": "stdio",
-        "read_only": not allow_writes,
-        "tools": [{"name": name, "description": desc} for name, desc in tools.items()],
-        "resources": [
-            {"uri": uri, "description": desc} for uri, desc in _RESOURCE_DESCRIPTIONS
-        ],
-    }
 
 
 # ---------- FastMCP wiring ----------
@@ -608,6 +214,21 @@ def _build_fastmcp(config: cfg_mod.Config, *, allow_writes: bool = False):
         finally:
             db_mod.close(conn)
 
+    @mcp.tool(description=tools["code_graph"])
+    def code_graph(
+        include_code: bool = False,
+        max_code_bytes: int = 200_000,
+        focus_paths: list[str] | None = None,
+        agent_name: str | None = None,
+    ) -> dict:
+        return _tool_code_graph(
+            config, include_code, max_code_bytes, focus_paths, agent_name
+        )
+
+    @mcp.tool(description=tools["agent_activity"])
+    def agent_activity(limit: int = 100) -> dict:
+        return _tool_agent_activity(config, limit)
+
     # Mutating tools — only registered when --allow-writes is set.
     if allow_writes:
 
@@ -619,6 +240,47 @@ def _build_fastmcp(config: cfg_mod.Config, *, allow_writes: bool = False):
         def rebuild_fts() -> dict:
             return _tool_rebuild_fts(config)
 
+        @mcp.tool(description=tools["agent_start"])
+        def agent_start(
+            agent_name: str = "Agent",
+            prompt: str = "",
+            selected_nodes: list[str] | None = None,
+            metadata: dict[str, Any] | None = None,
+            run_id: str | None = None,
+        ) -> dict:
+            return _tool_agent_start(
+                config, agent_name, prompt, selected_nodes, metadata, run_id
+            )
+
+        @mcp.tool(description=tools["agent_event"])
+        def agent_event(
+            event_type: str,
+            file_path: str | None = None,
+            message: str | None = None,
+            run_id: str | None = None,
+            agent_name: str = "Agent",
+            symbol_path: str | None = None,
+            payload: dict[str, Any] | None = None,
+        ) -> dict:
+            return _tool_agent_event(
+                config,
+                event_type,
+                file_path,
+                message,
+                run_id,
+                agent_name,
+                symbol_path,
+                payload,
+            )
+
+        @mcp.tool(description=tools["agent_end"])
+        def agent_end(
+            run_id: str | None = None,
+            agent_name: str = "Agent",
+            status: str = "completed",
+        ) -> dict:
+            return _tool_agent_end(config, run_id, agent_name, status)
+
     # Resources (URI templates handled natively by FastMCP).
     @mcp.resource("codeindex://repo-map", description=_RESOURCE_DESCRIPTIONS[0][1])
     def repo_map() -> dict:
@@ -628,17 +290,27 @@ def _build_fastmcp(config: cfg_mod.Config, *, allow_writes: bool = False):
     def doctor_resource() -> dict:
         return _tool_doctor(config)
 
+    @mcp.resource("codeindex://graph", description=_RESOURCE_DESCRIPTIONS[2][1])
+    def graph_resource() -> dict:
+        return _tool_code_graph(config, include_code=False)
+
     @mcp.resource(
-        "codeindex://symbol/{canonical}", description=_RESOURCE_DESCRIPTIONS[2][1]
+        "codeindex://symbol/{canonical}", description=_RESOURCE_DESCRIPTIONS[3][1]
     )
     def symbol_resource(canonical: str) -> dict:
         return _resource_symbol(config, canonical)
 
     @mcp.resource(
-        "codeindex://chunk/{chunk_uid}", description=_RESOURCE_DESCRIPTIONS[3][1]
+        "codeindex://chunk/{chunk_uid}", description=_RESOURCE_DESCRIPTIONS[4][1]
     )
     def chunk_resource(chunk_uid: str) -> dict:
         return _resource_chunk(config, chunk_uid)
+
+    @mcp.resource(
+        "codeindex://agent-activity", description=_RESOURCE_DESCRIPTIONS[5][1]
+    )
+    def agent_activity_resource() -> dict:
+        return _tool_agent_activity(config)
 
     return mcp
 

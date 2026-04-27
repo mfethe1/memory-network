@@ -2,6 +2,7 @@
 -- Layering:
 --   semantic spine: files, symbols, occurrences, relations, diagnostics
 --   retrieval projection: chunks, chunks_fts, chunk_edits, chunk_lineage
+--   activity: agent_runs, agent_events
 --   reserved: embeddings, test_edges, repo_map_snapshots, commits, file_versions
 --
 -- Apply idempotently: CREATE TABLE IF NOT EXISTS throughout.
@@ -209,6 +210,38 @@ CREATE TABLE IF NOT EXISTS chunk_edits (
 CREATE INDEX IF NOT EXISTS idx_chunk_edits_chunk ON chunk_edits(chunk_pk);
 CREATE INDEX IF NOT EXISTS idx_chunk_edits_symbol ON chunk_edits(symbol_uid);
 CREATE INDEX IF NOT EXISTS idx_chunk_edits_time ON chunk_edits(timestamp);
+
+CREATE TABLE IF NOT EXISTS agent_runs (
+    run_pk              INTEGER PRIMARY KEY,
+    run_id              TEXT NOT NULL UNIQUE,
+    agent_name          TEXT,
+    status              TEXT,
+    prompt              TEXT,
+    selected_nodes_json TEXT,
+    started_at          TEXT,
+    updated_at          TEXT,
+    ended_at            TEXT,
+    metadata_json       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_updated ON agent_runs(updated_at);
+
+CREATE TABLE IF NOT EXISTS agent_events (
+    event_pk     INTEGER PRIMARY KEY,
+    run_pk       INTEGER NOT NULL REFERENCES agent_runs(run_pk) ON DELETE CASCADE,
+    timestamp    TEXT NOT NULL,
+    event_type   TEXT NOT NULL,
+    file_path    TEXT,
+    symbol_path  TEXT,
+    message      TEXT,
+    payload_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_events_run ON agent_events(run_pk);
+CREATE INDEX IF NOT EXISTS idx_agent_events_time ON agent_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_agent_events_file ON agent_events(file_path);
+CREATE INDEX IF NOT EXISTS idx_agent_events_type ON agent_events(event_type);
 
 CREATE TABLE IF NOT EXISTS chunk_lineage (
     lineage_pk          INTEGER PRIMARY KEY,
