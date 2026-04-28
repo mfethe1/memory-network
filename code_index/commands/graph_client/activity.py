@@ -47,10 +47,22 @@ function graphPostHeaders() {
 function syncGraphTokenFromUrl() {
   try {
     const current = new URL(window.location.href);
-    const token = current.searchParams.get("token") || current.searchParams.get("graph_token") || current.searchParams.get("access_token");
-    if (token) localStorage.setItem(graphTokenKey, token.trim());
+    let changed = false;
+    ["token", "graph_token", "access_token"].forEach((name) => {
+      if (current.searchParams.has(name)) {
+        current.searchParams.delete(name);
+        changed = true;
+      }
+    });
+    if (changed) {
+      window.history.replaceState(
+        {},
+        document.title,
+        `${current.pathname}${current.search}${current.hash}`
+      );
+    }
   } catch (_err) {
-    // URL parsing should not block static graph use.
+    // URL cleanup should not block static graph use.
   }
 }
 function graphGetHeaders(extra = {}) {
@@ -59,30 +71,32 @@ function graphGetHeaders(extra = {}) {
   if (token) headers.Authorization = `Bearer ${token}`;
   return headers;
 }
-function graphTokenUrl(url) {
-  const token = localStorage.getItem(graphTokenKey);
-  if (!token) return url;
-  try {
-    const next = new URL(url, window.location.href);
-    if (!next.searchParams.has("token")) next.searchParams.set("token", token);
-    return next.toString();
-  } catch (_err) {
-    return url;
-  }
+async function establishGraphBrowserSession(token) {
+  const response = await fetch("/api/auth/browser-session", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  if (!response.ok) throw new Error("Invalid graph server token");
+  return response;
 }
 async function fetchGraphPost(url, payload) {
   let response = await fetch(url, {
     method: "POST",
     headers: graphPostHeaders(),
+    credentials: "same-origin",
     body: JSON.stringify(payload)
   });
   if (response.status !== 401) return response;
   const token = window.prompt("Graph server token");
   if (!token) return response;
-  localStorage.setItem(graphTokenKey, token.trim());
+  const trimmedToken = token.trim();
+  await establishGraphBrowserSession(trimmedToken);
+  localStorage.setItem(graphTokenKey, trimmedToken);
   return fetch(url, {
     method: "POST",
     headers: graphPostHeaders(),
+    credentials: "same-origin",
     body: JSON.stringify(payload)
   });
 }
@@ -91,15 +105,19 @@ async function fetchGraphGet(url, options = {}) {
   let response = await fetch(url, {
     ...options,
     headers,
+    credentials: "same-origin",
     cache: options.cache || "no-store"
   });
   if (response.status !== 401) return response;
   const token = window.prompt("Graph server token");
   if (!token) return response;
-  localStorage.setItem(graphTokenKey, token.trim());
-  return fetch(graphTokenUrl(url), {
+  const trimmedToken = token.trim();
+  await establishGraphBrowserSession(trimmedToken);
+  localStorage.setItem(graphTokenKey, trimmedToken);
+  return fetch(url, {
     ...options,
     headers: graphGetHeaders(options.headers || {}),
+    credentials: "same-origin",
     cache: options.cache || "no-store"
   });
 }
@@ -591,6 +609,7 @@ function applyAgentRunResponse(result) {
       ...agent,
       active_runs: activeRuns,
       recent_runs: recentRuns,
+      kanban: result.board || agent.kanban,
       active_files: activeFiles,
       active_agents: uniquePaths(activeRuns.map(item => item.agent_name || "Agent")),
       status: activeRuns.length ? "working" : "idle"

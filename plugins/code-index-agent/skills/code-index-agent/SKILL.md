@@ -99,6 +99,7 @@ explicitly wants an MCP client to mutate index state.
 - Keep the graph server bound to `127.0.0.1` unless the user explicitly asks for
   remote access.
 - Use `CODE_INDEX_GRAPH_TOKEN` when browser POSTs or adapter callbacks need a
-  bearer token.
+  bearer token. Do not put graph tokens in URLs; browser sessions are created
+  through the local auth prompt and same-origin cookie.
 - Do not run broad reindexes during active coding unless `doctor` reports drift
   or the user asks for a full refresh.

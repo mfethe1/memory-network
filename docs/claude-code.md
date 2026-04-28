@@ -33,12 +33,23 @@ optional deps (tree-sitter, ripgrep) are missing.
 
 ## Automatic reindex on edit
 
-`.claude/settings.json` registers a `PostToolUse` hook for
-`Edit|Write|MultiEdit`:
+`.claude/settings.json` registers two hooks for `Edit|Write|MultiEdit`:
+
+- A `PreToolUse` guard runs `.claude/hooks/verify-claim-before-edit.sh`.
+  It is opt-in at runtime: without `CODE_INDEX_AGENT_RUN_ID` it exits
+  silently. When supervised runs set `CODE_INDEX_AGENT_RUN_ID` plus
+  `CODE_INDEX_AGENT_FENCE` or `CODE_INDEX_AGENT_FENCES`, it verifies a current
+  edit/exclusive file claim before the write.
+- A `PostToolUse` hook runs `.claude/hooks/reindex-after-edit.sh` after the
+  edit so the index catches up.
 
 ```json
 {
   "hooks": {
+    "PreToolUse": [
+      { "matcher": "Edit|Write|MultiEdit", "hooks": [
+        { "type": "command",
+          "command": ".claude/hooks/verify-claim-before-edit.sh" } ] } ],
     "PostToolUse": [
       { "matcher": "Edit|Write|MultiEdit", "hooks": [
         { "type": "command",
@@ -66,10 +77,10 @@ The script (`.claude/hooks/reindex-after-edit.sh`):
 `code_index mcp-serve` ships with a **read-only tool surface by default**.
 A connected agent sees only the retrieval and analysis tools (`search_text`,
 `search_query`, `search_ast`, `find_symbol`, `impact`, `affected_tests`,
-`doctor`, `ask`). The mutating tools (`update`, `rebuild_fts`) are NOT
-registered and cannot be invoked. (`ask` dispatches to lookup, impact,
-tests, grep, FTS, similar, repo-map, and doctor — never to mutating
-primitives.)
+`doctor`, `ask`, `retrieval_broker`, `code_graph`, `graph_context`, and
+`agent_activity`). The mutating tools (`update`, `rebuild_fts`) are NOT
+registered and cannot be invoked. (`ask` dispatches to lookup, impact, tests,
+grep, FTS, similar, repo-map, and doctor — never to mutating primitives.)
 
 To expose the mutating tools, start the server with `--allow-writes`:
 
@@ -129,10 +140,10 @@ On purpose, to keep the configuration minimal:
 
 - No `Stop` hook (too chatty for this workflow).
 - No `UserPromptSubmit` hook.
-- No `PreToolUse` guards beyond what Claude Code already does.
+- No always-on write-blocking guard; the `PreToolUse` lease check is inert
+  unless supervised run/fence environment variables are present.
 - No legacy `.claude/commands/*` — skills are the recommended path.
-- No embeddings / MCP server wiring (the index itself doesn't ship those
-  yet).
+- No embeddings by default, and no write-enabled MCP server by default.
 
 ## What the indexer currently handles (truthful reality check)
 
@@ -166,15 +177,14 @@ Each of these has test coverage in `tests/`:
   `occurrences(role="reference", syntax_kind="call")`; `code_index symbol X
   --references --json` returns up to 50 call-site file/line spans.
 - **MCP server** — `code_index mcp-serve` speaks stdio MCP. The default
-  surface is **read-only**: eight tools are exposed (`search_text`,
-  `search_query`, `search_ast`, `find_symbol`, `impact`, `affected_tests`,
-  `doctor`, `ask`) plus four resources (`codeindex://repo-map`,
-  `codeindex://doctor`, `codeindex://symbol/<canonical>`,
-  `codeindex://chunk/<chunk_uid>`). Pass `--allow-writes` to additionally
-  expose the mutating tools `update` and `rebuild_fts`; their descriptions
-  are prefixed with `MUTATING —` so agents see the warning in the tool
-  list. `--describe` prints the surface as JSON without starting the loop
-  and honours `--allow-writes` too.
+  surface is **read-only**: graph, retrieval, activity, and analysis tools are
+  exposed, including `retrieval_broker`, `code_graph`, `graph_context`, and
+  `agent_activity`, plus graph, retrieval, symbol, chunk, and activity
+  resources. Pass `--allow-writes` to additionally expose the mutating tools
+  `update` and `rebuild_fts`; their descriptions are prefixed with
+  `MUTATING —` so agents see the warning in the tool list. `--describe` prints
+  the surface as JSON without starting the loop and honours `--allow-writes`
+  too.
 - **Git-hook installer** — `code_index install-hooks` writes post-commit,
   post-checkout, post-merge, and post-rewrite scripts under
   `.code_index/hooks` and wires `git config core.hooksPath`. Idempotent;

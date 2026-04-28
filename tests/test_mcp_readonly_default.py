@@ -7,8 +7,6 @@ stay consistent with the actually-exposed FastMCP surface in both modes.
 
 from __future__ import annotations
 
-import io
-
 import pytest
 
 from code_index.cli import build_parser
@@ -35,7 +33,9 @@ def test_describe_surface_default_omits_mutating_tools() -> None:
         "affected_tests",
         "doctor",
         "ask",
+        "retrieval_broker",
         "code_graph",
+        "graph_context",
         "agent_activity",
     ):
         assert read_tool in names, f"missing read tool {read_tool!r} in default surface"
@@ -49,6 +49,7 @@ def test_describe_surface_with_allow_writes_includes_mutating_tools() -> None:
     assert "agent_start" in names
     assert "agent_event" in names
     assert "agent_end" in names
+    assert "retrieval_broker" in names
     # Mutating tool descriptions must warn the caller.
     for tool in surface["tools"]:
         if tool["name"] in (
@@ -96,6 +97,8 @@ def test_build_fastmcp_default_does_not_register_mutating_tools(tmp_path) -> Non
     assert "agent_end" not in names
     assert "search_text" in names
     assert "doctor" in names
+    assert "retrieval_broker" in names
+    assert "graph_context" in names
     assert "agent_activity" in names
 
 
@@ -109,6 +112,7 @@ def test_build_fastmcp_allow_writes_registers_mutating_tools(tmp_path) -> None:
     assert "update" in names
     assert "rebuild_fts" in names
     assert "agent_event" in names
+    assert "retrieval_broker" in names
 
 
 # ---------- CLI subparser exposes the flag ----------

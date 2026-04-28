@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -58,6 +59,110 @@ def test_agent_activity_helpers_track_runs_events_and_recent_files(tmp_path: Pat
         assert ended["status"] == "completed"
         assert agent_activity.active_runs(conn) == []
         assert agent_activity.active_file_claims(conn) == []
+    finally:
+        db_mod.close(conn)
+
+
+def test_file_claims_use_fence_tokens_and_reject_conflicting_edits(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run_a = agent_activity.start_run(conn, agent_name="Codex", prompt="edit a")
+        run_b = agent_activity.start_run(conn, agent_name="Claude", prompt="edit b")
+        first = agent_activity.claim_file(
+            conn,
+            run_id=run_a["run_id"],
+            file_path="pkg/a.py",
+            mode="edit",
+        )
+        assert first["fence_token"] == 1
+        assert agent_activity.verify_claim_fence(
+            conn,
+            run_id=run_a["run_id"],
+            file_path="pkg/a.py",
+            mode="edit",
+            fence_token=first["fence_token"],
+        )
+
+        with pytest.raises(ValueError, match="claim conflict"):
+            agent_activity.claim_file(
+                conn,
+                run_id=run_b["run_id"],
+                file_path="pkg/a.py",
+                mode="edit",
+            )
+
+        agent_activity.release_claims(conn, run_id=run_a["run_id"], file_path="pkg/a.py")
+        second = agent_activity.claim_file(
+            conn,
+            run_id=run_b["run_id"],
+            file_path="pkg/a.py",
+            mode="edit",
+        )
+        assert second["fence_token"] == 2
+        assert not agent_activity.verify_claim_fence(
+            conn,
+            run_id=run_a["run_id"],
+            file_path="pkg/a.py",
+            mode="edit",
+            fence_token=first["fence_token"],
+        )
+    finally:
+        db_mod.close(conn)
+
+
+def test_run_blockers_drive_task_board_and_unblock_on_completion(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        blocker = agent_activity.start_run(
+            conn,
+            agent_name="Codex",
+            prompt="Slice 1 tracer bullet",
+            status="working",
+        )
+        blocked = agent_activity.start_run(
+            conn,
+            agent_name="Claude",
+            prompt="Slice 2 depends on slice 1",
+            status="queued",
+        )
+
+        links = agent_activity.add_run_blockers(
+            conn,
+            run_id=blocked["run_id"],
+            blocked_by_run_ids=[blocker["run_id"]],
+            reason="Slice 2 should not start until slice 1 is green.",
+        )
+
+        assert links[0]["status"] == "active"
+        blocked_run = agent_activity.get_run(conn, blocked["run_id"])
+        assert blocked_run is not None
+        assert blocked_run["status"] == "blocked"
+        assert blocked_run["blocked_by"][0]["run_id"] == blocker["run_id"]
+        assert blocked_run["blocked_by"][0]["reason"] == (
+            "Slice 2 should not start until slice 1 is green."
+        )
+
+        board = agent_activity.kanban_board(conn)
+        assert [run["run_id"] for run in board["columns"]["active"]["runs"]] == [
+            blocker["run_id"]
+        ]
+        assert [run["run_id"] for run in board["columns"]["blocked"]["runs"]] == [
+            blocked["run_id"]
+        ]
+
+        agent_activity.end_run(conn, run_id=blocker["run_id"], status="completed")
+
+        unblocked = agent_activity.get_run(conn, blocked["run_id"])
+        assert unblocked is not None
+        assert unblocked["status"] == "queued"
+        assert unblocked["blocked_by"][0]["status"] == "resolved"
+        board = agent_activity.kanban_board(conn)
+        assert [run["run_id"] for run in board["columns"]["ready"]["runs"]] == [
+            blocked["run_id"]
+        ]
+        assert blocker["run_id"] in {
+            run["run_id"] for run in board["columns"]["done"]["runs"]
+        }
     finally:
         db_mod.close(conn)
 
@@ -299,6 +404,291 @@ def test_agent_cli_records_event_json(
     claims_payload = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert claims_payload["active_claims"] == []
+
+
+def test_agent_cli_verify_claim_reports_write_lease_failures(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text("value = 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "agent",
+                "--root",
+                str(tmp_path),
+                "start",
+                "--agent-name",
+                "Codex",
+                "--prompt",
+                "Patch a.py",
+            ]
+        )
+        == 0
+    )
+    run_a = json.loads(capsys.readouterr().out)["run"]["run_id"]
+
+    assert (
+        main(
+            [
+                "agent",
+                "--root",
+                str(tmp_path),
+                "verify-claim",
+                "--run-id",
+                run_a,
+                "--file",
+                "pkg/a.py",
+                "--fence",
+                "1",
+            ]
+        )
+        == 1
+    )
+    missing = capsys.readouterr()
+    assert "missing claim:" in missing.err
+
+    assert (
+        main(
+            [
+                "agent",
+                "--root",
+                str(tmp_path),
+                "claim",
+                "--run-id",
+                run_a,
+                "--file",
+                "pkg/a.py",
+                "--mode",
+                "edit",
+            ]
+        )
+        == 0
+    )
+    claim = json.loads(capsys.readouterr().out)["claims"][0]
+    fence = str(claim["fence_token"])
+
+    assert (
+        main(
+            [
+                "agent",
+                "--root",
+                str(tmp_path),
+                "verify-claim",
+                "--run-id",
+                run_a,
+                "--file",
+                "pkg/a.py",
+                "--fence",
+                fence,
+            ]
+        )
+        == 0
+    )
+    assert "claim verified:" in capsys.readouterr().out
+
+    assert (
+        main(
+            [
+                "agent",
+                "--root",
+                str(tmp_path),
+                "verify-claim",
+                "--run-id",
+                run_a,
+                "--file",
+                "pkg/a.py",
+                "--fence",
+                str(int(fence) + 1),
+            ]
+        )
+        == 1
+    )
+    assert "stale fence:" in capsys.readouterr().err
+
+    assert (
+        main(
+            [
+                "agent",
+                "--root",
+                str(tmp_path),
+                "release",
+                "--run-id",
+                run_a,
+                "--file",
+                "pkg/a.py",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "agent",
+                "--root",
+                str(tmp_path),
+                "claim",
+                "--run-id",
+                run_a,
+                "--file",
+                "pkg/a.py",
+                "--mode",
+                "edit",
+                "--ttl-seconds",
+                "0.001",
+            ]
+        )
+        == 0
+    )
+    expired_claim = json.loads(capsys.readouterr().out)["claims"][0]
+    time.sleep(0.02)
+    assert (
+        main(
+            [
+                "agent",
+                "--root",
+                str(tmp_path),
+                "verify-claim",
+                "--run-id",
+                run_a,
+                "--file",
+                "pkg/a.py",
+                "--fence",
+                str(expired_claim["fence_token"]),
+            ]
+        )
+        == 1
+    )
+    assert "expired claim:" in capsys.readouterr().err
+
+    assert (
+        main(
+            [
+                "agent",
+                "--root",
+                str(tmp_path),
+                "start",
+                "--agent-name",
+                "Claude",
+                "--prompt",
+                "Patch a.py too",
+            ]
+        )
+        == 0
+    )
+    run_b = json.loads(capsys.readouterr().out)["run"]["run_id"]
+    assert (
+        main(
+            [
+                "agent",
+                "--root",
+                str(tmp_path),
+                "claim",
+                "--run-id",
+                run_b,
+                "--file",
+                "pkg/a.py",
+                "--mode",
+                "edit",
+            ]
+        )
+        == 0
+    )
+    other_claim = json.loads(capsys.readouterr().out)["claims"][0]
+    assert (
+        main(
+            [
+                "agent",
+                "--root",
+                str(tmp_path),
+                "verify-claim",
+                "--run-id",
+                run_a,
+                "--file",
+                "pkg/a.py",
+                "--fence",
+                str(expired_claim["fence_token"]),
+            ]
+        )
+        == 1
+    )
+    conflict = capsys.readouterr()
+    assert "conflicting claim:" in conflict.err
+    assert other_claim["run_id"] in conflict.err
+
+
+def test_agent_cli_verify_claim_ignores_read_only_claims(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text("value = 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    assert main(["agent", "--root", str(tmp_path), "start", "--prompt", "Read a.py"]) == 0
+    reader = json.loads(capsys.readouterr().out)["run"]["run_id"]
+    assert (
+        main(
+            [
+                "agent",
+                "--root",
+                str(tmp_path),
+                "claim",
+                "--run-id",
+                reader,
+                "--file",
+                "pkg/a.py",
+                "--mode",
+                "read",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert main(["agent", "--root", str(tmp_path), "start", "--prompt", "Edit a.py"]) == 0
+    writer = json.loads(capsys.readouterr().out)["run"]["run_id"]
+    assert (
+        main(
+            [
+                "agent",
+                "--root",
+                str(tmp_path),
+                "claim",
+                "--run-id",
+                writer,
+                "--file",
+                "pkg/a.py",
+                "--mode",
+                "edit",
+            ]
+        )
+        == 0
+    )
+    claim = json.loads(capsys.readouterr().out)["claims"][0]
+    assert (
+        main(
+            [
+                "agent",
+                "--root",
+                str(tmp_path),
+                "verify-claim",
+                "--run-id",
+                writer,
+                "--file",
+                "pkg/a.py",
+                "--fence",
+                str(claim["fence_token"]),
+            ]
+        )
+        == 0
+    )
+    assert "claim verified:" in capsys.readouterr().out
 
 
 def test_agent_cli_records_decision_and_transcript_json(

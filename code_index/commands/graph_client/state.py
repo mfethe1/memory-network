@@ -17,6 +17,7 @@ const breadcrumbViewEl = document.getElementById("breadcrumb-view");
 const activeFilesEl = document.getElementById("active-files");
 const fileClaimsEl = document.getElementById("file-claims");
 const agentRunsEl = document.getElementById("agent-runs");
+const taskBoardEl = document.getElementById("task-board");
 const searchResultsEl = document.getElementById("search-results");
 const relatedFilesEl = document.getElementById("related-files");
 const recentFilesEl = document.getElementById("recent-files");
@@ -114,6 +115,9 @@ let viewSaveTimer = null;
 let terminalRenderFrame = null;
 let terminalForceScroll = false;
 let terminalLastSignature = "";
+let debugSnapshot = null;
+let debugPerfTick = null;
+let debugFetchError = "";
 let clientMetrics = {
   hydrate_count: 0,
   render_count: 0,

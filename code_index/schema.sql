@@ -253,6 +253,7 @@ CREATE TABLE IF NOT EXISTS agent_file_claims (
     mode          TEXT NOT NULL,                 -- read | edit | review | test
     status        TEXT NOT NULL DEFAULT 'active', -- active | released | expired
     reason        TEXT,
+    fence_token   INTEGER NOT NULL DEFAULT 0,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
     heartbeat_at  TEXT,
@@ -266,6 +267,41 @@ CREATE INDEX IF NOT EXISTS idx_agent_file_claims_run ON agent_file_claims(run_pk
 CREATE INDEX IF NOT EXISTS idx_agent_file_claims_file ON agent_file_claims(file_path);
 CREATE INDEX IF NOT EXISTS idx_agent_file_claims_status ON agent_file_claims(status);
 CREATE INDEX IF NOT EXISTS idx_agent_file_claims_expires ON agent_file_claims(expires_at);
+CREATE INDEX IF NOT EXISTS idx_agent_file_claims_fence ON agent_file_claims(file_path, fence_token);
+
+CREATE TABLE IF NOT EXISTS agent_task_preflights (
+    preflight_pk INTEGER PRIMARY KEY,
+    preflight_id TEXT NOT NULL UNIQUE,
+    draft_hash   TEXT NOT NULL,
+    warning_hash TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'active', -- active | consumed | expired
+    run_id       TEXT,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_task_preflights_status
+    ON agent_task_preflights(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_agent_task_preflights_run
+    ON agent_task_preflights(run_id);
+
+CREATE TABLE IF NOT EXISTS agent_run_blockers (
+    blocker_pk     INTEGER PRIMARY KEY,
+    run_pk         INTEGER NOT NULL REFERENCES agent_runs(run_pk) ON DELETE CASCADE,
+    blocker_run_pk INTEGER NOT NULL REFERENCES agent_runs(run_pk) ON DELETE CASCADE,
+    status         TEXT NOT NULL DEFAULT 'active', -- active | resolved
+    reason         TEXT,
+    created_at     TEXT NOT NULL,
+    resolved_at    TEXT,
+    metadata_json  TEXT,
+    UNIQUE(run_pk, blocker_run_pk)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_run_blockers_run
+    ON agent_run_blockers(run_pk, status);
+CREATE INDEX IF NOT EXISTS idx_agent_run_blockers_blocker
+    ON agent_run_blockers(blocker_run_pk, status);
 
 CREATE TABLE IF NOT EXISTS chunk_lineage (
     lineage_pk          INTEGER PRIMARY KEY,

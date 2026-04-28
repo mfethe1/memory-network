@@ -17,7 +17,9 @@ _READ_TOOL_DESCRIPTIONS: dict[str, str] = {
     "affected_tests": "Tests that reach a symbol (direct + transitive). Returns affected_tests plus a ready-to-run pytest invocation.",
     "doctor": "Index health snapshot: parse_status, semantic_sources, relation counts, FTS consistency + rebuild recommendation.",
     "ask": "Natural-language query synthesis. Pass a question string (e.g. 'who calls reindex', 'tests for apply_schema', 'find code like jwt expiry'); returns intent classification + the right primitive's results + a one-paragraph narrative.",
+    "retrieval_broker": "Read-only retrieval broker. Accepts query, scope/include_kinds, limits, byte budget, and selected graph/file context; returns the broker payload.",
     "code_graph": "Read-only file/directory graph projection with cross-file relation edges, importance scores, care guidance, summaries, and optional embedded source code.",
+    "graph_context": "Budgeted layered graph context for agents. Returns stable node handles, relation paths, risk, byte cost, and enum-only why_included values.",
     "agent_activity": "Read recent agent runs/events that the graph uses for live active-file highlighting and activity trails.",
 }
 
@@ -62,11 +64,19 @@ _RESOURCE_DESCRIPTIONS: list[tuple[str, str]] = [
         "Read-only file graph JSON without embedded source code.",
     ),
     (
+        "codeindex://graph-context",
+        "Budgeted layered graph context for active or selected graph nodes.",
+    ),
+    (
         "codeindex://symbol/{canonical}",
         "Symbol lookup by canonical name; includes references.",
     ),
     ("codeindex://chunk/{chunk_uid}", "Canonical chunk content + context_json."),
     ("codeindex://agent-activity", "Recent agent runs/events for graph overlays."),
+    (
+        "codeindex://retrieval-broker/{query}",
+        "Default read-only retrieval broker request for a query. Use the retrieval_broker tool for scoped/budgeted calls.",
+    ),
 ]
 
 

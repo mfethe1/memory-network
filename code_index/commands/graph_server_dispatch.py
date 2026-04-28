@@ -22,6 +22,13 @@ from code_index.locking import writer_lock
 
 _LOCAL_AGENT_CANCEL_EVENTS: dict[str, threading.Event] = {}
 _LOCAL_AGENT_CANCEL_LOCK = threading.Lock()
+GRAPH_CONTEXT_WHY_INCLUDED = (
+    "selected_node",
+    "selected_path",
+    "supplied_node",
+    "adjacent_relation",
+    "metric_neighbor",
+)
 
 
 def _env_float(name: str) -> float | None:
@@ -224,15 +231,55 @@ def _normal_task_path(path: Any) -> str | None:
     return text or None
 
 
-def _compact_graph_node(node: dict[str, Any]) -> dict[str, Any]:
-    metrics = node.get("metrics") or {}
+def _json_byte_cost(payload: dict[str, Any]) -> int:
+    return len(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def _with_byte_cost(payload: dict[str, Any]) -> dict[str, Any]:
+    item = dict(payload)
+    item["byte_cost"] = 0
+    while True:
+        byte_cost = _json_byte_cost(item)
+        if item["byte_cost"] == byte_cost:
+            return item
+        item["byte_cost"] = byte_cost
+
+
+def _node_risk(node: dict[str, Any]) -> dict[str, Any]:
     importance = node.get("importance") or {}
     return {
+        "level": node.get("care_level") or "unknown",
+        "score": importance.get("score"),
+    }
+
+
+def _compact_graph_node(
+    node: dict[str, Any],
+    *,
+    layer: str,
+    distance: int,
+    relation_path: list[dict[str, Any]],
+    why_included: str,
+) -> dict[str, Any]:
+    metrics = node.get("metrics") or {}
+    importance = node.get("importance") or {}
+    stable_id = node.get("id")
+    item = {
         "id": node.get("id"),
+        "stable_id": stable_id,
         "path": node.get("path"),
         "kind": node.get("kind"),
         "language": node.get("language"),
         "role": node.get("role"),
+        "layer": layer,
+        "distance": distance,
+        "relation_path": relation_path,
+        "risk": _node_risk(node),
+        "why_included": (
+            why_included
+            if why_included in GRAPH_CONTEXT_WHY_INCLUDED
+            else "metric_neighbor"
+        ),
         "care_level": node.get("care_level"),
         "active_work": bool(node.get("active_work")),
         "importance": {
@@ -245,6 +292,49 @@ def _compact_graph_node(node: dict[str, Any]) -> dict[str, Any]:
         "outgoing_files": list(metrics.get("outgoing_files") or [])[:12],
         "recent_edits": list(node.get("recent_edits") or [])[:6],
     }
+    return _with_byte_cost(item)
+
+
+def _edge_relation_path(edge: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "edge_id": edge.get("id"),
+            "source": edge.get("source"),
+            "target": edge.get("target"),
+            "kind": edge.get("kind"),
+        }
+    ]
+
+
+def _metric_relation_path(source_id: str, target_id: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "source": source_id,
+            "target": target_id,
+            "kind": "metric_neighbor",
+        }
+    ]
+
+
+def _append_budgeted_node(
+    out: list[dict[str, Any]],
+    item: dict[str, Any],
+    *,
+    max_nodes: int,
+    max_bytes: int,
+    budget: dict[str, Any],
+) -> bool:
+    if len(out) >= max_nodes:
+        budget["truncated_nodes"] = True
+        return False
+    next_bytes = int(budget["used_bytes"]) + int(item.get("byte_cost") or 0)
+    if next_bytes > max_bytes:
+        budget["truncated_bytes"] = True
+        return False
+    out.append(item)
+    budget["used_nodes"] = len(out)
+    budget["used_bytes"] = next_bytes
+    return True
 
 
 def _build_task_graph_context(
@@ -254,10 +344,14 @@ def _build_task_graph_context(
     selected_nodes: list[str],
     selected_paths: list[str],
     node: dict[str, Any] | None = None,
+    max_nodes: int = 24,
+    max_bytes: int = 24_000,
 ) -> dict[str, Any]:
     """Build a compact graph packet for a dispatched coding-agent task."""
 
     try:
+        max_nodes = max(0, int(max_nodes))
+        max_bytes = max(0, int(max_bytes))
         selected_node_ids = {str(item) for item in selected_nodes if item}
         selected_path_set = {
             path for path in (_normal_task_path(item) for item in selected_paths) if path
@@ -314,34 +408,137 @@ def _build_task_graph_context(
         }
         related_ids: set[str] = set()
         adjacent_edges: list[dict[str, Any]] = []
+        relation_path_by_related_id: dict[str, list[dict[str, Any]]] = {}
         for edge in payload.get("edges") or []:
             if not isinstance(edge, dict):
                 continue
             source = str(edge.get("source") or "")
             target = str(edge.get("target") or "")
             if source in selected_ids or target in selected_ids:
-                adjacent_edges.append(
-                    {
-                        "source": source,
-                        "target": target,
-                        "kind": edge.get("kind"),
-                        "label": edge.get("label"),
-                        "weight": edge.get("weight"),
-                    }
-                )
+                compact_edge = {
+                    "id": edge.get("id"),
+                    "source": source,
+                    "target": target,
+                    "kind": edge.get("kind"),
+                    "label": edge.get("label"),
+                    "weight": edge.get("weight"),
+                }
+                adjacent_edges.append(compact_edge)
                 if source and source not in selected_ids:
                     related_ids.add(source)
+                    relation_path_by_related_id.setdefault(
+                        source, _edge_relation_path(compact_edge)
+                    )
                 if target and target not in selected_ids:
                     related_ids.add(target)
+                    relation_path_by_related_id.setdefault(
+                        target, _edge_relation_path(compact_edge)
+                    )
 
         for selected_node in selected_graph_nodes:
             metrics = selected_node.get("metrics") or {}
+            selected_id = str(selected_node.get("id") or "")
             for path in list(metrics.get("incoming_files") or []) + list(
                 metrics.get("outgoing_files") or []
             ):
                 related = node_by_path.get(_normal_task_path(path))
                 if related and related.get("id") not in selected_ids:
-                    related_ids.add(str(related.get("id")))
+                    related_id = str(related.get("id"))
+                    related_ids.add(related_id)
+                    relation_path_by_related_id.setdefault(
+                        related_id, _metric_relation_path(selected_id, related_id)
+                    )
+
+        selected_why_by_id: dict[str, str] = {}
+        for item in selected_graph_nodes:
+            node_id = str(item.get("id") or "")
+            path = _normal_task_path(item.get("path"))
+            if node_id in selected_node_ids:
+                selected_why_by_id[node_id] = "selected_node"
+            elif path and path in selected_path_set:
+                selected_why_by_id[node_id] = "selected_path"
+            else:
+                selected_why_by_id[node_id] = "supplied_node"
+
+        budget = {
+            "max_nodes": max_nodes,
+            "max_bytes": max_bytes,
+            "max_edges": 40,
+            "used_nodes": 0,
+            "used_edges": 0,
+            "used_bytes": 0,
+            "truncated_nodes": False,
+            "truncated_bytes": False,
+            "truncated_edges": False,
+        }
+        selected_compact: list[dict[str, Any]] = []
+        all_compact: list[dict[str, Any]] = []
+        for item in selected_graph_nodes:
+            if not isinstance(item, dict):
+                continue
+            node_id = str(item.get("id") or "")
+            compact = _compact_graph_node(
+                item,
+                layer="selected",
+                distance=0,
+                relation_path=[],
+                why_included=selected_why_by_id.get(node_id, "supplied_node"),
+            )
+            if _append_budgeted_node(
+                all_compact,
+                compact,
+                max_nodes=max_nodes,
+                max_bytes=max_bytes,
+                budget=budget,
+            ):
+                selected_compact.append(compact)
+
+        related_compact: list[dict[str, Any]] = []
+        for node_id in sorted(related_ids):
+            related = node_by_id.get(node_id)
+            if not related:
+                continue
+            why = (
+                "adjacent_relation"
+                if node_id in relation_path_by_related_id
+                and any(
+                    step.get("kind") != "metric_neighbor"
+                    for step in relation_path_by_related_id[node_id]
+                )
+                else "metric_neighbor"
+            )
+            compact = _compact_graph_node(
+                related,
+                layer="related",
+                distance=1,
+                relation_path=relation_path_by_related_id.get(node_id, []),
+                why_included=why,
+            )
+            if _append_budgeted_node(
+                all_compact,
+                compact,
+                max_nodes=max_nodes,
+                max_bytes=max_bytes,
+                budget=budget,
+            ):
+                related_compact.append(compact)
+
+        included_ids = {str(item.get("id")) for item in all_compact if item.get("id")}
+        budgeted_edges: list[dict[str, Any]] = []
+        for edge in adjacent_edges:
+            if len(budgeted_edges) >= int(budget["max_edges"]):
+                budget["truncated_edges"] = True
+                break
+            if edge["source"] not in included_ids or edge["target"] not in included_ids:
+                continue
+            budgeted_edge = _with_byte_cost(edge)
+            edge_cost = int(budgeted_edge.get("byte_cost") or 0)
+            if int(budget["used_bytes"]) + edge_cost > max_bytes:
+                budget["truncated_bytes"] = True
+                continue
+            budget["used_bytes"] = int(budget["used_bytes"]) + edge_cost
+            budgeted_edges.append(budgeted_edge)
+            budget["used_edges"] = len(budgeted_edges)
 
         summary = payload.get("summary") or {}
         return {
@@ -356,17 +553,16 @@ def _build_task_graph_context(
                 "top_files": list(summary.get("top_files") or [])[:8],
                 "recent_files": list(summary.get("recent_files") or [])[:8],
             },
-            "selected_nodes": [
-                _compact_graph_node(item)
-                for item in selected_graph_nodes
-                if isinstance(item, dict)
+            "budget": budget,
+            "why_included_values": list(GRAPH_CONTEXT_WHY_INCLUDED),
+            "layers": [
+                {"layer": "selected", "distance": 0, "nodes": selected_compact},
+                {"layer": "related", "distance": 1, "nodes": related_compact},
             ],
-            "related_nodes": [
-                _compact_graph_node(node_by_id[node_id])
-                for node_id in sorted(related_ids)
-                if node_id in node_by_id
-            ][:16],
-            "edges": adjacent_edges[:40],
+            "nodes": all_compact,
+            "selected_nodes": selected_compact,
+            "related_nodes": related_compact,
+            "edges": budgeted_edges,
         }
     except Exception as exc:  # pragma: no cover - graph context is best-effort.
         return {

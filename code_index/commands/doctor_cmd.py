@@ -14,6 +14,7 @@ from code_index import config as cfg_mod
 from code_index import db_router as db_mod
 from code_index.parsers import ctags as ctags_mod
 from code_index.parsers import tree_sitter as ts_mod
+from code_index.retrieval_eval import run_eval as run_retrieval_eval
 from code_index.search import lexical
 from code_index.structural import ts_python
 
@@ -305,6 +306,14 @@ def run(args: argparse.Namespace) -> int:
             report["embeddings"] = _embeddings_summary(conn)
         finally:
             db_mod.close(conn)
+        if bool(getattr(args, "eval_retrieval", False)):
+            eval_file = Path(args.eval_file).resolve() if args.eval_file else None
+            report["retrieval_eval"] = run_retrieval_eval(
+                config,
+                eval_file=eval_file,
+                limit=int(getattr(args, "eval_limit", 10) or 10),
+                budget_bytes=int(getattr(args, "eval_budget_bytes", 20_000) or 20_000),
+            )
 
     if args.json:
         print(json.dumps(report, indent=2))
@@ -337,6 +346,15 @@ def run(args: argparse.Namespace) -> int:
             f"  unresolved:     {report.get('unresolved_calls_open')} open, "
             f"{report.get('unresolved_calls_backfilled')} backfilled"
         )
+        if "retrieval_eval" in report:
+            ev = report["retrieval_eval"]
+            print(
+                "  retrieval eval: "
+                f"cases={ev['case_count']} "
+                f"recall={ev['recall_at_limit']:.2f} "
+                f"precision={ev['precision_at_limit']:.2f} "
+                f"bytes_p95={ev['bytes_p95']}"
+            )
     rg = report["ripgrep"]
     if rg["path"]:
         print(

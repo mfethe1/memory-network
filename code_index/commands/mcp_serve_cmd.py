@@ -13,6 +13,8 @@ Tools (model-controlled):
 - `impact`          → blast-radius (inbound calls/inherits/contains/imports).
 - `affected_tests`  → tests that reach a symbol + pytest invocation.
 - `doctor`          → health snapshot + FTS drift + rebuild recommendation.
+- `retrieval_broker`→ brokered retrieval over query + graph context.
+- `graph_context`   → budgeted layered graph context for agent task context.
 
 Mutating tools — only registered when `--allow-writes` is passed:
 - `update`          → reindex (files | all).
@@ -24,6 +26,8 @@ unless the operator explicitly starts the server with `--allow-writes`.
 Resources (application-controlled, URI-templated):
 - `codeindex://repo-map`
 - `codeindex://doctor`
+- `codeindex://graph-context`
+- `codeindex://retrieval-broker/{query}`
 - `codeindex://symbol/{canonical}`
 - `codeindex://chunk/{chunk_uid}`
 
@@ -44,7 +48,7 @@ from typing import Any
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
 from code_index.commands import mcp_tool_impl as _mcp_tool_impl
-from code_index.locking import LockTimeoutError, writer_lock
+from code_index.locking import writer_lock
 from code_index.commands.mcp_auth import (
     TOKEN_ENV_VAR,
     TOKEN_FILENAME,
@@ -56,10 +60,7 @@ from code_index.commands.mcp_auth import (
     _write_token_file,
 )
 from code_index.commands.mcp_surface import (
-    _READ_TOOL_DESCRIPTIONS,
     _RESOURCE_DESCRIPTIONS,
-    _TOOL_DESCRIPTIONS,
-    _WRITE_TOOL_DESCRIPTIONS,
     _tool_descriptions,
     describe_surface,
 )
@@ -75,13 +76,28 @@ from code_index.commands.mcp_tool_impl import (
     _tool_code_graph,
     _tool_doctor,
     _tool_find_symbol,
+    _tool_graph_context,
     _tool_impact,
+    _tool_retrieval_broker,
     _tool_search_ast,
     _tool_search_query,
     _tool_search_text,
 )
 
+_UNAVAILABLE = {
+    "error": "mcp Python SDK is not installed",
+    "hint": "install the `mcp` package, or use `code_index mcp-serve --describe` to inspect the static surface",
+}
 
+__all__ = [
+    "TOKEN_FILENAME",
+    "_generate_token",
+    "_read_token_file",
+    "_resolve_bearer_token",
+    "_validate_bearer",
+    "_write_token_file",
+    "run",
+]
 
 
 def _with_local_writer_lock(fn, *args, **kwargs):
@@ -214,6 +230,27 @@ def _build_fastmcp(config: cfg_mod.Config, *, allow_writes: bool = False):
         finally:
             db_mod.close(conn)
 
+    @mcp.tool(description=tools["retrieval_broker"])
+    def retrieval_broker(
+        query: str,
+        scope: str | None = None,
+        include_kinds: list[str] | None = None,
+        limit: int = 10,
+        byte_budget: int = 20_000,
+        selected_paths: list[str] | None = None,
+        selected_nodes: list[Any] | None = None,
+    ) -> Any:
+        return _tool_retrieval_broker(
+            config,
+            query,
+            scope,
+            include_kinds,
+            limit,
+            byte_budget,
+            selected_paths,
+            selected_nodes,
+        )
+
     @mcp.tool(description=tools["code_graph"])
     def code_graph(
         include_code: bool = False,
@@ -223,6 +260,25 @@ def _build_fastmcp(config: cfg_mod.Config, *, allow_writes: bool = False):
     ) -> dict:
         return _tool_code_graph(
             config, include_code, max_code_bytes, focus_paths, agent_name
+        )
+
+    @mcp.tool(description=tools["graph_context"])
+    def graph_context(
+        selected_nodes: list[str] | None = None,
+        selected_paths: list[str] | None = None,
+        node: dict[str, Any] | None = None,
+        agent_name: str = "Agent",
+        max_nodes: int = 24,
+        max_bytes: int = 24_000,
+    ) -> dict:
+        return _tool_graph_context(
+            config,
+            selected_nodes,
+            selected_paths,
+            node,
+            agent_name,
+            max_nodes,
+            max_bytes,
         )
 
     @mcp.tool(description=tools["agent_activity"])
@@ -295,22 +351,35 @@ def _build_fastmcp(config: cfg_mod.Config, *, allow_writes: bool = False):
         return _tool_code_graph(config, include_code=False)
 
     @mcp.resource(
-        "codeindex://symbol/{canonical}", description=_RESOURCE_DESCRIPTIONS[3][1]
+        "codeindex://graph-context", description=_RESOURCE_DESCRIPTIONS[3][1]
+    )
+    def graph_context_resource() -> dict:
+        return _tool_graph_context(config)
+
+    @mcp.resource(
+        "codeindex://symbol/{canonical}", description=_RESOURCE_DESCRIPTIONS[4][1]
     )
     def symbol_resource(canonical: str) -> dict:
         return _resource_symbol(config, canonical)
 
     @mcp.resource(
-        "codeindex://chunk/{chunk_uid}", description=_RESOURCE_DESCRIPTIONS[4][1]
+        "codeindex://chunk/{chunk_uid}", description=_RESOURCE_DESCRIPTIONS[5][1]
     )
     def chunk_resource(chunk_uid: str) -> dict:
         return _resource_chunk(config, chunk_uid)
 
     @mcp.resource(
-        "codeindex://agent-activity", description=_RESOURCE_DESCRIPTIONS[5][1]
+        "codeindex://agent-activity", description=_RESOURCE_DESCRIPTIONS[6][1]
     )
     def agent_activity_resource() -> dict:
         return _tool_agent_activity(config)
+
+    @mcp.resource(
+        "codeindex://retrieval-broker/{query}",
+        description=_RESOURCE_DESCRIPTIONS[7][1],
+    )
+    def retrieval_broker_resource(query: str) -> Any:
+        return _tool_retrieval_broker(config, query)
 
     return mcp
 

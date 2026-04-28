@@ -3,6 +3,12 @@
 Audience: Claude Code or another coding agent picking up the graph-server
 task orchestration slice.
 
+Next hardening roadmap:
+[`graph-agent-companion-hardening-plan.md`](graph-agent-companion-hardening-plan.md).
+
+New-session PRD:
+[`../docs/graph-agent-companion-prd.md`](../docs/graph-agent-companion-prd.md).
+
 ## Goal
 
 Make `code_index graph-server` a seamless local control plane for supervising

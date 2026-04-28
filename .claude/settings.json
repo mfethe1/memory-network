@@ -1,6 +1,18 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/verify-claim-before-edit.sh",
+            "description": "When CODE_INDEX_AGENT_RUN_ID and fence env vars are set, verify edit/exclusive claims before writes."
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",

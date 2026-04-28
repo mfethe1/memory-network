@@ -58,7 +58,9 @@ python -m code_index agent decision --message "Keep graph refresh SSE-only for a
 python -m code_index agent transcript --run-id <run-id> --json
 python -m code_index agent recent
 python -m code_index agent claim --run-id <run-id> --file code_index/commands/graph_cmd.py --mode edit
+python -m code_index agent verify-claim --run-id <run-id> --file code_index/commands/graph_cmd.py --fence <token>
 python -m code_index agent claims --json
+python -m code_index agent board --json
 python -m code_index agent release --run-id <run-id> --file code_index/commands/graph_cmd.py
 
 # Exercise the graph task callback path without launching a real coding agent
@@ -143,7 +145,8 @@ output: JSON lines with `event_type`/`type`, optional
 message`. Set `CODE_INDEX_AGENT_WEBHOOK_TOKEN` to add a bearer token on
 outbound HTTP dispatches. Set `CODE_INDEX_GRAPH_TOKEN` when you want graph
 server reads, browser POSTs, and adapter callbacks to require bearer auth.
-The server prints a `?token=...` URL for browser use; clients can also send
+The server prints a clean browser URL; the browser creates an httpOnly
+same-origin session after token entry, and API or adapter clients can send
 `Authorization: Bearer <token>`. Optional command limits:
 `CODE_INDEX_AGENT_COMMAND_TIMEOUT`, `CODE_INDEX_AGENT_MAX_OUTPUT_EVENTS`, and
 `CODE_INDEX_AGENT_CONTEXT_BUDGET`.
@@ -161,14 +164,19 @@ run transcript and decision ledger.
 
 `GET /api/debug` returns a compact graph-server health snapshot for humans and
 agents: graph build time, payload size, node/edge counts, embedded-code bytes,
-index file stats, active run/claim counts, and dispatch configuration. The
-browser inspector includes a Debug tab that shows local render/hydration
-metrics and can fetch this server snapshot.
+index file stats, active run/claim counts, dispatch configuration, and a
+sanitized ops snapshot for auth failures, preflight rejections, claim
+conflicts, SSE drops, stale runs, search latency, and retrieval-budget
+readiness. The browser inspector includes a Debug tab that shows local
+render/hydration metrics, renders ops cards, consumes live `perf:tick` SSE
+updates, and can fetch this server snapshot.
 
 The top search box filters the visible graph locally and, when served by
 `graph-server`, also queries `/api/search` for indexed file/chunk matches and
-agent transcript events. Search results appear in the navigator and can jump
-to a file node or open the matching run transcript.
+agent transcript events. `/api/search`, `doctor --eval-retrieval`, and the MCP
+`retrieval_broker` tool share the same broker contract for file paths, code
+chunks, and transcript events. Search results appear in the navigator and can
+jump to a file node or open the matching run transcript.
 
 The graph renderer now draws only the visible subgraph instead of rendering the
 whole repository and dimming hidden nodes. The `Layered context` view lays out
@@ -184,6 +192,22 @@ lists active claims; `POST /api/file-claims` can claim or release paths for a
 run. Claims are included in SSE activity snapshots, graph context, collaboration
 packets, context packets, and the browser sidebar so overlapping agents can see
 coordination risk before editing.
+
+Hooks and command adapters can enforce leases before supervised writes with
+`python -m code_index agent verify-claim --run-id <run-id> --file <path>
+--fence <token>`. The command succeeds only for a current edit or exclusive
+claim with a matching fence token and reports missing, stale, expired, or
+conflicting claims with hook-friendly error text. Read-only claims remain
+non-blocking. The included Claude Code PreToolUse hook
+`.claude/hooks/verify-claim-before-edit.sh` is opt-in: set
+`CODE_INDEX_AGENT_RUN_ID` plus `CODE_INDEX_AGENT_FENCE` for one file or
+`CODE_INDEX_AGENT_FENCES` as a JSON map of repo-relative paths to fence tokens.
+
+Task blockers are first-class too. Graph task payloads can include
+`blocked_by_run_ids`; blocked tasks are recorded without dispatching and move
+from the graph sidebar's blocked column to ready when their blocker runs
+complete. `GET /api/agent-board` and `code_index agent board --json` expose the
+same blocked/ready/active/review/done projection for adapters.
 
 Completed or failed runs automatically attach post-run suggestions to the
 transcript: parser diagnostics for touched files, affected pytest node ids when
@@ -229,7 +253,7 @@ The launcher validates configured provider executables before starting unless
               query   → search/fts.py  (weighted BM25 over chunks_fts)
               graph   → commands/graph_cmd.py + graph_model/html/server helpers
               agent   → agent_activity.py + commands/agent_cmd.py
-              mcp     → code_graph/agent_activity tools + codeindex://graph resources
+              mcp     → retrieval_broker/code_graph/graph_context/agent_activity tools + codeindex://graph resources
 ```
 
 ### Parser priority
@@ -310,7 +334,7 @@ Tracked as TODOs rather than silent gaps:
 python -m pytest tests/
 ```
 
-295 tests cover hashing stability, ignore rules, Python AST extraction,
+315 tests cover hashing stability, ignore rules, Python AST extraction,
 pipeline upsert/tombstone/rewrite semantics, graph notes/activity, MCP auth,
 schema repair, and CLI smoke. Tests run with the Python stdlib only.
 

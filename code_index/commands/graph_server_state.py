@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -87,6 +88,7 @@ def _agent_stream_payload(config: cfg_mod.Config) -> dict[str, Any]:
             "active_runs": snapshot["active_runs"],
             "recent_runs": snapshot.get("recent_runs", []),
             "active_claims": snapshot.get("active_claims", []),
+            "kanban": snapshot.get("kanban"),
             "status": "working" if snapshot["active_runs"] else "idle",
         },
         "activity": {
@@ -150,6 +152,7 @@ def _build_payload(config: cfg_mod.Config, args: argparse.Namespace) -> dict[str
             "agent_preflight_path": "/api/agent-task-preflight",
             "agent_runs_path": "/api/agent-runs",
             "agent_events_path": "/api/agent-events",
+            "agent_board_path": "/api/agent-board",
         }
         return payload
     finally:
@@ -224,8 +227,163 @@ def _debug_recommendations(
     return recommendations
 
 
+def _parse_debug_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _sanitize_claim_for_debug(claim: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "claim_id": claim.get("claim_id"),
+        "run_id": claim.get("run_id"),
+        "agent_name": claim.get("agent_name"),
+        "run_status": claim.get("run_status"),
+        "file_path": claim.get("file_path"),
+        "mode": claim.get("mode"),
+        "status": claim.get("status"),
+        "created_at": claim.get("created_at"),
+        "updated_at": claim.get("updated_at"),
+        "heartbeat_at": claim.get("heartbeat_at"),
+        "expires_at": claim.get("expires_at"),
+    }
+
+
+def _sanitize_run_for_debug(run: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "run_id": run.get("run_id"),
+        "agent_name": run.get("agent_name"),
+        "status": run.get("status"),
+        "started_at": run.get("started_at"),
+        "updated_at": run.get("updated_at"),
+        "active_files": run.get("active_files") or [],
+    }
+
+
+def _debug_active_runs_all(config: cfg_mod.Config) -> list[dict[str, Any]]:
+    conn = db_mod.connect(config.db_path)
+    try:
+        db_mod.ensure_schema(conn, config)
+        return agent_activity.active_runs(conn, limit=100, max_age_seconds=None)
+    finally:
+        db_mod.close(conn)
+
+
+def _debug_ops_snapshot(
+    *,
+    agent: dict[str, Any],
+    perf: dict[str, Any],
+) -> dict[str, Any]:
+    counters = perf.get("counters") if isinstance(perf.get("counters"), dict) else {}
+    try:
+        stale_after_seconds = float(
+            os.environ.get("CODE_INDEX_GRAPH_STALE_RUN_SECONDS")
+            or agent_activity.DEFAULT_ACTIVE_RUN_MAX_AGE_SECONDS
+        )
+    except ValueError:
+        stale_after_seconds = float(agent_activity.DEFAULT_ACTIVE_RUN_MAX_AGE_SECONDS)
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)
+    stale_runs: list[dict[str, Any]] = []
+    for run in agent.get("active_runs_all") or agent.get("active_runs") or []:
+        updated_at = _parse_debug_iso(run.get("updated_at"))
+        if updated_at and updated_at < stale_cutoff:
+            stale_runs.append(_sanitize_run_for_debug(run))
+    search_latency = counters.get("search_latency_ms")
+    if not isinstance(search_latency, dict):
+        search_latency = {"count": 0, "last": None, "max": None, "avg": None}
+    retrieval_budget = counters.get("retrieval_budget")
+    if not isinstance(retrieval_budget, dict):
+        retrieval_budget = {
+            "broker_configured": False,
+            "requests": 0,
+            "budget_rejections": 0,
+        }
+    broker_configured = bool(retrieval_budget.get("broker_configured"))
+    active_claims = [
+        _sanitize_claim_for_debug(claim)
+        for claim in agent.get("active_claims") or []
+        if isinstance(claim, dict)
+    ]
+    return {
+        "preflight": {
+            "rejections": counters.get("preflight_rejections") or {},
+        },
+        "auth": {
+            "failures": counters.get("auth_failures") or {},
+        },
+        "claims": {
+            "active_count": len(active_claims),
+            "conflict_count": int(counters.get("claim_conflicts") or 0),
+            "active": active_claims[:20],
+        },
+        "sse": {
+            "dropped_events": int(counters.get("sse_dropped_events") or 0),
+        },
+        "runs": {
+            "stale_after_seconds": stale_after_seconds,
+            "stale_count": len(stale_runs),
+            "stale": stale_runs[:20],
+        },
+        "search": {
+            "latency_ms": search_latency,
+        },
+        "retrieval_budget": {
+            "broker_configured": broker_configured,
+            "requests": int(retrieval_budget.get("requests") or 0),
+            "budget_rejections": int(retrieval_budget.get("budget_rejections") or 0),
+            "placeholder": not broker_configured,
+            "note": (
+                "Graph search uses the shared retrieval broker."
+                if broker_configured
+                else "Runtime retrieval budget broker is not wired into graph-server yet."
+            ),
+        },
+    }
+
+
+def _debug_secret_values() -> list[str]:
+    needles: list[str] = []
+    sensitive_markers = (
+        "TOKEN",
+        "SECRET",
+        "COOKIE",
+        "PASSWORD",
+        "WEBHOOK",
+        "COMMAND",
+        "KEY",
+    )
+    for name, value in os.environ.items():
+        if not value or len(value) < 8:
+            continue
+        if any(marker in name.upper() for marker in sensitive_markers):
+            needles.append(value)
+    return sorted(set(needles), key=len, reverse=True)
+
+
+def _sanitize_debug_payload(value: Any, secret_values: list[str]) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_debug_payload(item, secret_values)
+            for key, item in value.items()
+            if key not in {"fence_token", "lease_token", "bearer_token", "session_cookie"}
+        }
+    if isinstance(value, list):
+        return [_sanitize_debug_payload(item, secret_values) for item in value]
+    if isinstance(value, str):
+        sanitized = value
+        for secret in secret_values:
+            sanitized = sanitized.replace(secret, "[redacted]")
+        return sanitized
+    return value
+
+
 def _build_debug_payload(
-    config: cfg_mod.Config, args: argparse.Namespace
+    config: cfg_mod.Config,
+    args: argparse.Namespace,
+    perf: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a compact debug snapshot for humans, agents, and health checks."""
 
@@ -236,12 +394,39 @@ def _build_debug_payload(
     summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
     activity = payload.get("activity") if isinstance(payload.get("activity"), dict) else {}
     agent = payload.get("agent") if isinstance(payload.get("agent"), dict) else {}
+    agent_for_ops = dict(agent)
+    agent_for_ops["active_runs_all"] = _debug_active_runs_all(config)
     notes = payload.get("notes") if isinstance(payload.get("notes"), dict) else {}
     code_metrics = _embedded_code_metrics(payload)
 
     provider = os.environ.get("CODE_INDEX_AGENT_PROVIDER", "").strip()
     command = os.environ.get("CODE_INDEX_AGENT_COMMAND", "").strip()
     webhook = os.environ.get("CODE_INDEX_AGENT_WEBHOOK_URL", "").strip()
+    perf_payload = perf or {
+        "kind": "code_index_graph_debug_perf",
+        "counters": {
+            "preflight_rejections": {},
+            "auth_failures": {},
+            "sse_dropped_events": 0,
+            "claim_conflicts": 0,
+            "stale_runs": 0,
+            "retrieval_budget": {
+                "broker_configured": True,
+                "requests": 0,
+                "budget_rejections": 0,
+            },
+            "search_latency_ms": {
+                "count": 0,
+                "last": None,
+                "max": None,
+                "avg": None,
+                "by_scope": {},
+            },
+        },
+    }
+    ops_payload = _debug_ops_snapshot(agent=agent_for_ops, perf=perf_payload)
+    if isinstance(perf_payload.get("counters"), dict):
+        perf_payload["counters"]["stale_runs"] = ops_payload["runs"]["stale_count"]
     debug = {
         "kind": "code_index_graph_debug",
         "schema_version": 1,
@@ -290,6 +475,8 @@ def _build_debug_payload(
             "recent_file_count": len(activity.get("agent_recent_files") or []),
             "active_agents": agent.get("active_agents") or [],
         },
+        "perf": perf_payload,
+        "ops": ops_payload,
         "notes": {
             "count": notes.get("count") or 0,
             "updated_at": notes.get("updated_at"),
@@ -301,4 +488,4 @@ def _build_debug_payload(
         summary=summary,
         code=code_metrics,
     )
-    return debug
+    return _sanitize_debug_payload(debug, _debug_secret_values())

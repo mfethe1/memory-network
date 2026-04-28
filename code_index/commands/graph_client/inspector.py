@@ -310,10 +310,251 @@ function renderCode(node) {
   }
   return `<pre><code>${escapeHtml(node.code.content)}</code></pre>`;
 }
+function debugNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+function sanitizeDebugValue(value) {
+  const blockedKeys = new Set([
+    "token",
+    "graph_token",
+    "access_token",
+    "authorization",
+    "fence_token",
+    "lease_token",
+    "bearer_token",
+    "session_cookie"
+  ]);
+  if (Array.isArray(value)) return value.map(item => sanitizeDebugValue(item));
+  if (value && typeof value === "object") {
+    const clean = {};
+    Object.entries(value).forEach(([key, item]) => {
+      if (blockedKeys.has(String(key).toLowerCase())) return;
+      clean[key] = sanitizeDebugValue(item);
+    });
+    return clean;
+  }
+  return value;
+}
+function opsFromPerfTick(tick) {
+  const counters = (tick && tick.counters) || {};
+  const retrieval = counters.retrieval_budget && typeof counters.retrieval_budget === "object"
+    ? counters.retrieval_budget
+    : {};
+  return {
+    preflight: { rejections: counters.preflight_rejections || {} },
+    auth: { failures: counters.auth_failures || {} },
+    claims: {
+      active_count: 0,
+      conflict_count: debugNumber(counters.claim_conflicts),
+      active: []
+    },
+    sse: { dropped_events: debugNumber(counters.sse_dropped_events) },
+    runs: {
+      stale_after_seconds: null,
+      stale_count: debugNumber(counters.stale_runs),
+      stale: []
+    },
+    search: { latency_ms: counters.search_latency_ms || {} },
+    retrieval_budget: {
+      broker_configured: !!retrieval.broker_configured,
+      requests: debugNumber(retrieval.requests),
+      budget_rejections: debugNumber(retrieval.budget_rejections),
+      placeholder: true,
+      note: "Perf tick carries counters only; fetch server debug for run and claim details."
+    }
+  };
+}
+function debugViewSnapshot() {
+  if (debugSnapshot) return debugSnapshot;
+  if (!debugPerfTick) return null;
+  return {
+    kind: "code_index_graph_debug_perf_tick",
+    generated_at: debugPerfTick.generated_at,
+    perf: debugPerfTick,
+    ops: opsFromPerfTick(debugPerfTick)
+  };
+}
+function debugObjectEntries(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.entries(value).filter(([key]) => key !== "");
+}
+function renderOpsList(items, emptyText) {
+  if (!items.length) return `<p class="empty">${escapeHtml(emptyText)}</p>`;
+  return `<ul class="ops-list">${items.map(item => `
+    <li>
+      <span>${escapeHtml(item.label)}</span>
+      <strong>${escapeHtml(item.value)}</strong>
+    </li>
+  `).join("")}</ul>`;
+}
+function renderOpsBucket(bucket, emptyText) {
+  const rows = debugObjectEntries(bucket)
+    .sort((a, b) => debugNumber(b[1]) - debugNumber(a[1]))
+    .map(([label, value]) => ({ label, value }));
+  return renderOpsList(rows, emptyText);
+}
+function renderOpsCard(title, active, status, body, extraClass = "") {
+  const className = ["ops-card", active ? "active" : "quiet", extraClass].filter(Boolean).join(" ");
+  return `
+    <div class="${escapeHtml(className)}">
+      <div class="ops-card-head">
+        <h4>${escapeHtml(title)}</h4>
+        <span>${escapeHtml(status)}</span>
+      </div>
+      ${body}
+    </div>
+  `;
+}
+function renderClaimOps(ops) {
+  const claims = (ops.claims && ops.claims.active) || [];
+  const conflictCount = debugNumber(ops.claims && ops.claims.conflict_count);
+  const activeCount = debugNumber((ops.claims && ops.claims.active_count) || claims.length);
+  const rows = claims.slice(0, 8).map(claim => ({
+    label: claim.file_path || claim.claim_id || "claim",
+    value: [claim.agent_name || "Agent", claim.mode || "claim", claim.run_status || claim.status || ""]
+      .filter(Boolean)
+      .join(" · ")
+  }));
+  const body = `
+    ${renderOpsList([
+      { label: "Conflicts", value: conflictCount },
+      { label: "Active claims", value: activeCount }
+    ], "No claim activity recorded.")}
+    ${rows.length ? renderOpsList(rows, "No active claims.") : `<p class="empty">No active claims.</p>`}
+  `;
+  return renderOpsCard(
+    "Claim Conflicts",
+    conflictCount > 0 || activeCount > 0,
+    conflictCount > 0 ? `${conflictCount} conflict${conflictCount === 1 ? "" : "s"}` : "No conflicts",
+    body,
+    conflictCount > 0 ? "warn" : ""
+  );
+}
+function renderStaleRunOps(ops) {
+  const runs = (ops.runs && ops.runs.stale) || [];
+  const staleCount = debugNumber((ops.runs && ops.runs.stale_count) || runs.length);
+  const rows = runs.slice(0, 8).map(run => ({
+    label: run.run_id || "run",
+    value: [run.agent_name || "Agent", run.status || "working", run.updated_at || ""]
+      .filter(Boolean)
+      .join(" · ")
+  }));
+  const staleAfter = ops.runs && ops.runs.stale_after_seconds
+    ? `after ${ops.runs.stale_after_seconds}s`
+    : "counter only";
+  const body = rows.length
+    ? renderOpsList(rows, "No stale runs.")
+    : `<p class="empty">No stale runs detected.</p>`;
+  return renderOpsCard(
+    "Stale Runs",
+    staleCount > 0,
+    staleCount > 0 ? `${staleCount} stale · ${staleAfter}` : "Fresh",
+    body,
+    staleCount > 0 ? "warn" : ""
+  );
+}
+function renderSearchLatencyOps(ops) {
+  const latency = (ops.search && ops.search.latency_ms) || {};
+  const count = debugNumber(latency.count);
+  const rows = [
+    { label: "Samples", value: count },
+    { label: "Last", value: latency.last == null ? "n/a" : `${latency.last} ms` },
+    { label: "Average", value: latency.avg == null ? "n/a" : `${latency.avg} ms` },
+    { label: "Max", value: latency.max == null ? "n/a" : `${latency.max} ms` }
+  ];
+  const scopeRows = debugObjectEntries(latency.by_scope || {}).map(([scope, scoped]) => ({
+    label: `scope ${scope}`,
+    value: scoped && typeof scoped === "object"
+      ? `${debugNumber(scoped.count)} · avg ${scoped.avg == null ? "n/a" : `${scoped.avg} ms`}`
+      : scoped
+  }));
+  return renderOpsCard(
+    "Search Latency",
+    count > 0,
+    count > 0 ? `${count} sample${count === 1 ? "" : "s"}` : "No searches",
+    count > 0
+      ? renderOpsList(rows.concat(scopeRows), "No search latency samples.")
+      : `<p class="empty">No server searches recorded yet.</p>`
+  );
+}
+function renderRetrievalBudgetOps(ops) {
+  const budget = (ops && ops.retrieval_budget) || {};
+  const requests = debugNumber(budget.requests);
+  const rejections = debugNumber(budget.budget_rejections);
+  const configured = !!budget.broker_configured;
+  const body = `
+    ${renderOpsList([
+      { label: "Broker", value: configured ? "configured" : "not configured" },
+      { label: "Requests", value: requests },
+      { label: "Budget rejections", value: rejections }
+    ], "No retrieval budget counters.")}
+    <p class="ops-note">${escapeHtml(budget.note || (budget.placeholder ? "Retrieval budget broker readiness placeholder." : ""))}</p>
+  `;
+  return renderOpsCard(
+    "Retrieval Budget",
+    configured || requests > 0 || rejections > 0,
+    configured ? "Ready" : "Not wired",
+    body,
+    rejections > 0 ? "warn" : ""
+  );
+}
+function renderOpsPanel(snapshot) {
+  if (!snapshot) {
+    return `
+      <div class="ops-empty">
+        <strong>No server ops snapshot loaded</strong>
+        <span>Fetch server debug to render auth failures, preflight rejections, claim conflicts, SSE drops, stale runs, search latency, and retrieval budget readiness.</span>
+      </div>
+    `;
+  }
+  const ops = snapshot.ops || {};
+  const authFailures = (ops.auth && ops.auth.failures) || {};
+  const preflightRejections = (ops.preflight && ops.preflight.rejections) || {};
+  const sseDrops = debugNumber(ops.sse && ops.sse.dropped_events);
+  return `
+    <div class="ops-grid">
+      ${renderOpsCard(
+        "Auth Failures",
+        debugObjectEntries(authFailures).length > 0,
+        debugObjectEntries(authFailures).length ? "Failures recorded" : "Clean",
+        renderOpsBucket(authFailures, "No auth failures recorded."),
+        debugObjectEntries(authFailures).length ? "warn" : ""
+      )}
+      ${renderOpsCard(
+        "Preflight Rejections",
+        debugObjectEntries(preflightRejections).length > 0,
+        debugObjectEntries(preflightRejections).length ? "Rejected requests" : "Clear",
+        renderOpsBucket(preflightRejections, "No preflight rejections recorded."),
+        debugObjectEntries(preflightRejections).length ? "warn" : ""
+      )}
+      ${renderClaimOps(ops)}
+      ${renderOpsCard(
+        "SSE Drops",
+        sseDrops > 0,
+        sseDrops > 0 ? `${sseDrops} drop${sseDrops === 1 ? "" : "s"}` : "Connected",
+        sseDrops > 0
+          ? renderOpsList([{ label: "Dropped events", value: sseDrops }], "No SSE drops recorded.")
+          : `<p class="empty">No dropped SSE connections recorded.</p>`,
+        sseDrops > 0 ? "warn" : ""
+      )}
+      ${renderStaleRunOps(ops)}
+      ${renderSearchLatencyOps(ops)}
+      ${renderRetrievalBudgetOps(ops)}
+    </div>
+  `;
+}
+function handlePerfTick(tick) {
+  debugPerfTick = sanitizeDebugValue(tick || {});
+  if (activeTab === "debug" && !selectedRunTranscript) {
+    renderInspector();
+  }
+}
 function renderDebug(node) {
   const summary = data.summary || {};
   const agent = data.agent || {};
   const activity = data.activity || {};
+  const snapshot = debugViewSnapshot();
   const selectedFacts = node ? [
     `selected ${node.id}`,
     `care ${node.care_level || "n/a"}`,
@@ -346,6 +587,14 @@ function renderDebug(node) {
     },
     selected: selectedFacts
   };
+  const statusText = debugFetchError
+    ? debugFetchError
+    : (debugSnapshot
+      ? `Fetched ${debugSnapshot.generated_at || ""}`
+      : (debugPerfTick ? `Live perf tick ${debugPerfTick.generated_at || ""}` : (canPostToGraphServer() ? "Server snapshot available" : "Graph server required")));
+  const rawSnapshot = snapshot
+    ? { server: snapshot, client: clientMetrics }
+    : { local };
   return `
     <p class="summary-text">Debug state for graph build, rendering, live updates, and agent activity.</p>
     <div class="section">
@@ -357,6 +606,7 @@ function renderDebug(node) {
         <dt>Hydrate</dt><dd>${escapeHtml(`${clientMetrics.last_hydrate_ms} ms · ${clientMetrics.hydrate_count}x`)}</dd>
         <dt>Render</dt><dd>${escapeHtml(`${clientMetrics.last_render_ms} ms · ${clientMetrics.render_count}x`)}</dd>
         <dt>Live</dt><dd>${escapeHtml(local.live.event_source_connected ? "connected" : (liveRefresh.checked ? "connecting" : "off"))}</dd>
+        <dt>Perf tick</dt><dd>${escapeHtml(debugPerfTick ? (debugPerfTick.generated_at || "received") : "none")}</dd>
       </dl>
     </div>
     <div class="section">
@@ -365,11 +615,15 @@ function renderDebug(node) {
     </div>
     <div class="actions">
       <button class="small-button" id="refresh-debug" type="button"${canPostToGraphServer() ? "" : " disabled aria-disabled=\"true\""}>Fetch server debug</button>
-      <span class="inline-status" id="debug-status">${canPostToGraphServer() ? "Server snapshot available" : "Graph server required"}</span>
+      <span class="inline-status" id="debug-status">${escapeHtml(statusText)}</span>
+    </div>
+    <div class="section">
+      <h3>Ops Snapshot</h3>
+      <div id="debug-ops">${renderOpsPanel(snapshot)}</div>
     </div>
     <div class="section">
       <h3>Snapshot</h3>
-      <pre id="debug-json">${escapeHtml(JSON.stringify(local, null, 2))}</pre>
+      <pre id="debug-json">${escapeHtml(JSON.stringify(rawSnapshot, null, 2))}</pre>
     </div>
   `;
 }
@@ -389,16 +643,17 @@ async function fetchDebugSnapshot() {
       headers: { "Accept": "application/json" },
       cache: "no-store"
     });
-    const snapshot = await response.json();
+    const snapshot = sanitizeDebugValue(await response.json());
     if (!response.ok) throw new Error(snapshot.error || `HTTP ${response.status}`);
     clientMetrics.last_debug_fetch_ms = Math.round((performance.now() - started) * 100) / 100;
-    output.textContent = JSON.stringify({
-      server: snapshot,
-      client: clientMetrics
-    }, null, 2);
+    debugSnapshot = snapshot;
+    debugFetchError = "";
+    output.textContent = JSON.stringify({ server: snapshot, client: clientMetrics }, null, 2);
     status.textContent = `Fetched in ${clientMetrics.last_debug_fetch_ms} ms`;
+    if (activeTab === "debug" && !selectedRunTranscript) renderInspector();
   } catch (err) {
-    status.textContent = err.message || "Fetch failed";
+    debugFetchError = err.message || "Fetch failed";
+    status.textContent = debugFetchError;
   }
 }
 function renderChat(node) {

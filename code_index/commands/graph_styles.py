@@ -299,6 +299,68 @@ GRAPH_CSS = r"""
       opacity: 0.55;
       cursor: default;
     }
+    .task-board {
+      display: grid;
+      gap: 6px;
+    }
+    .task-column {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+      padding: 6px;
+    }
+    .task-column-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 5px;
+      color: var(--muted);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .task-column.blocked .task-column-head {
+      color: var(--critical);
+    }
+    .task-column.ready .task-column-head {
+      color: #ffd166;
+    }
+    .task-card {
+      width: 100%;
+      min-height: 32px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--field);
+      color: var(--ink);
+      display: grid;
+      gap: 2px;
+      padding: 5px 6px;
+      font: inherit;
+      font-size: 11px;
+      text-align: left;
+      cursor: pointer;
+    }
+    .task-card + .task-card {
+      margin-top: 4px;
+    }
+    .task-card span,
+    .task-card em {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .task-card em {
+      color: var(--muted);
+      font-style: normal;
+      font-size: 10px;
+    }
+    .task-card.empty {
+      min-height: 24px;
+      color: var(--muted);
+      cursor: default;
+    }
     .breadcrumb-list {
       display: flex;
       flex-wrap: wrap;
@@ -670,6 +732,94 @@ GRAPH_CSS = r"""
       color: var(--muted);
       font-size: 12px;
       line-height: 1.35;
+    }
+    .ops-empty {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: var(--panel-2);
+      display: grid;
+      gap: 5px;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .ops-empty strong {
+      color: var(--ink);
+    }
+    .ops-empty span,
+    .ops-note {
+      color: var(--muted);
+    }
+    .ops-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 8px;
+    }
+    .ops-card {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: var(--panel-2);
+      display: grid;
+      gap: 8px;
+      align-content: start;
+    }
+    .ops-card.active {
+      border-color: rgba(93, 212, 198, 0.45);
+    }
+    .ops-card.warn {
+      border-color: rgba(255, 107, 107, 0.55);
+      background: rgba(255, 107, 107, 0.06);
+    }
+    .ops-card-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: baseline;
+    }
+    .ops-card-head h4 {
+      margin: 0;
+      color: var(--ink);
+      font-size: 12px;
+      line-height: 1.25;
+    }
+    .ops-card-head span {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.25;
+      text-align: right;
+    }
+    .ops-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 5px;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .ops-list li {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: baseline;
+    }
+    .ops-list span {
+      min-width: 0;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+    .ops-list strong {
+      color: var(--ink);
+      font-weight: 600;
+      text-align: right;
+      overflow-wrap: anywhere;
+    }
+    .ops-note {
+      margin: 0;
+      font-size: 11px;
+      line-height: 1.4;
     }
     .edit-list {
       display: grid;

@@ -982,6 +982,7 @@ def build_graph(
             "agent_preflight_path": None,
             "agent_runs_path": None,
             "agent_events_path": None,
+            "agent_board_path": None,
         },
         "agent": {
             "name": agent_name or (", ".join(active_agent_names) or "Agent"),
@@ -990,6 +991,7 @@ def build_graph(
             "active_runs": activity_snapshot["active_runs"],
             "recent_runs": activity_snapshot.get("recent_runs", []),
             "active_claims": active_claims,
+            "kanban": activity_snapshot.get("kanban"),
             "status": agent_status,
         },
         "summary": {

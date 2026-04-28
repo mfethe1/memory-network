@@ -132,6 +132,27 @@ def build_parser() -> argparse.ArgumentParser:
         "doctor", help="coverage, drift, and optional-dep report"
     )
     _add_common(p_doctor)
+    p_doctor.add_argument(
+        "--eval-retrieval",
+        action="store_true",
+        help="run the local retrieval golden-set eval and include metrics",
+    )
+    p_doctor.add_argument(
+        "--eval-file",
+        help="path to a retrieval eval JSON file (default: bundled fixture)",
+    )
+    p_doctor.add_argument(
+        "--eval-limit",
+        type=int,
+        default=10,
+        help="max retrieval results per eval case (default 10)",
+    )
+    p_doctor.add_argument(
+        "--eval-budget-bytes",
+        type=int,
+        default=20_000,
+        help="byte budget per eval case (default 20000)",
+    )
     p_doctor.set_defaults(func=doctor_cmd.run)
 
     p_watch = subparsers.add_parser(
@@ -435,6 +456,9 @@ def build_parser() -> argparse.ArgumentParser:
             "claims",
             "claim",
             "release",
+            "block",
+            "board",
+            "verify-claim",
         ],
         help="activity action to record or inspect",
     )
@@ -515,6 +539,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=agent_activity.DEFAULT_CLAIM_TTL_SECONDS,
         help="claim lease duration for `claim` (default 1800)",
+    )
+    p_agent.add_argument(
+        "--fence",
+        type=int,
+        help="fence token for `verify-claim` write lease checks",
+    )
+    p_agent.add_argument(
+        "--blocked-by",
+        dest="blocked_by_run_id",
+        action="append",
+        default=[],
+        help="run id that must complete before this run can start; repeatable",
     )
     p_agent.set_defaults(func=agent_cmd.run)
 

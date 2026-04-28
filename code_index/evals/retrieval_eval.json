@@ -1,0 +1,23 @@
+[
+  {
+    "id": "graph-server-preflight",
+    "query": "code_index/commands/graph_server_http.py",
+    "expected": [
+      {"kind": "file", "id": "code_index/commands/graph_server_http.py"}
+    ]
+  },
+  {
+    "id": "agent-claims",
+    "query": "code_index/agent_activity.py",
+    "expected": [
+      {"kind": "file", "id": "code_index/agent_activity.py"}
+    ]
+  },
+  {
+    "id": "debug-payload",
+    "query": "code_index/commands/graph_server_state.py",
+    "expected": [
+      {"kind": "file", "id": "code_index/commands/graph_server_state.py"}
+    ]
+  }
+]

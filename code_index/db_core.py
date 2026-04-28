@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "10"
 SCHEMA_FILE = Path(__file__).with_name("schema.sql")
 
 
@@ -44,6 +44,7 @@ def apply_schema(conn: sqlite3.Connection) -> None:
         )
     prior_version = get_schema_version(conn)
     _migrate_if_needed(conn, prior_version)
+    _repair_expected_columns(conn)
     sql = SCHEMA_FILE.read_text(encoding="utf-8")
     conn.executescript(sql)
     conn.execute(
@@ -118,6 +119,7 @@ def _migrate_if_needed(conn: sqlite3.Connection, prior: str | None) -> None:
     v4 while still missing `embedding_norm` or the git metadata columns.
     """
     if prior is None:
+        _repair_expected_columns(conn)
         return
     if prior == SCHEMA_VERSION:
         _repair_expected_columns(conn)
@@ -165,6 +167,19 @@ def _migrate_if_needed(conn: sqlite3.Connection, prior: str | None) -> None:
         # v7 → v8 adds first-class agent file claims. `schema.sql` creates
         # the new table idempotently; existing activity tables are retained.
         return
+    if prior == "8":
+        # v8 → v9 adds preflight receipts and lease fencing. Both are additive.
+        if _table_exists(conn, "agent_file_claims"):
+            _add_column_if_missing(
+                conn,
+                "agent_file_claims",
+                "fence_token",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+        return
+    if prior == "9":
+        # v9 → v10 adds first-class run blocker edges for task-board planning.
+        return
     # Unknown older version: safest local policy is to drop the derived tables
     # and let the next reindex rebuild them. Canonical tables survive.
     for t in ("test_edges", "unresolved_calls"):
@@ -181,12 +196,15 @@ _EXPECTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("embeddings", "embedding_norm", "REAL"),
     ("embeddings", "content_hash", "TEXT"),
     ("agent_runs", "archived_at", "TEXT"),
+    ("agent_file_claims", "fence_token", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 _EXPECTED_TABLES: tuple[str, ...] = (
     "agent_runs",
     "agent_events",
     "agent_file_claims",
+    "agent_task_preflights",
+    "agent_run_blockers",
 )
 
 

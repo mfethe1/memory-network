@@ -12,6 +12,7 @@ GRAPH_SCRIPT_NAVIGATOR = r"""function renderNavigator() {
   renderActiveFiles();
   renderFileClaims();
   renderAgentRuns();
+  renderTaskBoard();
   renderSearchResults();
   renderRelatedFiles();
   recentFilesEl.innerHTML = recentFiles.length
@@ -149,6 +150,42 @@ function renderAgentRuns() {
   agentRunsEl.innerHTML = runs.length
     ? runs.map(run => runRowHtml(run)).join("")
     : `<div class="empty">No queued or active runs.</div>`;
+}
+function renderTaskBoard() {
+  if (!taskBoardEl) return;
+  const board = data.agent && data.agent.kanban;
+  const columns = board && board.columns ? board.columns : {};
+  const ordered = ["blocked", "ready", "active", "review", "done"];
+  taskBoardEl.innerHTML = ordered.map(name => {
+    const column = columns[name] || { title: name, runs: [] };
+    const runs = (column.runs || []).slice(0, 4);
+    const title = column.title || name;
+    const rows = runs.length
+      ? runs.map(run => taskBoardRunHtml(run, name)).join("")
+      : `<div class="task-card empty">Empty</div>`;
+    return `
+      <div class="task-column ${escapeHtml(name)}">
+        <div class="task-column-head">
+          <span>${escapeHtml(title)}</span>
+          <strong>${runs.length}</strong>
+        </div>
+        ${rows}
+      </div>
+    `;
+  }).join("");
+}
+function taskBoardRunHtml(run, column) {
+  const blockers = (run.blocked_by || []).filter(item => String(item.status || "").toLowerCase() === "active");
+  const label = run.prompt || run.run_id;
+  const badge = blockers.length
+    ? `${blockers.length} blocker${blockers.length === 1 ? "" : "s"}`
+    : `${run.agent_name || "Agent"} · ${run.status || column}`;
+  return `
+    <button class="task-card" data-run-details="${escapeHtml(run.run_id)}" type="button" title="${escapeHtml(label)}">
+      <span>${escapeHtml(label)}</span>
+      <em>${escapeHtml(badge)}</em>
+    </button>
+  `;
 }
 function renderSearchResults() {
   if (!searchResultsEl) return;

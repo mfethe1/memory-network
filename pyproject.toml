@@ -44,7 +44,7 @@ include = ["code_index*"]
 exclude = ["tests*", "plans*", "docs*"]
 
 [tool.setuptools.package-data]
-code_index = ["schema.sql", "hooks/*"]
+code_index = ["schema.sql", "hooks/*", "evals/*.json"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

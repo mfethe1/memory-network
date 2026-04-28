@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import textwrap
-from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -88,12 +87,16 @@ def test_mcp_serve_describe_emits_tool_and_resource_surface(
         "impact",
         "affected_tests",
         "doctor",
+        "retrieval_broker",
         "code_graph",
+        "graph_context",
         "agent_activity",
     } <= tool_names
+    resource_uris = {r["uri"] for r in payload["resources"]}
+    assert "codeindex://graph-context" in resource_uris
+    assert "codeindex://retrieval-broker/{query}" in resource_uris
     assert "update" not in tool_names
     assert "rebuild_fts" not in tool_names
-    resource_uris = {r["uri"] for r in payload["resources"]}
     assert "codeindex://repo-map" in resource_uris
     assert "codeindex://doctor" in resource_uris
     assert "codeindex://graph" in resource_uris

@@ -27,6 +27,7 @@ EVENT_CLAIM_MODES = {
     "edit": "edit",
     "test": "test",
 }
+EXCLUSIVE_CLAIM_MODES = {"edit", "exclusive"}
 
 
 def _now_iso() -> str:
@@ -76,6 +77,21 @@ def _json_dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        text = str(item).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
 def _row_to_run(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
     run_pk = int(row["run_pk"])
     columns = set(row.keys())
@@ -92,6 +108,8 @@ def _row_to_run(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         "archived_at": row["archived_at"] if "archived_at" in columns else None,
         "metadata": _json_loads(row["metadata_json"], {}),
         "active_files": _active_files_for_run(conn, run_pk),
+        "blocked_by": _run_blockers_for_run(conn, run_pk),
+        "blocks": _runs_blocked_by_run(conn, run_pk),
     }
 
 
@@ -147,6 +165,7 @@ def _row_to_claim(row: sqlite3.Row) -> dict[str, Any]:
         "mode": row["mode"],
         "status": row["status"] or "active",
         "reason": row["reason"] or "",
+        "fence_token": int(row["fence_token"] or 0) if "fence_token" in row.keys() else 0,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "heartbeat_at": row["heartbeat_at"],
@@ -154,6 +173,88 @@ def _row_to_claim(row: sqlite3.Row) -> dict[str, Any]:
         "released_at": row["released_at"],
         "metadata": _json_loads(row["metadata_json"], {}),
     }
+
+
+def _row_to_blocker(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "blocker_pk": int(row["blocker_pk"]),
+        "run_id": row["blocker_run_id"],
+        "agent_name": row["blocker_agent_name"] or "Agent",
+        "run_status": row["blocker_run_status"] or "working",
+        "prompt": row["blocker_prompt"] or "",
+        "status": row["status"] or "active",
+        "reason": row["reason"] or "",
+        "created_at": row["created_at"],
+        "resolved_at": row["resolved_at"],
+        "metadata": _json_loads(row["metadata_json"], {}),
+    }
+
+
+def _row_to_blocked_run(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "blocker_pk": int(row["blocker_pk"]),
+        "run_id": row["blocked_run_id"],
+        "agent_name": row["blocked_agent_name"] or "Agent",
+        "run_status": row["blocked_run_status"] or "working",
+        "prompt": row["blocked_prompt"] or "",
+        "status": row["status"] or "active",
+        "reason": row["reason"] or "",
+        "created_at": row["created_at"],
+        "resolved_at": row["resolved_at"],
+        "metadata": _json_loads(row["metadata_json"], {}),
+    }
+
+
+def _run_blockers_for_run(
+    conn: sqlite3.Connection, run_pk: int
+) -> list[dict[str, Any]]:
+    try:
+        rows = conn.execute(
+            """
+            SELECT b.*,
+                   blocker.run_id AS blocker_run_id,
+                   blocker.agent_name AS blocker_agent_name,
+                   blocker.status AS blocker_run_status,
+                   blocker.prompt AS blocker_prompt
+              FROM agent_run_blockers b
+              JOIN agent_runs blocker ON blocker.run_pk = b.blocker_run_pk
+             WHERE b.run_pk = ?
+             ORDER BY
+               CASE b.status WHEN 'active' THEN 0 ELSE 1 END,
+               b.created_at ASC,
+               b.blocker_pk ASC
+            """,
+            (run_pk,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [_row_to_blocker(row) for row in rows]
+
+
+def _runs_blocked_by_run(
+    conn: sqlite3.Connection, blocker_run_pk: int
+) -> list[dict[str, Any]]:
+    try:
+        rows = conn.execute(
+            """
+            SELECT b.*,
+                   blocked.run_id AS blocked_run_id,
+                   blocked.agent_name AS blocked_agent_name,
+                   blocked.status AS blocked_run_status,
+                   blocked.prompt AS blocked_prompt
+              FROM agent_run_blockers b
+              JOIN agent_runs blocked ON blocked.run_pk = b.run_pk
+             WHERE b.blocker_run_pk = ?
+             ORDER BY
+               CASE b.status WHEN 'active' THEN 0 ELSE 1 END,
+               b.created_at ASC,
+               b.blocker_pk ASC
+            """,
+            (blocker_run_pk,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [_row_to_blocked_run(row) for row in rows]
 
 
 def _active_files_for_run(
@@ -263,6 +364,216 @@ def start_run(
     return run
 
 
+def _active_blocker_count(conn: sqlite3.Connection, run_pk: int) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*)
+          FROM agent_run_blockers
+         WHERE run_pk = ?
+           AND status = 'active'
+        """,
+        (run_pk,),
+    ).fetchone()
+    return int(row[0] or 0)
+
+
+def _sync_blocked_runs(conn: sqlite3.Connection) -> None:
+    now = _now_iso()
+    conn.execute(
+        """
+        UPDATE agent_run_blockers
+           SET status = 'resolved',
+               resolved_at = COALESCE(resolved_at, ?)
+         WHERE status = 'active'
+           AND blocker_run_pk IN (
+               SELECT run_pk
+                 FROM agent_runs
+                WHERE LOWER(COALESCE(status, '')) = 'completed'
+           )
+        """,
+        (now,),
+    )
+    conn.execute(
+        """
+        UPDATE agent_runs
+           SET status = 'queued',
+               updated_at = ?
+         WHERE LOWER(COALESCE(status, '')) = 'blocked'
+           AND archived_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM agent_run_blockers b
+                WHERE b.run_pk = agent_runs.run_pk
+                  AND b.status = 'active'
+           )
+        """,
+        (now,),
+    )
+
+
+def add_run_blockers(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    blocked_by_run_ids: list[str],
+    reason: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    run = get_run(conn, run_id)
+    if run is None:
+        raise ValueError(f"unknown agent run_id: {run_id}")
+    if str(run.get("status") or "").lower() in TERMINAL_STATUSES:
+        raise ValueError(f"cannot block terminal run_id: {run_id}")
+    blocker_ids = _string_list(blocked_by_run_ids)
+    if not blocker_ids:
+        return []
+    if run_id in blocker_ids:
+        raise ValueError("a run cannot block itself")
+
+    now = _now_iso()
+    rows: list[dict[str, Any]] = []
+    for blocker_id in blocker_ids:
+        blocker = get_run(conn, blocker_id)
+        if blocker is None:
+            raise ValueError(f"unknown blocker run_id: {blocker_id}")
+        link_status = (
+            "resolved"
+            if str(blocker.get("status") or "").lower() == "completed"
+            else "active"
+        )
+        resolved_at = now if link_status == "resolved" else None
+        conn.execute(
+            """
+            INSERT INTO agent_run_blockers(
+                run_pk, blocker_run_pk, status, reason, created_at,
+                resolved_at, metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_pk, blocker_run_pk) DO UPDATE SET
+                status = excluded.status,
+                reason = excluded.reason,
+                resolved_at = excluded.resolved_at,
+                metadata_json = excluded.metadata_json
+            """,
+            (
+                run["run_pk"],
+                blocker["run_pk"],
+                link_status,
+                reason or "",
+                now,
+                resolved_at,
+                _json_dumps(metadata or {}),
+            ),
+        )
+    if _active_blocker_count(conn, int(run["run_pk"])):
+        conn.execute(
+            """
+            UPDATE agent_runs
+               SET status = 'blocked',
+                   updated_at = ?
+             WHERE run_pk = ?
+               AND LOWER(COALESCE(status, '')) NOT IN ({})
+            """.format(",".join("?" for _ in TERMINAL_STATUSES)),
+            (now, run["run_pk"], *sorted(TERMINAL_STATUSES)),
+        )
+    else:
+        _sync_blocked_runs(conn)
+
+    refreshed = get_run(conn, run_id)
+    if refreshed is not None:
+        rows = refreshed.get("blocked_by") or []
+    return [
+        row
+        for row in rows
+        if row.get("run_id") in blocker_ids
+    ]
+
+
+def active_run_blockers(
+    conn: sqlite3.Connection, *, run_id: str
+) -> list[dict[str, Any]]:
+    run = get_run(conn, run_id)
+    if run is None:
+        raise ValueError(f"unknown agent run_id: {run_id}")
+    return [
+        blocker
+        for blocker in run.get("blocked_by", [])
+        if str(blocker.get("status") or "").lower() == "active"
+    ]
+
+
+def blocking_runs(
+    conn: sqlite3.Connection, *, run_ids: list[str]
+) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for run_id in _string_list(run_ids):
+        run = get_run(conn, run_id)
+        if run is None:
+            raise ValueError(f"unknown blocker run_id: {run_id}")
+        if run_id in seen:
+            continue
+        seen.add(run_id)
+        blockers.append(run)
+    return [
+        run
+        for run in blockers
+        if str(run.get("status") or "").lower() != "completed"
+    ]
+
+
+def _kanban_column_for_run(run: dict[str, Any]) -> str:
+    status = str(run.get("status") or "working").lower()
+    active_blockers = [
+        blocker
+        for blocker in run.get("blocked_by", [])
+        if str(blocker.get("status") or "").lower() == "active"
+    ]
+    if active_blockers or status == "blocked":
+        return "blocked"
+    if status in {"queued", "ready", "planned"}:
+        return "ready"
+    if status in {"review", "needs_review", "needs-review"}:
+        return "review"
+    if status in TERMINAL_STATUSES:
+        return "done"
+    return "active"
+
+
+def kanban_board(conn: sqlite3.Connection, *, limit: int = 25) -> dict[str, Any]:
+    active = active_runs(conn, limit=max(0, int(limit)) * 3, max_age_seconds=None)
+    recent = recent_runs(conn, limit=max(0, int(limit)) * 3)
+    runs = unique_runs(active + recent)
+    columns = {
+        "blocked": {"title": "Blocked", "runs": []},
+        "ready": {"title": "Ready", "runs": []},
+        "active": {"title": "Active", "runs": []},
+        "review": {"title": "Review", "runs": []},
+        "done": {"title": "Done", "runs": []},
+    }
+    for run in runs:
+        column = _kanban_column_for_run(run)
+        if len(columns[column]["runs"]) < max(0, int(limit)):
+            columns[column]["runs"].append(run)
+    return {
+        "kind": "code_index_agent_kanban",
+        "columns": columns,
+        "counts": {name: len(column["runs"]) for name, column in columns.items()},
+    }
+
+
+def unique_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for run in runs:
+        run_id = str(run.get("run_id") or "")
+        if not run_id or run_id in seen:
+            continue
+        seen.add(run_id)
+        out.append(run)
+    return out
+
+
 def claim_file(
     conn: sqlite3.Connection,
     *,
@@ -280,20 +591,28 @@ def claim_file(
     if not path:
         raise ValueError("file_path is required")
     claim_mode = (mode or "edit").strip().lower()
-    if claim_mode not in {"read", "edit", "review", "test"}:
+    if claim_mode not in {"read", "edit", "review", "test", "exclusive"}:
         raise ValueError(f"unknown claim mode: {claim_mode}")
+    _raise_on_claim_conflict(
+        conn,
+        run_pk=int(run["run_pk"]),
+        file_path=path,
+        mode=claim_mode,
+    )
     now = _now_iso()
     claim_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{run_id}:{path}:{claim_mode}").hex
+    fence_token = _next_fence_token(conn, path)
     conn.execute(
         """
         INSERT INTO agent_file_claims(
-            claim_id, run_pk, file_path, mode, status, reason, created_at,
+            claim_id, run_pk, file_path, mode, status, reason, fence_token, created_at,
             updated_at, heartbeat_at, expires_at, released_at, metadata_json
         )
-        VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, NULL, ?)
+        VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, NULL, ?)
         ON CONFLICT(run_pk, file_path, mode) DO UPDATE SET
             status = 'active',
             reason = excluded.reason,
+            fence_token = excluded.fence_token,
             updated_at = excluded.updated_at,
             heartbeat_at = excluded.heartbeat_at,
             expires_at = excluded.expires_at,
@@ -306,6 +625,7 @@ def claim_file(
             path,
             claim_mode,
             reason or "",
+            fence_token,
             now,
             now,
             now,
@@ -328,6 +648,250 @@ def claim_file(
         (run["run_pk"], path, claim_mode),
     ).fetchone()
     return _row_to_claim(row)
+
+
+def _next_fence_token(conn: sqlite3.Connection, file_path: str) -> int:
+    row = conn.execute(
+        """
+        SELECT COALESCE(MAX(fence_token), 0) + 1
+          FROM agent_file_claims
+         WHERE file_path = ?
+        """,
+        (file_path,),
+    ).fetchone()
+    return int(row[0] or 1)
+
+
+def _raise_on_claim_conflict(
+    conn: sqlite3.Connection,
+    *,
+    run_pk: int,
+    file_path: str,
+    mode: str,
+) -> None:
+    now = _now_iso()
+    rows = conn.execute(
+        f"""
+        SELECT c.claim_id, c.mode, c.file_path, c.fence_token,
+               r.run_id, r.agent_name
+          FROM agent_file_claims c
+          JOIN agent_runs r ON r.run_pk = c.run_pk
+         WHERE c.file_path = ?
+           AND c.status = 'active'
+           AND c.run_pk != ?
+           AND (c.expires_at IS NULL OR c.expires_at >= ?)
+           AND r.archived_at IS NULL
+           AND LOWER(COALESCE(r.status, 'working')) NOT IN ({','.join('?' for _ in TERMINAL_STATUSES)})
+        """,
+        (file_path, run_pk, now, *sorted(TERMINAL_STATUSES)),
+    ).fetchall()
+    for row in rows:
+        other_mode = str(row["mode"] or "")
+        conflict = (
+            mode == "exclusive"
+            or other_mode == "exclusive"
+            or (mode in EXCLUSIVE_CLAIM_MODES and other_mode in EXCLUSIVE_CLAIM_MODES)
+        )
+        if conflict:
+            raise ValueError(
+                "claim conflict: "
+                f"{file_path} is held by {row['agent_name'] or 'Agent'} "
+                f"({row['run_id']}, mode={other_mode}, fence={row['fence_token']})"
+            )
+
+
+def verify_claim_fence(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    file_path: str,
+    fence_token: int,
+    mode: str | None = None,
+) -> bool:
+    path = _normal_path(file_path)
+    if not path:
+        return False
+    run = get_run(conn, run_id)
+    if run is None:
+        return False
+    clauses = [
+        "run_pk = ?",
+        "file_path = ?",
+        "status = 'active'",
+        "(expires_at IS NULL OR expires_at >= ?)",
+        "fence_token = ?",
+    ]
+    params: list[Any] = [run["run_pk"], path, _now_iso(), int(fence_token)]
+    claim_mode = (mode or "").strip().lower()
+    if claim_mode:
+        clauses.append("mode = ?")
+        params.append(claim_mode)
+    row = conn.execute(
+        f"""
+        SELECT 1
+          FROM agent_file_claims
+         WHERE {" AND ".join(clauses)}
+         LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    return row is not None
+
+
+def verify_write_claim(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    file_path: str,
+    fence_token: int,
+) -> dict[str, Any]:
+    """Verify a supervised write has a current edit/exclusive claim.
+
+    Read/review/test claims are intentionally ignored here: they should be
+    visible coordination signals, not write blockers.
+    """
+
+    path = _normal_path(file_path)
+    if not path:
+        return {
+            "ok": False,
+            "reason": "missing_claim",
+            "message": "missing claim: --file is required",
+        }
+    try:
+        fence = int(fence_token)
+    except (TypeError, ValueError):
+        return {
+            "ok": False,
+            "reason": "stale_fence",
+            "message": f"stale fence: expected numeric fence token for {path}",
+            "file_path": path,
+        }
+    run = get_run(conn, run_id)
+    if run is None:
+        return {
+            "ok": False,
+            "reason": "missing_claim",
+            "message": f"missing claim: unknown agent run_id {run_id}",
+            "run_id": run_id,
+            "file_path": path,
+        }
+
+    now = _now_iso()
+    terminal_placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
+    foreign_rows = conn.execute(
+        f"""
+        SELECT c.*,
+               r.run_id,
+               r.agent_name,
+               r.status AS run_status
+          FROM agent_file_claims c
+          JOIN agent_runs r ON r.run_pk = c.run_pk
+         WHERE c.file_path = ?
+           AND c.run_pk != ?
+           AND c.status = 'active'
+           AND c.mode IN ('edit', 'exclusive')
+           AND (c.expires_at IS NULL OR c.expires_at >= ?)
+           AND r.archived_at IS NULL
+           AND LOWER(COALESCE(r.status, 'working')) NOT IN ({terminal_placeholders})
+         ORDER BY c.updated_at DESC, c.claim_pk DESC
+        """,
+        (path, run["run_pk"], now, *sorted(TERMINAL_STATUSES)),
+    ).fetchall()
+    if foreign_rows:
+        claim = _row_to_claim(foreign_rows[0])
+        return {
+            "ok": False,
+            "reason": "conflicting_claim",
+            "message": (
+                "conflicting claim: "
+                f"{path} is held by {claim['agent_name']} "
+                f"({claim['run_id']}, mode={claim['mode']}, "
+                f"fence={claim['fence_token']})"
+            ),
+            "run_id": run_id,
+            "file_path": path,
+            "conflicting_claim": claim,
+        }
+
+    own_rows = conn.execute(
+        """
+        SELECT c.*,
+               r.run_id,
+               r.agent_name,
+               r.status AS run_status
+          FROM agent_file_claims c
+          JOIN agent_runs r ON r.run_pk = c.run_pk
+         WHERE c.file_path = ?
+           AND c.run_pk = ?
+           AND c.status = 'active'
+           AND c.mode IN ('edit', 'exclusive')
+         ORDER BY c.updated_at DESC, c.claim_pk DESC
+        """,
+        (path, run["run_pk"]),
+    ).fetchall()
+    if not own_rows:
+        return {
+            "ok": False,
+            "reason": "missing_claim",
+            "message": (
+                f"missing claim: {run_id} has no active edit/exclusive claim "
+                f"for {path}"
+            ),
+            "run_id": run_id,
+            "file_path": path,
+        }
+
+    expired_claims = [
+        _row_to_claim(row)
+        for row in own_rows
+        if row["expires_at"] is not None and row["expires_at"] < now
+    ]
+    current_claims = [
+        _row_to_claim(row)
+        for row in own_rows
+        if row["expires_at"] is None or row["expires_at"] >= now
+    ]
+    if not current_claims:
+        claim = expired_claims[0]
+        return {
+            "ok": False,
+            "reason": "expired_claim",
+            "message": (
+                f"expired claim: {path} claim for {run_id} expired at "
+                f"{claim['expires_at']} (fence={claim['fence_token']})"
+            ),
+            "run_id": run_id,
+            "file_path": path,
+            "claim": claim,
+        }
+
+    for claim in current_claims:
+        if int(claim.get("fence_token") or 0) == fence:
+            return {
+                "ok": True,
+                "reason": "verified",
+                "message": (
+                    f"claim verified: {path} is held by {run_id} "
+                    f"(mode={claim['mode']}, fence={claim['fence_token']})"
+                ),
+                "run_id": run_id,
+                "file_path": path,
+                "claim": claim,
+            }
+
+    fences = ", ".join(str(claim["fence_token"]) for claim in current_claims)
+    return {
+        "ok": False,
+        "reason": "stale_fence",
+        "message": (
+            f"stale fence: {path} for {run_id} has current fence "
+            f"{fences}; got {fence}"
+        ),
+        "run_id": run_id,
+        "file_path": path,
+        "current_claims": current_claims,
+    }
 
 
 def claim_files(
@@ -548,6 +1112,8 @@ def record_event(
         )
     if next_status and str(next_status).lower() in TERMINAL_STATUSES:
         release_claims(conn, run_id=run_id)
+        if str(next_status).lower() == "completed":
+            _sync_blocked_runs(conn)
     return event_payload
 
 
@@ -963,6 +1529,8 @@ def end_run(
         """,
         (status or "completed", now, now, run_id),
     )
+    if str(status or "completed").lower() == "completed":
+        _sync_blocked_runs(conn)
     updated = get_run(conn, run_id)
     assert updated is not None
     return updated
@@ -1117,4 +1685,5 @@ def activity_snapshot(
             conn, limit=file_limit, event_limit=max(event_limit, file_limit * 8)
         ),
         "active_claims": active_file_claims(conn, limit=100),
+        "kanban": kanban_board(conn, limit=10),
     }

@@ -382,7 +382,7 @@ function bindEventStream() {
   if (!canPostToGraphServer() || !window.EventSource) return;
   try {
     closeEventStream();
-    eventSource = new EventSource(graphTokenUrl((data.live && data.live.events_path) || "/events"));
+    eventSource = new EventSource((data.live && data.live.events_path) || "/events");
     eventSource.onopen = () => {
       liveConnected = true;
       updateAgentHeader();
@@ -400,6 +400,13 @@ function bindEventStream() {
     });
     eventSource.addEventListener("graph", () => {
       if (document.visibilityState === "visible") refreshGraphData({ silent: true });
+    });
+    eventSource.addEventListener("perf:tick", event => {
+      try {
+        handlePerfTick(JSON.parse(event.data || "{}"));
+      } catch (_err) {
+        // Perf ticks are advisory; debug polling remains the fallback.
+      }
     });
   } catch (_err) {
     closeEventStream();

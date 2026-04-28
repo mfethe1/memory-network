@@ -136,6 +136,54 @@ def run(args: argparse.Namespace) -> int:
                 db_mod.close(conn)
             return 0
 
+        if action == "verify-claim":
+            if not args.run_id:
+                print(
+                    "error: --run-id is required for `code_index agent verify-claim`",
+                    file=sys.stderr,
+                )
+                return 2
+            path = _first_file_path(args.file_path)
+            if not path:
+                print(
+                    "error: --file is required for `code_index agent verify-claim`",
+                    file=sys.stderr,
+                )
+                return 2
+            if args.fence is None:
+                print(
+                    "error: --fence is required for `code_index agent verify-claim`",
+                    file=sys.stderr,
+                )
+                return 2
+            conn = db_mod.connect(config.db_path)
+            try:
+                db_mod.ensure_schema(conn, config)
+                result = agent_activity.verify_write_claim(
+                    conn,
+                    run_id=args.run_id,
+                    file_path=path,
+                    fence_token=args.fence,
+                )
+            finally:
+                db_mod.close(conn)
+            if args.json:
+                _print_json({"action": "verify-claim", **result})
+            elif result["ok"]:
+                print(result["message"])
+            else:
+                print(f"error: {result['message']}", file=sys.stderr)
+            return 0 if result["ok"] else 1
+
+        if action == "board":
+            conn = db_mod.connect(config.db_path)
+            try:
+                db_mod.ensure_schema(conn, config)
+                _print_json(agent_activity.kanban_board(conn, limit=max(0, int(args.limit))))
+            finally:
+                db_mod.close(conn)
+            return 0
+
         if action == "transcript":
             if not args.run_id:
                 print(
@@ -174,9 +222,60 @@ def run(args: argparse.Namespace) -> int:
                         prompt=args.prompt or "",
                         selected_nodes=args.selected_node or [],
                         metadata=_parse_json_object(args.metadata, label="--metadata"),
-                        status=args.status or "working",
+                        status=(
+                            "blocked"
+                            if args.blocked_by_run_id
+                            else (args.status or "working")
+                        ),
                     )
-                    _print_json({"action": "start", "run": run_payload})
+                    blockers = []
+                    if args.blocked_by_run_id:
+                        blockers = agent_activity.add_run_blockers(
+                            conn,
+                            run_id=run_payload["run_id"],
+                            blocked_by_run_ids=args.blocked_by_run_id,
+                            reason=args.message,
+                            metadata={"source": "agent-cli"},
+                        )
+                        run_payload = agent_activity.get_run(
+                            conn, run_payload["run_id"]
+                        )
+                    _print_json(
+                        {
+                            "action": "start",
+                            "run": run_payload,
+                            "blockers": blockers,
+                        }
+                    )
+                    return 0
+
+                if action == "block":
+                    if not args.run_id:
+                        print(
+                            "error: --run-id is required for `code_index agent block`",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    if not args.blocked_by_run_id:
+                        print(
+                            "error: --blocked-by is required for `code_index agent block`",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    blockers = agent_activity.add_run_blockers(
+                        conn,
+                        run_id=args.run_id,
+                        blocked_by_run_ids=args.blocked_by_run_id,
+                        reason=args.message,
+                        metadata=_parse_json_object(args.payload, label="--payload"),
+                    )
+                    _print_json(
+                        {
+                            "action": "block",
+                            "run": agent_activity.get_run(conn, args.run_id),
+                            "blockers": blockers,
+                        }
+                    )
                     return 0
 
                 if action == "event":

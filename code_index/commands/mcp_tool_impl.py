@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
+import inspect
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +12,7 @@ from code_index import agent_activity
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
 from code_index.commands.graph_cmd import build_graph
+from code_index.commands.graph_server_dispatch import _build_task_graph_context
 from code_index.commands.impact_cmd import _resolve_target, compute_impact
 from code_index.locking import LockTimeoutError, writer_lock
 from code_index.pipeline import reindex
@@ -52,6 +56,122 @@ def _tool_search_query(
     finally:
         db_mod.close(conn)
     return {"engine": "fts5", "query": query, "results": results}
+
+
+def _load_retrieval_module() -> Any | None:
+    try:
+        return importlib.import_module("code_index.retrieval")
+    except ModuleNotFoundError as exc:
+        if exc.name == "code_index.retrieval":
+            return None
+        raise
+
+
+def _retrieval_request_kwargs(request: dict[str, Any], request_cls: Any) -> dict[str, Any]:
+    try:
+        params = inspect.signature(request_cls).parameters
+    except (TypeError, ValueError):
+        return dict(request)
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        return dict(request)
+    kwargs = {key: value for key, value in request.items() if key in params}
+    aliases = {
+        "budget_bytes": "byte_budget",
+        "sources": "include_kinds",
+    }
+    for target, source in aliases.items():
+        if target in params and target not in kwargs and source in request:
+            kwargs[target] = request[source]
+    return kwargs
+
+
+def _build_retrieval_request(module: Any, request: dict[str, Any]) -> Any:
+    for request_cls_name in (
+        "RetrievalRequest",
+        "RetrievalBrokerRequest",
+        "RetrieveRequest",
+    ):
+        request_cls = getattr(module, request_cls_name, None)
+        if not callable(request_cls):
+            continue
+        try:
+            return request_cls(**request)
+        except TypeError:
+            return request_cls(**_retrieval_request_kwargs(request, request_cls))
+    return dict(request)
+
+
+def _jsonable_retrieval_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        return payload
+    if hasattr(payload, "model_dump") and callable(payload.model_dump):
+        return payload.model_dump()
+    if hasattr(payload, "to_dict") and callable(payload.to_dict):
+        return payload.to_dict()
+    if is_dataclass(payload) and not isinstance(payload, type):
+        return asdict(payload)
+    return payload
+
+
+def _tool_retrieval_broker(
+    config: cfg_mod.Config,
+    query: str,
+    scope: str | None = None,
+    include_kinds: list[str] | None = None,
+    limit: int = 10,
+    byte_budget: int = 20_000,
+    selected_paths: list[str] | None = None,
+    selected_nodes: list[Any] | None = None,
+) -> Any:
+    module = _load_retrieval_module()
+    if module is None:
+        return {
+            "error": "retrieval broker unavailable",
+            "detail": "code_index.retrieval is not available yet",
+        }
+    retrieve = getattr(module, "retrieve", None)
+    if not callable(retrieve):
+        return {
+            "error": "retrieval broker unavailable",
+            "detail": "code_index.retrieval.retrieve is not callable",
+        }
+    request = {
+        "query": query,
+        "scope": scope,
+        "include_kinds": include_kinds or [],
+        "limit": limit,
+        "byte_budget": byte_budget,
+        "selected_paths": selected_paths or [],
+        "selected_nodes": selected_nodes or [],
+    }
+    return _jsonable_retrieval_payload(
+        _invoke_retrieval_broker(
+            retrieve,
+            config,
+            _build_retrieval_request(module, request),
+        )
+    )
+
+
+def _invoke_retrieval_broker(
+    retrieve: Any,
+    config: cfg_mod.Config,
+    request: Any,
+) -> Any:
+    first_param = ""
+    try:
+        params = list(inspect.signature(retrieve).parameters)
+        first_param = params[0].lower() if params else ""
+    except (TypeError, ValueError):
+        first_param = ""
+    if first_param in {"conn", "connection", "db", "sqlite_conn"}:
+        conn = db_mod.connect(config.db_path)
+        try:
+            db_mod.ensure_schema(conn, config)
+            return retrieve(conn, request)
+        finally:
+            db_mod.close(conn)
+    return retrieve(config, request)
 
 
 def _tool_search_ast(config: cfg_mod.Config, pattern: str, limit: int = 100) -> dict:
@@ -215,6 +335,26 @@ def _tool_code_graph(
         )
     finally:
         db_mod.close(conn)
+
+
+def _tool_graph_context(
+    config: cfg_mod.Config,
+    selected_nodes: list[str] | None = None,
+    selected_paths: list[str] | None = None,
+    node: dict[str, Any] | None = None,
+    agent_name: str = "Agent",
+    max_nodes: int = 24,
+    max_bytes: int = 24_000,
+) -> dict:
+    return _build_task_graph_context(
+        config,
+        agent_name=agent_name,
+        selected_nodes=selected_nodes or [],
+        selected_paths=selected_paths or [],
+        node=node,
+        max_nodes=max_nodes,
+        max_bytes=max_bytes,
+    )
 
 
 def _tool_agent_activity(config: cfg_mod.Config, limit: int = 100) -> dict:

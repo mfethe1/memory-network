@@ -84,6 +84,10 @@ HTML_BETWEEN_CSS_AND_SCRIPT = r"""  </style>
           <div class="nav-list" id="agent-runs"></div>
         </section>
         <section class="nav-section">
+          <h3>Task Board</h3>
+          <div class="task-board" id="task-board"></div>
+        </section>
+        <section class="nav-section">
           <h3>Search Results</h3>
           <div class="nav-list" id="search-results"></div>
         </section>
