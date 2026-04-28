@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.parsers import ctags as ctags_mod
 from code_index.parsers import tree_sitter as ts_mod
 from code_index.search import lexical

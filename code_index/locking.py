@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Iterator
@@ -82,6 +83,17 @@ def _unlock_win(fd: int) -> None:
 
 
 _HELD_COUNT: dict[str, int] = {}
+_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock(lock_key: str) -> threading.RLock:
+    with _THREAD_LOCKS_GUARD:
+        lock = _THREAD_LOCKS.get(lock_key)
+        if lock is None:
+            lock = threading.RLock()
+            _THREAD_LOCKS[lock_key] = lock
+        return lock
 
 
 @contextlib.contextmanager
@@ -104,49 +116,53 @@ def writer_lock(
     """
     lock_path = config.lock_path
     lock_key = str(lock_path)
-
-    # Nested: already held by this process.
-    if _HELD_COUNT.get(lock_key, 0) > 0:
-        _HELD_COUNT[lock_key] += 1
-        try:
-            yield
-        finally:
-            _HELD_COUNT[lock_key] -= 1
-        return
-
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    local_lock = _thread_lock(lock_key)
+    local_lock.acquire()
     try:
-        if os.fstat(fd).st_size == 0:
-            os.write(fd, b"\x00")
-    except OSError:
-        pass
+        # Nested: already held by this thread in this process.
+        if _HELD_COUNT.get(lock_key, 0) > 0:
+            _HELD_COUNT[lock_key] += 1
+            try:
+                yield
+            finally:
+                _HELD_COUNT[lock_key] -= 1
+            return
 
-    is_win = os.name == "nt"
-    deadline = time.monotonic() + timeout_s
-    backoff = poll_ms / 1000.0
-    acquired = False
-    try:
-        while True:
-            ok = _try_lock_win(fd) if is_win else _try_lock_posix(fd)
-            if ok:
-                acquired = True
-                _HELD_COUNT[lock_key] = 1
-                break
-            if time.monotonic() >= deadline:
-                raise LockTimeoutError(lock_path, timeout_s)
-            time.sleep(backoff)
-            backoff = min(backoff * 1.5, 0.5)
-
-        yield
-    finally:
-        if acquired:
-            _HELD_COUNT.pop(lock_key, None)
-            if is_win:
-                _unlock_win(fd)
-            else:
-                _unlock_posix(fd)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            os.close(fd)
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\x00")
         except OSError:
             pass
+
+        is_win = os.name == "nt"
+        deadline = time.monotonic() + timeout_s
+        backoff = poll_ms / 1000.0
+        acquired = False
+        try:
+            while True:
+                ok = _try_lock_win(fd) if is_win else _try_lock_posix(fd)
+                if ok:
+                    acquired = True
+                    _HELD_COUNT[lock_key] = 1
+                    break
+                if time.monotonic() >= deadline:
+                    raise LockTimeoutError(lock_path, timeout_s)
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, 0.5)
+
+            yield
+        finally:
+            if acquired:
+                _HELD_COUNT.pop(lock_key, None)
+                if is_win:
+                    _unlock_win(fd)
+                else:
+                    _unlock_posix(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    finally:
+        local_lock.release()

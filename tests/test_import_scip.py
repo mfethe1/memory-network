@@ -6,7 +6,7 @@ import stat
 import textwrap
 from pathlib import Path
 
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.cli import main
 from code_index.config import load as load_config
 from code_index.scip_import import canonical_from_scip_symbol

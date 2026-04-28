@@ -1,0 +1,215 @@
+"""Browser coverage for graph UI agent submission and stream updates."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import threading
+import textwrap
+import time
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+from code_index import agent_activity
+from code_index import config as cfg_mod
+from code_index import db_router as db_mod
+from code_index.cli import main
+from code_index.commands import agent_adapter_cmd
+from code_index.commands.graph_server_cmd import _make_handler
+
+playwright_sync_api = pytest.importorskip("playwright.sync_api")
+sync_playwright = playwright_sync_api.sync_playwright
+
+
+def _wait_for_run_status(
+    config: cfg_mod.Config,
+    run_id: str,
+    expected: str,
+    *,
+    timeout: float = 8.0,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    last_run: dict | None = None
+    while time.monotonic() < deadline:
+        conn = db_mod.connect(config.db_path)
+        try:
+            last_run = agent_activity.get_run(conn, run_id)
+        finally:
+            db_mod.close(conn)
+        if last_run and last_run["status"] == expected:
+            return last_run
+        time.sleep(0.05)
+    raise AssertionError(f"run {run_id} did not reach {expected}: {last_run}")
+
+
+def test_graph_ui_submits_agent_task_and_streams_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text(
+        "from .b import helper\n\n"
+        "def value() -> int:\n"
+        "    return helper()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pkg" / "b.py").write_text(
+        "def helper() -> int:\n"
+        "    return 42\n",
+        encoding="utf-8",
+    )
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    seen_task_path = tmp_path / "seen-task.json"
+    adapter_path = tmp_path / "fake_agent_adapter.py"
+    adapter_path.write_text(
+        textwrap.dedent(
+            """
+            import json
+            import sys
+            import time
+            from pathlib import Path
+
+            with open(sys.argv[1], encoding="utf-8") as handle:
+                task = json.load(handle)
+            Path(sys.argv[2]).write_text(json.dumps(task), encoding="utf-8")
+
+            graph_context = task.get("graph_context") or {}
+            selected_paths = {
+                node.get("path")
+                for node in graph_context.get("selected_nodes", [])
+                if isinstance(node, dict)
+            }
+            if graph_context.get("kind") != "code_index_graph_context":
+                print("STATUS failed missing graph context", flush=True)
+                sys.exit(3)
+            if "pkg/a.py" not in selected_paths:
+                print("STATUS failed missing selected graph node", flush=True)
+                sys.exit(4)
+
+            print("READ pkg/a.py - reading selected graph node", flush=True)
+            print("GRAPH_CONTEXT_OK pkg/a.py", flush=True)
+            for idx in range(40):
+                print(f"terminal output line {idx}", flush=True)
+            print("AuthRequired no access token", file=sys.stderr, flush=True)
+            print(
+                "CODE_INDEX_EVENT "
+                + json.dumps(
+                    {
+                        "event_type": "status",
+                        "message": "fake adapter completed",
+                        "status": "completed",
+                    }
+                ),
+                flush=True,
+            )
+            time.sleep(0.1)
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    adapter_command = f'"{sys.executable}" "{adapter_path}" {{task_json}} "{seen_task_path}"'
+    monkeypatch.setitem(agent_adapter_cmd.PROVIDER_COMMANDS, "codex", adapter_command)
+    monkeypatch.setenv("CODE_INDEX_AGENT_COMMAND", adapter_command)
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=["pkg/a.py"],
+        agent_name="Codex",
+        event_interval=0.1,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(headless=True)
+        except Exception as exc:  # pragma: no cover - local browser install guard.
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            pytest.skip(f"Playwright Chromium is not installed or not launchable: {exc}")
+        try:
+            page = browser.new_page(viewport={"width": 1440, "height": 900})
+            page.goto(f"{base_url}/repo-graph.html", wait_until="domcontentloaded")
+            nav_box = page.locator(".navigator").bounding_box()
+            nav_resizer_box = page.locator("#nav-resizer").bounding_box()
+            assert nav_box is not None
+            assert nav_resizer_box is not None
+            page.mouse.move(
+                nav_resizer_box["x"] + nav_resizer_box["width"] / 2,
+                nav_resizer_box["y"] + 80,
+            )
+            page.mouse.down()
+            page.mouse.move(nav_resizer_box["x"] + 92, nav_resizer_box["y"] + 80)
+            page.mouse.up()
+            resized_nav_box = page.locator(".navigator").bounding_box()
+            assert resized_nav_box is not None
+            assert resized_nav_box["width"] > nav_box["width"] + 45
+            assert page.evaluate(
+                "() => { const root = JSON.parse(document.getElementById('graph-data').textContent).root; return localStorage.getItem(`code_index_graph_nav_width:${root}`); }"
+            )
+            page.locator("#layer-mode").select_option("communities")
+            page.locator(".community-label").first.wait_for(timeout=10000)
+            page.locator('[data-nav-node="file:pkg/a.py"]').first.click()
+            page.get_by_role("button", name="Chat").click()
+            assert page.locator("#agent-provider").input_value() == "codex"
+            page.locator("#agent-chat-message").fill("browser stream check")
+            page.locator("#agent-chat-message").press("Enter")
+
+            page.locator("#terminal-stream-body").wait_for(timeout=10000)
+            assert page.locator("#panel-body").evaluate(
+                "(el) => el.classList.contains('terminal-view')"
+            )
+            page.locator("pre", has_text="GRAPH_CONTEXT_OK pkg/a.py").first.wait_for(
+                timeout=10000
+            )
+            page.locator("#terminal-stream-body", has_text="terminal output line 39").wait_for(
+                timeout=10000
+            )
+            page.locator(".terminal-body .stream-stderr", has_text="AuthRequired").wait_for(
+                timeout=10000
+            )
+            assert page.locator("#terminal-stream-body").evaluate(
+                "(el) => el.scrollTop + el.clientHeight >= el.scrollHeight - 4"
+            )
+            body_box = page.locator("#terminal-stream-body").bounding_box()
+            composer_box = page.locator(".terminal-composer").bounding_box()
+            assert body_box is not None
+            assert composer_box is not None
+            assert composer_box["y"] > body_box["y"]
+            assert page.locator("#run-followup-message").is_visible()
+            page.locator("#agent-runs").get_by_role("button", name="Stream").first.wait_for(
+                timeout=10000
+            )
+            page.locator('[data-nav-node="file:pkg/b.py"]').first.click()
+            page.locator("#agent-runs .run-select").first.click()
+            page.locator("#terminal-stream-body").wait_for(timeout=10000)
+
+            task = json.loads(seen_task_path.read_text(encoding="utf-8"))
+            assert task["graph_context"]["kind"] == "code_index_graph_context"
+            assert task["context_packet"]["graph_context"] == task["graph_context"]
+            assert task["collaboration"]["kind"] == "code_index_agent_collaboration"
+            assert task["graph_context"]["selected_nodes"][0]["path"] == "pkg/a.py"
+            run = _wait_for_run_status(config, task["run_id"], "completed")
+            assert run["status"] == "completed"
+            page.locator("#agent-runs").get_by_role("button", name="Archive").first.click()
+            page.locator("#agent-runs", has_text="No queued or active runs.").wait_for(
+                timeout=10000
+            )
+        finally:
+            browser.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)

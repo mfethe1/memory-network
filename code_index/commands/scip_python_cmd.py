@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.commands.import_scip_cmd import _load_from_scip_binary
 from code_index.locking import LockTimeoutError, writer_lock
 from code_index.scip_import import import_scip_json

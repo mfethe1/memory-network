@@ -7,7 +7,7 @@ from typing import Any
 
 from code_index import agent_activity
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.commands.graph_cmd import build_graph
 from code_index.commands.impact_cmd import _resolve_target, compute_impact
 from code_index.locking import LockTimeoutError, writer_lock

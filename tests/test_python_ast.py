@@ -64,3 +64,25 @@ def test_syntax_error_recorded_as_diagnostic():
     assert result.parse_status == "failed"
     assert result.diagnostics
     assert result.diagnostics[0].severity == "error"
+
+
+def test_repeated_local_definitions_get_distinct_chunk_uids():
+    src = textwrap.dedent(
+        """
+        def builds_classes():
+            class Inner:
+                value = 1
+
+            class Inner:
+                value = 2
+        """
+    ).lstrip()
+    parser = PythonAstParser()
+    result = parser.parse(rel_path="pkg/repeated.py", source=src)
+    inner_chunks = [
+        chunk
+        for chunk in result.chunks
+        if chunk.symbol_path == "pkg.repeated.builds_classes.Inner"
+    ]
+    assert len(inner_chunks) == 2
+    assert len({chunk.chunk_uid for chunk in inner_chunks}) == 2

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.nl import answer
 from code_index.nl.classify import Intent, IntentKind, classify
 from code_index.pipeline import reindex

@@ -661,6 +661,7 @@ def build_graph(
         conn, event_limit=120, file_limit=8
     )
     agent_recent_events = activity_snapshot["recent_events"]
+    active_claims = activity_snapshot.get("active_claims", [])
     agent_recent_edits = _agent_events_as_edits(agent_recent_events)
     recent_edits = _sort_recent_edits(index_recent_edits + agent_recent_edits)
     recent_edits_by_file = _group_edits_by_file(recent_edits)
@@ -672,7 +673,12 @@ def build_graph(
         for path in run.get("active_files", []):
             if path and path not in active_files_from_runs:
                 active_files_from_runs.append(path)
-    active_paths = set(focus) | set(active_files_from_runs)
+    active_files_from_claims: list[str] = []
+    for claim in active_claims:
+        path = claim.get("file_path")
+        if path and path not in active_files_from_claims:
+            active_files_from_claims.append(path)
+    active_paths = set(focus) | set(active_files_from_runs) | set(active_files_from_claims)
 
     incoming_by_file: dict[str, int] = defaultdict(int)
     outgoing_by_file: dict[str, int] = defaultdict(int)
@@ -947,6 +953,9 @@ def build_graph(
     for path in active_files_from_runs:
         if path not in active_file_list:
             active_file_list.append(path)
+    for path in active_files_from_claims:
+        if path not in active_file_list:
+            active_file_list.append(path)
     active_agent_names = sorted(
         {
             run.get("agent_name") or "Agent"
@@ -969,6 +978,9 @@ def build_graph(
             "server": False,
             "events_path": None,
             "notes_path": None,
+            "search_path": None,
+            "agent_preflight_path": None,
+            "agent_runs_path": None,
             "agent_events_path": None,
         },
         "agent": {
@@ -976,6 +988,8 @@ def build_graph(
             "active_agents": active_agent_names,
             "active_files": active_file_list,
             "active_runs": activity_snapshot["active_runs"],
+            "recent_runs": activity_snapshot.get("recent_runs", []),
+            "active_claims": active_claims,
             "status": agent_status,
         },
         "summary": {
@@ -1004,6 +1018,7 @@ def build_graph(
             "recent_files": recent_files,
             "agent_recent_files": activity_snapshot["recent_files"],
             "agent_events": agent_recent_events[:80],
+            "active_claims": active_claims,
             "trail": [
                 {"from": recent_files[idx]["file_path"], "to": recent_files[idx + 1]["file_path"]}
                 for idx in range(max(0, len(recent_files) - 1))

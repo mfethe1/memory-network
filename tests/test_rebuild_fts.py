@@ -7,7 +7,7 @@ import textwrap
 from pathlib import Path
 
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.commands.doctor_cmd import _fts_consistency
 from code_index.commands.rebuild_fts_cmd import _rebuild
 from code_index.pipeline import reindex

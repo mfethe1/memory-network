@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.ignore import build as build_matcher
 from code_index.scanner import iter_files
 from code_index.search import fts

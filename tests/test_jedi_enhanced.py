@@ -15,7 +15,7 @@ import pytest
 pytest.importorskip("jedi")
 
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.parsers.jedi_enhanced import (
     is_available,
     resolve_pending_via_jedi,

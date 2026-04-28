@@ -1,0 +1,20 @@
+{
+  "name": "code-index-local",
+  "interface": {
+    "displayName": "Code Index Local Plugins"
+  },
+  "plugins": [
+    {
+      "name": "code-index-agent",
+      "source": {
+        "source": "local",
+        "path": "./plugins/code-index-agent"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.commands import mcp_tool_impl as _mcp_tool_impl
 from code_index.locking import LockTimeoutError, writer_lock
 from code_index.commands.mcp_auth import (

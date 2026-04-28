@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import argparse
 from code_index import __version__
+from code_index import agent_activity
 from code_index.commands import (
+    agent_adapter_cmd,
     agent_cmd,
     ask_cmd,
+    context_cmd,
     doctor_cmd,
     embed_cmd,
     grep_cmd,
@@ -252,6 +255,44 @@ def build_parser() -> argparse.ArgumentParser:
     p_ask.add_argument("question", nargs="?", help="question in quotes")
     p_ask.set_defaults(func=ask_cmd.run)
 
+    p_context = subparsers.add_parser(
+        "context",
+        help="build a task-aware context and handoff packet for coding agents",
+    )
+    _add_common(p_context)
+    p_context.add_argument("task", nargs="?", help="task or question to package")
+    p_context.add_argument(
+        "--budget-tokens",
+        type=int,
+        default=1200,
+        help="approximate token budget for the packet (default 1200)",
+    )
+    p_context.add_argument(
+        "--selected-node",
+        action="append",
+        default=[],
+        help="graph node id to include; repeatable",
+    )
+    p_context.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        help="repo-relative file path to include; repeatable",
+    )
+    p_context.add_argument(
+        "--format",
+        choices=["json", "markdown"],
+        default="json",
+        help="output format (default: json)",
+    )
+    p_context.add_argument(
+        "--limit",
+        type=int,
+        default=8,
+        help="max items per section before budget trimming (default 8)",
+    )
+    p_context.set_defaults(func=context_cmd.run)
+
     p_repo_map = subparsers.add_parser(
         "repo-map",
         help="Aider-style compact symbol overview ranked by centrality",
@@ -384,7 +425,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_agent)
     p_agent.add_argument(
         "agent_action",
-        choices=["start", "event", "end", "recent"],
+        choices=[
+            "start",
+            "event",
+            "end",
+            "recent",
+            "transcript",
+            "decision",
+            "claims",
+            "claim",
+            "release",
+        ],
         help="activity action to record or inspect",
     )
     p_agent.add_argument(
@@ -414,12 +465,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_agent.add_argument(
         "--type",
         dest="event_type",
-        help="event type for `event` (read, edit, test, note, tool, navigate, status)",
+        help=(
+            "event type for `event` "
+            "(read, edit, test, note, tool, navigate, status, decision)"
+        ),
     )
     p_agent.add_argument(
         "--file",
         dest="file_path",
-        help="repo-relative file path touched by the event",
+        action="append",
+        help="repo-relative file path touched by the event or claim; repeatable",
     )
     p_agent.add_argument(
         "--symbol",
@@ -436,13 +491,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_agent.add_argument(
         "--status",
-        help="run status for start/end or status events",
+        help="run status for start/end/status events or decision ledger status",
     )
     p_agent.add_argument(
         "--limit",
         type=int,
         default=100,
-        help="recent event limit for `recent` (default 100)",
+        help="event limit for `recent` or `transcript` (default 100)",
     )
     p_agent.add_argument(
         "--file-limit",
@@ -450,7 +505,86 @@ def build_parser() -> argparse.ArgumentParser:
         default=8,
         help="recent file activity limit for `recent` (default 8)",
     )
+    p_agent.add_argument(
+        "--mode",
+        default="edit",
+        help="claim mode for `claim` or `release` (read, edit, review, test)",
+    )
+    p_agent.add_argument(
+        "--ttl-seconds",
+        type=float,
+        default=agent_activity.DEFAULT_CLAIM_TTL_SECONDS,
+        help="claim lease duration for `claim` (default 1800)",
+    )
     p_agent.set_defaults(func=agent_cmd.run)
+
+    p_agent_adapter = subparsers.add_parser(
+        "agent-adapter",
+        help="adapter for graph-submitted agent tasks",
+    )
+    _add_common(p_agent_adapter)
+    p_agent_adapter.add_argument(
+        "--mode",
+        choices=["auto", "dry-run", "command"],
+        default="auto",
+        help=(
+            "adapter mode; auto uses command when --command, --provider, "
+            "CODE_INDEX_AGENT_COMMAND, or CODE_INDEX_AGENT_PROVIDER is set, otherwise dry-run"
+        ),
+    )
+    p_agent_adapter.add_argument(
+        "--task-json",
+        help="task JSON file path or @path; reads stdin when omitted",
+    )
+    p_agent_adapter.add_argument(
+        "--callback-url",
+        help="override task.callback.agent_events_url",
+    )
+    p_agent_adapter.add_argument(
+        "--event-delay",
+        type=float,
+        default=0.0,
+        help="seconds to wait between posted dry-run events",
+    )
+    p_agent_adapter.add_argument(
+        "--command",
+        help=(
+            "command template for command mode; placeholders include "
+            "{message}, {provider_prompt}, {run_id}, {root}, {task_json}, "
+            "{last_message}, and {selected_paths}"
+        ),
+    )
+    p_agent_adapter.add_argument(
+        "--provider",
+        choices=["custom", "claude", "codex"],
+        default="custom",
+        help=(
+            "provider preset used when --command is omitted; also accepts "
+            "CODE_INDEX_AGENT_PROVIDER"
+        ),
+    )
+    p_agent_adapter.add_argument(
+        "--cwd",
+        help="working directory for command mode (default: task.root)",
+    )
+    p_agent_adapter.add_argument(
+        "--command-timeout",
+        type=float,
+        default=None,
+        help="seconds before command mode marks the run failed",
+    )
+    p_agent_adapter.add_argument(
+        "--max-output-events",
+        type=int,
+        default=400,
+        help="max stdout/stderr lines to post as tool events in command mode",
+    )
+    p_agent_adapter.add_argument(
+        "--fail",
+        action="store_true",
+        help="finish dry-run mode with failed status",
+    )
+    p_agent_adapter.set_defaults(func=agent_adapter_cmd.run)
 
     p_import_scip = subparsers.add_parser(
         "import-scip",

@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from code_index.config import Config
-from code_index.db import transaction
+from code_index.db_router import transaction
 from code_index.hashing import worktree_hash
 from code_index.ignore import IgnoreMatcher, build as build_matcher
 from code_index.parsers import ParseResult, Registry, default_registry
@@ -286,6 +286,34 @@ def _upsert_symbol(
         ),
     )
     return int(row["symbol_pk"]), reactivated
+
+
+def _insert_diagnostics(
+    conn: sqlite3.Connection,
+    *,
+    file_pk: int,
+    diagnostics: list,
+    now: str,
+) -> None:
+    for diag in diagnostics:
+        conn.execute(
+            """
+            INSERT INTO diagnostics(
+                file_pk, tool, code, severity, start_line, end_line,
+                message, observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                file_pk,
+                diag.tool,
+                diag.code,
+                diag.severity,
+                diag.start_line,
+                diag.end_line,
+                diag.message,
+                now,
+            ),
+        )
 
 
 def _apply_parsed_file(
@@ -616,26 +644,12 @@ def _apply_parsed_file(
         )
         stats.symbols_tombstoned += 1
 
-    # Insert diagnostics.
-    for diag in parsed.diagnostics:
-        conn.execute(
-            """
-            INSERT INTO diagnostics(
-                file_pk, tool, code, severity, start_line, end_line,
-                message, observed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                file_pk,
-                diag.tool,
-                diag.code,
-                diag.severity,
-                diag.start_line,
-                diag.end_line,
-                diag.message,
-                now,
-            ),
-        )
+    _insert_diagnostics(
+        conn,
+        file_pk=file_pk,
+        diagnostics=parsed.diagnostics,
+        now=now,
+    )
 
 
 def _tombstone_file(
@@ -754,25 +768,12 @@ def _record_diagnostics_only(
     """Insert diagnostics from a parse that otherwise produced no symbols/chunks."""
     now = _now_iso()
     conn.execute("DELETE FROM diagnostics WHERE file_pk = ?", (file_pk,))
-    for diag in parsed.diagnostics:
-        conn.execute(
-            """
-            INSERT INTO diagnostics(
-                file_pk, tool, code, severity, start_line, end_line,
-                message, observed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                file_pk,
-                diag.tool,
-                diag.code,
-                diag.severity,
-                diag.start_line,
-                diag.end_line,
-                diag.message,
-                now,
-            ),
-        )
+    _insert_diagnostics(
+        conn,
+        file_pk=file_pk,
+        diagnostics=parsed.diagnostics,
+        now=now,
+    )
 
 
 def _build_reexport_map(conn: sqlite3.Connection) -> dict[str, str]:
@@ -800,14 +801,12 @@ def _build_reexport_map(conn: sqlite3.Connection) -> dict[str, str]:
            AND c.language = 'python'
         """
     ).fetchall()
-    import json as _json
-
     for row in rows:
         pkg = row["symbol_path"] or ""
         if not pkg:
             continue
         try:
-            ctx = _json.loads(row["context_json"] or "{}")
+            ctx = json.loads(row["context_json"] or "{}")
         except Exception:
             continue
         imports = ctx.get("imports") or []
@@ -1075,8 +1074,6 @@ def _resolve_pending(
     Unresolved candidates are persisted into `unresolved_calls` so later
     reindex runs can backfill them once the missing symbol is indexed.
     """
-    import json as _json
-
     jedi_map = _maybe_jedi_resolve(
         config,
         conn,
@@ -1121,7 +1118,7 @@ def _resolve_pending(
                     file_pk,
                     rel.src_symbol_uid,
                     rel.relation_kind,
-                    _json.dumps(list(rel.dst_candidates)),
+                    json.dumps(list(rel.dst_candidates)),
                     rel.site_line,
                     rel.provenance,
                     now,
@@ -1172,8 +1169,6 @@ def _backfill_unresolved(
     `resolved_at = now` when an edge actually lands; otherwise they stay
     open so a later reindex can retry when the missing symbol appears.
     """
-    import json as _json
-
     sql = """
         SELECT unresolved_pk, file_pk, src_symbol_uid, relation_kind,
                dst_candidates_json, site_line, provenance
@@ -1213,7 +1208,7 @@ def _backfill_unresolved(
 
     for row in rows:
         try:
-            candidates = _json.loads(row["dst_candidates_json"] or "[]")
+            candidates = json.loads(row["dst_candidates_json"] or "[]")
         except Exception:
             candidates = []
         src_row = conn.execute(
@@ -1301,8 +1296,6 @@ def _repair_dead_edges(
     infer arbitrary renames — if `helper` is renamed to `run`, no candidate
     matches and the row stays open until some file reintroduces `helper`.
     """
-    import json as _json
-
     rows = conn.execute(
         """
         SELECT r.relation_pk, r.src_symbol_pk, r.relation_kind, r.provenance,
@@ -1348,7 +1341,7 @@ def _repair_dead_edges(
                 row["src_symbol_pk"],
                 row["src_uid"],
                 row["relation_kind"],
-                _json.dumps(candidates),
+                json.dumps(candidates),
                 site_line,
                 (provenance + ";repair:dst-tombstoned").lstrip(";"),
                 now,
@@ -1360,9 +1353,6 @@ def _repair_dead_edges(
         )
         repaired_to_queue += 1
     stats.relations_queued_for_repair = repaired_to_queue
-
-
-_TEST_FILE_PATTERNS = ("tests/", "/tests/", "test_", "_test.py", "conftest")
 
 
 def _is_test_path(path: str) -> bool:
@@ -1459,8 +1449,6 @@ def _insert_test_edges_for(
     test_pk: int,
     best_targets: dict[int, tuple[int, list[str]]],
 ) -> int:
-    import json as _json
-
     inserted = 0
     for dst_pk, (depth, path_names) in best_targets.items():
         edge_type = "direct" if depth == 1 else "transitive"
@@ -1479,11 +1467,42 @@ def _insert_test_edges_for(
                 edge_type,
                 depth,
                 confidence,
-                _json.dumps(path_names),
+                json.dumps(path_names),
             ),
         )
         if cur.rowcount:
             inserted += 1
+    return inserted
+
+
+def _rebuild_edges_for_test_rows(
+    conn: sqlite3.Connection,
+    test_rows: list,
+    *,
+    max_depth: int,
+) -> int:
+    def_file_cache: dict[int, str | None] = {}
+    inserted = 0
+    for row in test_rows:
+        test_pk = int(row["symbol_pk"])
+        chunk_row = conn.execute(
+            "SELECT chunk_pk FROM chunks WHERE primary_symbol_pk = ? AND deleted_at IS NULL LIMIT 1",
+            (test_pk,),
+        ).fetchone()
+        if chunk_row is None:
+            continue
+        inserted += _insert_test_edges_for(
+            conn,
+            test_chunk_pk=int(chunk_row["chunk_pk"]),
+            test_pk=test_pk,
+            best_targets=_collect_test_targets_for(
+                conn,
+                test_pk,
+                row["canonical_name"],
+                max_depth=max_depth,
+                def_file_cache=def_file_cache,
+            ),
+        )
     return inserted
 
 
@@ -1585,32 +1604,11 @@ def _rebuild_test_edges_for_test_symbols(
         impacted_params,
     ).fetchall()
 
-    def_file_cache: dict[int, str | None] = {}
-    inserted = 0
-    for row in live_tests:
-        test_pk = int(row["symbol_pk"])
-        test_name = row["canonical_name"]
-        chunk_row = conn.execute(
-            "SELECT chunk_pk FROM chunks WHERE primary_symbol_pk = ? AND deleted_at IS NULL LIMIT 1",
-            (test_pk,),
-        ).fetchone()
-        if chunk_row is None:
-            continue
-        targets = _collect_test_targets_for(
-            conn,
-            test_pk,
-            test_name,
-            max_depth=max_depth,
-            def_file_cache=def_file_cache,
-        )
-        inserted += _insert_test_edges_for(
-            conn,
-            test_chunk_pk=int(chunk_row["chunk_pk"]),
-            test_pk=test_pk,
-            best_targets=targets,
-        )
-
-    stats.test_edges_inserted += inserted
+    stats.test_edges_inserted += _rebuild_edges_for_test_rows(
+        conn,
+        live_tests,
+        max_depth=max_depth,
+    )
     stats.test_edges_removed += before
 
 
@@ -1649,8 +1647,6 @@ def _rebuild_test_edges(
     module → test function, so module-level targets of test funcs still
     register against the module symbol in DB-level queries.
     """
-    import json as _json
-
     before = conn.execute("SELECT COUNT(*) FROM test_edges").fetchone()[0]
     conn.execute("DELETE FROM test_edges")
 
@@ -1671,119 +1667,11 @@ def _rebuild_test_edges(
     if not test_rows:
         return
 
-    # Cache: def file per symbol_pk (to skip test-only targets).
-    def_file_cache: dict[int, str | None] = {}
-
-    def _def_file(sym_pk: int) -> str | None:
-        if sym_pk in def_file_cache:
-            return def_file_cache[sym_pk]
-        row = conn.execute(
-            """
-            SELECT f.file_path FROM occurrences o
-              JOIN files f ON f.file_pk = o.file_pk
-             WHERE o.symbol_pk = ? AND o.role = 'definition'
-             ORDER BY o.start_line ASC LIMIT 1
-            """,
-            (sym_pk,),
-        ).fetchone()
-        val = row["file_path"] if row else None
-        def_file_cache[sym_pk] = val
-        return val
-
-    inserted = 0
-    for test_row in test_rows:
-        test_pk = int(test_row["symbol_pk"])
-        test_name = test_row["canonical_name"]
-        # We need a chunk for the FK; pick the test symbol's own chunk if any.
-        chunk_row = conn.execute(
-            "SELECT chunk_pk FROM chunks WHERE primary_symbol_pk = ? AND deleted_at IS NULL LIMIT 1",
-            (test_pk,),
-        ).fetchone()
-        if chunk_row is None:
-            continue
-        test_chunk_pk = int(chunk_row["chunk_pk"])
-
-        # BFS: (sym_pk, depth, path_uids_list, path_names_list)
-        # Start by emitting a depth-1 edge for every `contains` child of this
-        # test symbol (covers test modules that contain test functions).
-        # More importantly, BFS outward on `calls` up to max_depth.
-        frontier: list[tuple[int, int, list[str]]] = [(test_pk, 0, [test_name])]
-        seen: dict[int, int] = {test_pk: 0}  # sym_pk → best depth
-        best_targets: dict[int, tuple[int, list[str]]] = {}
-
-        while frontier:
-            sym_pk, depth, path_names = frontier.pop(0)
-            if depth >= max_depth:
-                continue
-            out = conn.execute(
-                """
-                SELECT r.dst_symbol_pk, s.canonical_name
-                  FROM relations r
-                  JOIN symbols s ON s.symbol_pk = r.dst_symbol_pk
-                 WHERE r.src_symbol_pk = ?
-                   AND r.relation_kind = 'calls'
-                   AND s.deleted_at IS NULL
-                """,
-                (sym_pk,),
-            ).fetchall()
-            # Also descend into contains at depth 0 (test module → test func).
-            if depth == 0:
-                contains = conn.execute(
-                    """
-                    SELECT r.dst_symbol_pk, s.canonical_name
-                      FROM relations r
-                      JOIN symbols s ON s.symbol_pk = r.dst_symbol_pk
-                     WHERE r.src_symbol_pk = ?
-                       AND r.relation_kind = 'contains'
-                       AND s.deleted_at IS NULL
-                    """,
-                    (sym_pk,),
-                ).fetchall()
-                out = list(out) + list(contains)
-            for row in out:
-                dst_pk = int(row["dst_symbol_pk"])
-                dst_name = row["canonical_name"]
-                new_depth = depth + 1
-                prior = seen.get(dst_pk)
-                if prior is not None and prior <= new_depth:
-                    continue
-                seen[dst_pk] = new_depth
-                new_path = path_names + [dst_name]
-                # Consider it a test target if its def lives outside tests.
-                df = _def_file(dst_pk)
-                if df is not None and not _is_test_path(df):
-                    # Keep the shallowest reach.
-                    prev = best_targets.get(dst_pk)
-                    if prev is None or new_depth < prev[0]:
-                        best_targets[dst_pk] = (new_depth, new_path)
-                # Always enqueue further traversal (tests may route through
-                # test helpers before reaching the subject under test).
-                frontier.append((dst_pk, new_depth, new_path))
-
-        for dst_pk, (depth, path_names) in best_targets.items():
-            edge_type = "direct" if depth == 1 else "transitive"
-            confidence = max(0.3, 1.0 - 0.15 * (depth - 1))
-            cur = conn.execute(
-                """
-                INSERT OR IGNORE INTO test_edges(
-                    test_chunk_pk, test_symbol_pk, target_symbol_pk,
-                    edge_type, depth, confidence, path_json, provenance
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pipeline:bfs')
-                """,
-                (
-                    test_chunk_pk,
-                    test_pk,
-                    dst_pk,
-                    edge_type,
-                    depth,
-                    confidence,
-                    _json.dumps(path_names),
-                ),
-            )
-            if cur.rowcount:
-                inserted += 1
-
-    stats.test_edges_inserted = inserted
+    stats.test_edges_inserted = _rebuild_edges_for_test_rows(
+        conn,
+        test_rows,
+        max_depth=max_depth,
+    )
     stats.test_edges_removed = before
 
 

@@ -7,7 +7,7 @@ import textwrap
 from pathlib import Path
 
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.parsers.python_ast import PythonAstParser, _extract_parametrize
 from code_index.pipeline import reindex
 import ast

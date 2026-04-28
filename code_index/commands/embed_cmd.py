@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.embeddings import (
     DEFAULT_MODEL,
     availability_report,

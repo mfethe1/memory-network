@@ -6,7 +6,7 @@ import textwrap
 from pathlib import Path
 
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.pipeline import reindex
 
 
@@ -55,6 +55,35 @@ def _write_repo(tmp_path: Path) -> None:
 
             def test_wrapper_reaches_deep_target():
                 assert wrapper(3) == 8
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+
+
+def _write_related_repo(tmp_path: Path) -> None:
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "service.py").write_text(
+        textwrap.dedent(
+            """
+            class Service:
+                def target(self):
+                    return 1
+
+                def alternate(self):
+                    return 2
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "tests" / "test_service.py").write_text(
+        textwrap.dedent(
+            """
+            def test_alternate_related():
+                assert True
             """
         ).lstrip(),
         encoding="utf-8",
@@ -195,3 +224,79 @@ def test_symbol_uid_input_resolves(tmp_path: Path):
     payload = _json.loads(proc.stdout)
     assert payload["target"]["symbol_uid"] == symbol_uid
     assert payload["summary"]["affected_test_count"] >= 2
+
+
+def test_tests_cmd_falls_back_to_related_method_coverage(tmp_path: Path):
+    _write_related_repo(tmp_path)
+    config, conn = _init(tmp_path)
+    try:
+        reindex(conn, config, paths=None, event_source="init")
+        rows = {
+            row["canonical_name"]: row
+            for row in conn.execute(
+                """
+                SELECT symbol_pk, canonical_name
+                  FROM symbols
+                 WHERE canonical_name IN (
+                    'pkg.service.Service.target',
+                    'pkg.service.Service.alternate',
+                    'tests.test_service.test_alternate_related'
+                 )
+                """
+            ).fetchall()
+        }
+        target_pk = int(rows["pkg.service.Service.target"]["symbol_pk"])
+        alternate_pk = int(rows["pkg.service.Service.alternate"]["symbol_pk"])
+        test_pk = int(rows["tests.test_service.test_alternate_related"]["symbol_pk"])
+        chunk = conn.execute(
+            "SELECT chunk_pk FROM chunks WHERE primary_symbol_pk = ?",
+            (test_pk,),
+        ).fetchone()
+        assert chunk is not None
+        conn.execute(
+            """
+            INSERT INTO test_edges(
+                test_chunk_pk, test_symbol_pk, target_symbol_pk,
+                edge_type, depth, confidence, path_json, provenance
+            ) VALUES (?, ?, ?, 'direct', 1, 1.0, ?, 'test:manual')
+            """,
+            (
+                int(chunk["chunk_pk"]),
+                test_pk,
+                alternate_pk,
+                '["tests.test_service.test_alternate_related","pkg.service.Service.alternate"]',
+            ),
+        )
+        assert not conn.execute(
+            "SELECT 1 FROM test_edges WHERE target_symbol_pk = ?",
+            (target_pk,),
+        ).fetchone()
+    finally:
+        db_mod.close(conn)
+
+    import json as _json
+    import subprocess, sys
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "code_index",
+            "tests",
+            "pkg.service.Service.target",
+            "--root",
+            str(tmp_path),
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    payload = _json.loads(proc.stdout)
+    assert payload["summary"]["match_scope"] == "related"
+    assert payload["summary"]["affected_test_count"] == 1
+    row = payload["affected_tests"][0]
+    assert row["canonical_name"] == "tests.test_service.test_alternate_related"
+    assert row["match_reason"] in {"sibling", "same_file"}
+    assert row["matched_target"]["canonical_name"] == "pkg.service.Service.alternate"

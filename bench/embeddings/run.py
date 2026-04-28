@@ -27,7 +27,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from code_index import config as cfg_mod  # noqa: E402
-from code_index import db as db_mod  # noqa: E402
+from code_index import db_router as db_mod  # noqa: E402
 from code_index import pipeline as pipeline_mod  # noqa: E402
 from bench.embeddings import corpus as corpus_mod  # noqa: E402
 from code_index.embeddings import (  # noqa: E402

@@ -234,6 +234,20 @@ class _Ctx:
     chunks: list[ChunkDraft]
     diagnostics: list[DiagnosticDraft]
     scope: dict[str, list[str]]  # name → ordered canonical-name candidates
+    chunk_occurrences: dict[tuple[str, str, str], int]
+
+
+def _next_chunk_occurrence(
+    ctx: _Ctx,
+    *,
+    chunk_type: str,
+    symbol_uid: str,
+    symbol_path: str,
+) -> int:
+    key = (chunk_type, symbol_uid, symbol_path)
+    occurrence = ctx.chunk_occurrences.get(key, 0)
+    ctx.chunk_occurrences[key] = occurrence + 1
+    return occurrence
 
 
 def _new_symbol(
@@ -528,6 +542,12 @@ def _walk(
                 chunk_type=kind,
                 symbol_uid=sym.symbol_uid,
                 symbol_path=qual,
+                occurrence_index=_next_chunk_occurrence(
+                    ctx,
+                    chunk_type=kind,
+                    symbol_uid=sym.symbol_uid,
+                    symbol_path=qual,
+                ),
             )
             ctx.chunks.append(
                 ChunkDraft(
@@ -699,6 +719,7 @@ class PythonAstParser:
             chunks=[],
             diagnostics=[],
             scope=scope,
+            chunk_occurrences={},
         )
         # Emit pending 'imports' relations from module → each imported target.
         for imp in imports:

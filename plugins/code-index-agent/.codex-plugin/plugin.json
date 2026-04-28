@@ -1,0 +1,47 @@
+{
+  "name": "code-index-agent",
+  "version": "0.1.0",
+  "description": "Local code graph, MCP retrieval, and browser task control for coding agents.",
+  "author": {
+    "name": "code_index contributors",
+    "email": "maintainers@example.com",
+    "url": "https://github.com/code-index/code-index"
+  },
+  "homepage": "https://github.com/code-index/code-index#live-code-graph",
+  "repository": "https://github.com/code-index/code-index",
+  "license": "MIT",
+  "keywords": [
+    "code-index",
+    "coding-agents",
+    "mcp",
+    "repo-graph"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Code Index Agent",
+    "shortDescription": "Graph-aware repo memory and task supervision for coding agents.",
+    "longDescription": "Code Index Agent packages the code_index CLI, MCP server, and live graph control plane so Claude, Codex, and other MCP-capable agents can search symbols, inspect impact, submit tasks, watch active files, and cancel local command runs from the browser.",
+    "developerName": "code_index contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "MCP",
+      "Local"
+    ],
+    "websiteURL": "https://github.com/code-index/code-index",
+    "privacyPolicyURL": "https://github.com/code-index/code-index#privacy",
+    "termsOfServiceURL": "https://github.com/code-index/code-index#license",
+    "defaultPrompt": [
+      "Find the files and symbols involved in this change.",
+      "Start the live graph and supervise this task.",
+      "Show impact and affected tests before editing."
+    ],
+    "brandColor": "#2563EB",
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/icon.svg",
+    "screenshots": [
+      "./assets/graph-demo.svg"
+    ]
+  }
+}

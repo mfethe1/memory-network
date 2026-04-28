@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "code-index": {
+      "command": "python",
+      "args": [
+        "-m",
+        "code_index",
+        "mcp-serve",
+        "--root",
+        "."
+      ]
+    }
+  }
+}

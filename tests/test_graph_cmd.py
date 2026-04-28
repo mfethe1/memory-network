@@ -10,7 +10,7 @@ import pytest
 
 from code_index import agent_activity
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.cli import main
 from code_index.commands.graph_notes import upsert_note
 
@@ -182,13 +182,45 @@ def test_graph_html_writes_standalone_view(
     assert "code_index graph" in html
     assert "pkg/mid.py" in html
     assert "graph-data" in html
+    assert "tab-chat" in html
     assert "tab-notes" in html
     assert "tab-edits" in html
+    assert "tab-debug" in html
     assert "refresh-graph" in html
+    assert "refresh-debug" in html
     assert "live-refresh" in html
     assert "layer-mode" in html
     assert "agent-name" in html
     assert "panel-resizer" in html
+    assert "breadcrumb-view" in html
+    assert "active-files" in html
+    assert "file-claims" in html
+    assert "agent-runs" in html
+    assert "search-results" in html
+    assert "related-files" in html
+    assert "nav-parent" in html
+    assert "nav-center" in html
+    assert "expandedDirs" in html
+    assert "data-nav-tree" in html
+    assert "--nav-indent" in html
+    assert "zoom-in" in html
+    assert "fit-view" in html
+    assert "expand-neighborhood" in html
+    assert "Layered context" in html
+    assert "submit-agent-task" in html
+    assert "agent-chat-message" in html
+    assert "send-agent-message" in html
+    assert "agent-provider" in html
+    assert "agent_runs_path" in html
+    assert "agent_preflight_path" in html
+    assert "search_path" in html
+    assert "graphTokenKey" in html
+    assert "fetchGraphGet" in html
+    assert "/api/search" in html
+    assert "code_index_graph_view" in html
+    assert "run-cancel" in html
+    assert "addEventListener(\"agent\"" in html
+    assert "setInterval" not in html
     assert "tree-view" in html
     assert "recent-files" in html
     assert "color-scheme: dark" in html

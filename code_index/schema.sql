@@ -221,11 +221,13 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     started_at          TEXT,
     updated_at          TEXT,
     ended_at            TEXT,
+    archived_at         TEXT,
     metadata_json       TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_updated ON agent_runs(updated_at);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_archived ON agent_runs(archived_at);
 
 CREATE TABLE IF NOT EXISTS agent_events (
     event_pk     INTEGER PRIMARY KEY,
@@ -242,6 +244,28 @@ CREATE INDEX IF NOT EXISTS idx_agent_events_run ON agent_events(run_pk);
 CREATE INDEX IF NOT EXISTS idx_agent_events_time ON agent_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_agent_events_file ON agent_events(file_path);
 CREATE INDEX IF NOT EXISTS idx_agent_events_type ON agent_events(event_type);
+
+CREATE TABLE IF NOT EXISTS agent_file_claims (
+    claim_pk      INTEGER PRIMARY KEY,
+    claim_id      TEXT NOT NULL UNIQUE,
+    run_pk        INTEGER NOT NULL REFERENCES agent_runs(run_pk) ON DELETE CASCADE,
+    file_path     TEXT NOT NULL,
+    mode          TEXT NOT NULL,                 -- read | edit | review | test
+    status        TEXT NOT NULL DEFAULT 'active', -- active | released | expired
+    reason        TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    heartbeat_at  TEXT,
+    expires_at    TEXT,
+    released_at   TEXT,
+    metadata_json TEXT,
+    UNIQUE(run_pk, file_path, mode)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_file_claims_run ON agent_file_claims(run_pk);
+CREATE INDEX IF NOT EXISTS idx_agent_file_claims_file ON agent_file_claims(file_path);
+CREATE INDEX IF NOT EXISTS idx_agent_file_claims_status ON agent_file_claims(status);
+CREATE INDEX IF NOT EXISTS idx_agent_file_claims_expires ON agent_file_claims(expires_at);
 
 CREATE TABLE IF NOT EXISTS chunk_lineage (
     lineage_pk          INTEGER PRIMARY KEY,

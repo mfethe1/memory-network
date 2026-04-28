@@ -1,0 +1,11 @@
+{
+  "kind": "code_index_graph_agent_task",
+  "message": "Review the graph navigation flow, identify likely files to edit, and report affected tests before changing code.",
+  "selected_nodes": [
+    "dir:."
+  ],
+  "selected_paths": [],
+  "callback": {
+    "agent_events_url": "http://127.0.0.1:8768/api/agent-events"
+  }
+}

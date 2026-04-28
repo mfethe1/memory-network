@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.ignore import build as build_matcher
 from code_index.locking import LockTimeoutError
 from code_index.pipeline import reindex

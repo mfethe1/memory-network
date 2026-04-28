@@ -11,7 +11,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.commands import init_cmd, mcp_serve_cmd, update_cmd
 from code_index.locking import writer_lock
 

@@ -16,7 +16,7 @@ import textwrap
 from pathlib import Path
 
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.commands import update_cmd
 from code_index.pipeline import reindex
 from code_index.symbols import SymbolIdentity, rename_symbol

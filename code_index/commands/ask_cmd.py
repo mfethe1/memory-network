@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 from code_index import config as cfg_mod
-from code_index import db as db_mod
+from code_index import db_router as db_mod
 from code_index.nl import answer
 
 
@@ -28,12 +28,8 @@ def run(args: argparse.Namespace) -> int:
     if not config.db_path.exists():
         print(f"error: no index at {config.index_dir}. run `code_index init` first.")
         return 2
-    conn = db_mod.connect(config.db_path)
-    try:
-        db_mod.ensure_schema(conn, config)
+    with db_mod.open_config(config, schema="ensure") as conn:
         bundle = answer(config, conn, args.question)
-    finally:
-        db_mod.close(conn)
 
     if args.json:
         print(json.dumps(bundle, indent=2, default=str))
