@@ -102,6 +102,31 @@ def test_mcp_serve_describe_emits_tool_and_resource_surface(
     assert "codeindex://graph" in resource_uris
 
 
+def test_cli_ask_no_fallback_keeps_classifier_only_shape(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+):
+    _tiny_repo(tmp_path)
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "ask",
+            "--root",
+            str(tmp_path),
+            "--json",
+            "--no-fallback",
+            "how does hello work",
+        ]
+    )
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert rc == 0
+    assert payload["intent"]["kind"] == "unknown"
+    assert payload["primary_tool"] == "query"
+    assert payload["results"] == {"query": None, "hits": []}
+
+
 def test_graph_server_subparser_exists():
     from code_index.cli import build_parser
 

@@ -18,10 +18,33 @@ rely on it:
 
 from __future__ import annotations
 
+import re
 import sqlite3
+from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from code_index.nl.classify import Intent, IntentKind, classify
+
+
+_PATH_TOKEN_RE = re.compile(r"`([^`]+)`|[A-Za-z0-9_./\\:-]+\.[A-Za-z0-9_./\\:-]+")
+_UNKNOWN_FALLBACK_LIMIT = 10
+_UNKNOWN_FALLBACK_BUDGET_BYTES = 12_000
+_QUERY_STOPWORDS = {
+    "about",
+    "does",
+    "for",
+    "from",
+    "how",
+    "into",
+    "the",
+    "this",
+    "what",
+    "where",
+    "which",
+    "with",
+    "work",
+}
 
 
 def _find_primary_symbol(conn: sqlite3.Connection, target: str) -> dict | None:
@@ -37,7 +60,96 @@ def _with_limits(msg: str) -> list[str]:
     return [msg]
 
 
-def _dispatch(config, conn: sqlite3.Connection, intent: Intent) -> dict[str, Any]:
+def _selected_paths_from_question(config, question: str) -> tuple[str, ...]:
+    root = Path(config.root).resolve()
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _PATH_TOKEN_RE.finditer(question):
+        raw = (match.group(1) or match.group(0)).strip(" \t\r\n.,;:!?()[]{}\"'")
+        if not raw or "://" in raw:
+            continue
+        candidate_text = raw.replace("\\", "/")
+        if "/" not in candidate_text and "\\" not in raw:
+            continue
+        candidate = Path(candidate_text)
+        resolved = (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (root / candidate).resolve()
+        )
+        try:
+            rel = resolved.relative_to(root)
+        except ValueError:
+            continue
+        if not resolved.exists():
+            continue
+        rel_text = rel.as_posix()
+        if rel_text and rel_text not in seen:
+            out.append(rel_text)
+            seen.add(rel_text)
+    return tuple(out)
+
+
+def _keyword_fallback_query(question: str) -> str:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for term in re.findall(r"[A-Za-z0-9_]+", question):
+        lowered = term.lower()
+        if len(lowered) < 3 or lowered in _QUERY_STOPWORDS or lowered in seen:
+            continue
+        terms.append(term)
+        seen.add(lowered)
+        if len(terms) >= 6:
+            break
+    return " OR ".join(terms)
+
+
+def _unknown_retrieval_fallback(
+    config, conn: sqlite3.Connection, question: str
+) -> dict[str, Any]:
+    from code_index.retrieval import RetrievalRequest, SourceKind, retrieve
+
+    selected_paths = _selected_paths_from_question(config, question)
+    search_query = question
+    request = RetrievalRequest(
+        query=question,
+        limit=_UNKNOWN_FALLBACK_LIMIT,
+        byte_budget=_UNKNOWN_FALLBACK_BUDGET_BYTES,
+        include_kinds=(
+            SourceKind.FILE_PATH,
+            SourceKind.CODE_CHUNK,
+            SourceKind.DIAGNOSTIC,
+            SourceKind.AFFECTED_TEST,
+            SourceKind.TASK_GRAPH,
+        ),
+        selected_paths=selected_paths,
+        graph_config=config,
+        per_source_limit=_UNKNOWN_FALLBACK_LIMIT,
+    )
+    response = retrieve(conn, request)
+    if not response.results:
+        retry_query = _keyword_fallback_query(question)
+        if retry_query and retry_query != question:
+            search_query = retry_query
+            response = retrieve(conn, replace(request, query=retry_query))
+    payload = response.to_dict()
+    return {
+        "query": question,
+        "search_query": search_query,
+        "hits": payload.get("results") or [],
+        "selected_paths": list(selected_paths),
+        "broker": payload,
+    }
+
+
+def _dispatch(
+    config,
+    conn: sqlite3.Connection,
+    intent: Intent,
+    *,
+    question: str = "",
+    fallback_unknown: bool = True,
+) -> dict[str, Any]:
     """Return {primary_tool, supporting_tools, results, limitations, suggestions}
     for this intent. Never raises — every branch returns a usable bundle."""
     out: dict[str, Any] = {
@@ -74,8 +186,23 @@ def _dispatch(config, conn: sqlite3.Connection, intent: Intent) -> dict[str, Any
             out["primary_tool"] = "repo-map"
             out["results"] = build_repo_map(conn, limit=intent.limit or 20)
             return out
-        # Truly unknown: run both `query` (BM25) and `similar` (embedding)
-        # as a general "best-effort retrieval" so the agent still gets data.
+        # Truly unknown: use the retrieval broker as a bounded best-effort
+        # context builder when the caller supplied question text.
+        if fallback_unknown and question.strip():
+            out["primary_tool"] = "retrieval-broker"
+            out["supporting_tools"] = ["query"]
+            out["limitations"].append(
+                "question shape wasn't recognized; falling back to retrieval broker"
+            )
+            out["results"] = _unknown_retrieval_fallback(config, conn, question)
+            out["suggestions"] = [
+                "try `where is <name>`",
+                "try `who calls <name>`",
+                "try `find code like <phrase>`",
+            ]
+            return out
+
+        # Classifier-only compatibility mode: return the old empty result.
         out["primary_tool"] = "query"
         out["supporting_tools"] = ["similar"]
         out["limitations"].append(
@@ -91,16 +218,6 @@ def _dispatch(config, conn: sqlite3.Connection, intent: Intent) -> dict[str, Any
         return out
 
     target = intent.target
-
-    # Resolve a concrete symbol for kinds that need one.
-    need_symbol = intent.kind in {
-        IntentKind.WHERE,
-        IntentKind.CALLERS,
-        IntentKind.IMPACT,
-        IntentKind.TESTS,
-        IntentKind.REFERENCES,
-    }
-    primary_symbol = _find_primary_symbol(conn, target) if need_symbol else None
 
     if intent.kind == IntentKind.WHERE:
         from code_index.search.symbol_search import lookup
@@ -421,6 +538,13 @@ def _narrate(intent: Intent, results: dict) -> str:
             + "."
         )
     if intent.kind == IntentKind.UNKNOWN:
+        hits = results.get("hits") or []
+        if hits:
+            top = hits[0]
+            source = top.get("source_kind") or top.get("source") or "context"
+            path = top.get("file_path") or (top.get("payload") or {}).get("file_path")
+            suffix = f"; top {source} hit: {path}" if path else f"; top hit: {source}"
+            return f"Found {len(hits)} best-effort retrieval hits for this question{suffix}."
         return (
             "I couldn't match this question to a known pattern. Try "
             "`where is <name>`, `who calls <name>`, `tests for <name>`, "
@@ -444,15 +568,27 @@ def _suggestions(intent: Intent) -> list[str]:
     if intent.kind == IntentKind.REFERENCES:
         return [f"who calls {t}", f"tests for {t}"]
     if intent.kind == IntentKind.SIMILAR:
-        return [f"where is {t}", f"find all functions"]
+        return [f"where is {t}", "find all functions"]
     return []
 
 
-def answer(config, conn: sqlite3.Connection, question: str) -> dict[str, Any]:
+def answer(
+    config,
+    conn: sqlite3.Connection,
+    question: str,
+    *,
+    fallback_unknown: bool = True,
+) -> dict[str, Any]:
     """Main entry point. Classify the question, dispatch, narrate, return
     the full bundle. Safe to call concurrently — reads only."""
     intent = classify(question)
-    dispatch = _dispatch(config, conn, intent)
+    dispatch = _dispatch(
+        config,
+        conn,
+        intent,
+        question=question,
+        fallback_unknown=fallback_unknown,
+    )
     return {
         "question": question,
         "intent": {

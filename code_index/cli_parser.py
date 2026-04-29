@@ -274,6 +274,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common(p_ask)
     p_ask.add_argument("question", nargs="?", help="question in quotes")
+    p_ask.add_argument(
+        "--no-fallback",
+        action="store_true",
+        help="disable retrieval-broker fallback for unknown questions",
+    )
     p_ask.set_defaults(func=ask_cmd.run)
 
     p_context = subparsers.add_parser(

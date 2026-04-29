@@ -29,7 +29,12 @@ def run(args: argparse.Namespace) -> int:
         print(f"error: no index at {config.index_dir}. run `code_index init` first.")
         return 2
     with db_mod.open_config(config, schema="ensure") as conn:
-        bundle = answer(config, conn, args.question)
+        bundle = answer(
+            config,
+            conn,
+            args.question,
+            fallback_unknown=not getattr(args, "no_fallback", False),
+        )
 
     if args.json:
         print(json.dumps(bundle, indent=2, default=str))
@@ -50,6 +55,6 @@ def run(args: argparse.Namespace) -> int:
             print(f"  - {s}")
     if bundle.get("limitations"):
         print("\nlimitations:")
-        for l in bundle["limitations"]:
-            print(f"  - {l}")
+        for limitation in bundle["limitations"]:
+            print(f"  - {limitation}")
     return 0

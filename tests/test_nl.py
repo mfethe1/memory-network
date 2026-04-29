@@ -10,7 +10,7 @@ import pytest
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
 from code_index.nl import answer
-from code_index.nl.classify import Intent, IntentKind, classify
+from code_index.nl.classify import IntentKind, classify
 from code_index.pipeline import reindex
 
 
@@ -99,6 +99,9 @@ def _build_small_repo(tmp_path: Path) -> None:
 
             def run():
                 return helper(42)
+
+            def build_memory_handoff():
+                return "memory handoff logic"
             """
         ).lstrip(),
         encoding="utf-8",
@@ -202,6 +205,45 @@ def test_answer_unknown_question_falls_back_with_suggestions(tmp_path: Path):
         bundle = answer(config, conn, "what is the best taco filling")
         assert bundle["intent"]["kind"] == IntentKind.UNKNOWN.value
         assert bundle["suggestions"], "unknown fallback must suggest concrete patterns"
+    finally:
+        db_mod.close(conn)
+
+
+def test_answer_unknown_question_uses_retrieval_broker(tmp_path: Path):
+    _build_small_repo(tmp_path)
+    config, conn = _init(tmp_path)
+    try:
+        reindex(conn, config, paths=None, event_source="init")
+        bundle = answer(config, conn, "how does memory handoff logic work")
+        assert bundle["intent"]["kind"] == IntentKind.UNKNOWN.value
+        assert bundle["primary_tool"] == "retrieval-broker"
+        hits = bundle["results"]["hits"]
+        assert hits
+        assert len(hits) <= 10
+        assert any(
+            "pkg/service.py" in str(hit.get("file_path") or hit.get("payload") or "")
+            for hit in hits
+        )
+        assert bundle["results"]["broker"]["kind"] == "code_index_retrieval"
+    finally:
+        db_mod.close(conn)
+
+
+def test_answer_unknown_question_can_disable_retrieval_fallback(tmp_path: Path):
+    _build_small_repo(tmp_path)
+    config, conn = _init(tmp_path)
+    try:
+        reindex(conn, config, paths=None, event_source="init")
+        bundle = answer(
+            config,
+            conn,
+            "how does memory handoff logic work",
+            fallback_unknown=False,
+        )
+        assert bundle["intent"]["kind"] == IntentKind.UNKNOWN.value
+        assert bundle["primary_tool"] == "query"
+        assert bundle["supporting_tools"] == ["similar"]
+        assert bundle["results"] == {"query": None, "hits": []}
     finally:
         db_mod.close(conn)
 

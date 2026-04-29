@@ -19,6 +19,10 @@ def _seed_broker_db(root: Path):
         "pkg/budgeted_file.py",
         "pkg/dup.py",
         "pkg/hybridmemory.py",
+        "pkg/service.py",
+        "pkg/selected/a.py",
+        "pkg/selected/b.py",
+        "tests/test_service.py",
     ):
         cursor = conn.execute(
             """
@@ -81,6 +85,82 @@ def _seed_broker_db(root: Path):
                 f"norm-{chunk_uid}",
             ),
         )
+
+    target_cursor = conn.execute(
+        """
+        INSERT INTO symbols(symbol_uid, language, kind, canonical_name, display_name)
+        VALUES ('py:pkg.service.value', 'python', 'function', 'pkg.service.value', 'value')
+        """
+    )
+    target_symbol_pk = int(target_cursor.lastrowid)
+    test_cursor = conn.execute(
+        """
+        INSERT INTO symbols(symbol_uid, language, kind, canonical_name, display_name)
+        VALUES (
+            'py:tests.test_service.test_value', 'python', 'function',
+            'tests.test_service.test_value', 'test_value'
+        )
+        """
+    )
+    test_symbol_pk = int(test_cursor.lastrowid)
+    conn.execute(
+        """
+        INSERT INTO occurrences(symbol_pk, file_pk, role, start_line, end_line)
+        VALUES (?, ?, 'definition', 1, 2)
+        """,
+        (target_symbol_pk, file_pks["pkg/service.py"]),
+    )
+    conn.execute(
+        """
+        INSERT INTO occurrences(symbol_pk, file_pk, role, start_line, end_line)
+        VALUES (?, ?, 'definition', 3, 4)
+        """,
+        (test_symbol_pk, file_pks["tests/test_service.py"]),
+    )
+    test_chunk_cursor = conn.execute(
+        """
+        INSERT INTO chunks(
+            chunk_uid, file_pk, file_path, language, chunk_type,
+            symbol_name, symbol_path, primary_symbol_pk, signature,
+            start_line, end_line, context_json, content, raw_hash, normalized_hash
+        )
+        VALUES (
+            'chunk-test-service', ?, 'tests/test_service.py', 'python', 'function',
+            'test_value', 'tests.test_service.test_value', ?, 'def test_value(): pass',
+            3, 4, '{}', 'def test_value():\n    assert value() == 1\n',
+            'raw-chunk-test-service', 'norm-chunk-test-service'
+        )
+        """,
+        (file_pks["tests/test_service.py"], test_symbol_pk),
+    )
+    test_chunk_pk = int(test_chunk_cursor.lastrowid)
+    conn.execute(
+        """
+        INSERT INTO test_edges(
+            test_chunk_pk, test_symbol_pk, target_symbol_pk, edge_type,
+            depth, confidence, path_json, provenance
+        )
+        VALUES (?, ?, ?, 'direct', 1, 0.95, ?, 'synthetic')
+        """,
+        (
+            test_chunk_pk,
+            test_symbol_pk,
+            target_symbol_pk,
+            '["pkg.service.value","tests.test_service.test_value"]',
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO diagnostics(
+            file_pk, tool, code, severity, start_line, end_line, message, observed_at
+        )
+        VALUES (
+            ?, 'pytest', 'W001', 'warning', 1, 1,
+            'synthetic service warning', '2099-01-01T00:00:00+00:00'
+        )
+        """,
+        (file_pks["pkg/service.py"],),
+    )
 
     cursor = conn.execute(
         """
@@ -237,3 +317,179 @@ def test_retrieval_returns_file_and_transcript_matches(tmp_path: Path):
     )
     assert transcript.file_path == "pkg/hybridmemory.py"
     assert "hybridmemory transcript event" in transcript.payload["text"]
+
+
+def test_retrieval_selected_paths_boost_and_fanout(tmp_path: Path):
+    conn = _seed_broker_db(tmp_path)
+    try:
+        response = retrieval.retrieve(
+            conn,
+            retrieval.RetrievalRequest(
+                query="memory",
+                limit=4,
+                budget_bytes=2_000,
+                sources=(retrieval.SourceKind.FILE_PATH,),
+                selected_paths=("pkg/memory.py", "pkg/selected"),
+            ),
+        )
+    finally:
+        db_mod.close(conn)
+
+    paths = [result.file_path for result in response.results]
+    assert paths[0] == "pkg/memory.py"
+    assert {"pkg/selected/a.py", "pkg/selected/b.py"} <= set(paths)
+    first = response.results[0]
+    assert first.provenance["selected_path"] == "pkg/memory.py"
+    assert first.score < 0
+
+
+def test_retrieval_diagnostic_collector_requires_selected_paths(tmp_path: Path):
+    conn = _seed_broker_db(tmp_path)
+    try:
+        ungated = retrieval.retrieve(
+            conn,
+            retrieval.RetrievalRequest(
+                query="service",
+                limit=5,
+                budget_bytes=2_000,
+                sources=(retrieval.SourceKind.DIAGNOSTIC,),
+            ),
+        )
+        gated = retrieval.retrieve(
+            conn,
+            retrieval.RetrievalRequest(
+                query="service",
+                limit=5,
+                budget_bytes=2_000,
+                sources=(retrieval.SourceKind.DIAGNOSTIC,),
+                selected_paths=("pkg/service.py",),
+            ),
+        )
+    finally:
+        db_mod.close(conn)
+
+    assert ungated.results == ()
+    assert len(gated.results) == 1
+    result = gated.results[0]
+    assert result.source_kind is retrieval.SourceKind.DIAGNOSTIC
+    assert result.file_path == "pkg/service.py"
+    assert result.payload["message"] == "synthetic service warning"
+    assert "synthetic service warning" in result.payload["text"]
+
+
+def test_retrieval_affected_test_collector_requires_selected_paths(tmp_path: Path):
+    conn = _seed_broker_db(tmp_path)
+    try:
+        ungated = retrieval.retrieve(
+            conn,
+            retrieval.RetrievalRequest(
+                query="service",
+                limit=5,
+                budget_bytes=2_000,
+                sources=(retrieval.SourceKind.AFFECTED_TEST,),
+            ),
+        )
+        gated = retrieval.retrieve(
+            conn,
+            retrieval.RetrievalRequest(
+                query="service",
+                limit=5,
+                budget_bytes=2_000,
+                sources=(retrieval.SourceKind.AFFECTED_TEST,),
+                selected_paths=("pkg/service.py",),
+            ),
+        )
+    finally:
+        db_mod.close(conn)
+
+    assert ungated.results == ()
+    assert len(gated.results) == 1
+    result = gated.results[0]
+    assert result.source_kind is retrieval.SourceKind.AFFECTED_TEST
+    assert result.file_path == "tests/test_service.py"
+    assert result.payload["canonical_name"] == "tests.test_service.test_value"
+    assert result.payload["matched_target"]["canonical_name"] == "pkg.service.value"
+    assert "tests.test_service.test_value" in result.payload["text"]
+
+
+def test_retrieval_task_graph_deferred_without_config(tmp_path: Path):
+    conn = _seed_broker_db(tmp_path)
+    try:
+        ungated = retrieval.retrieve(
+            conn,
+            retrieval.RetrievalRequest(
+                query="service graph",
+                limit=5,
+                budget_bytes=2_000,
+                sources=(retrieval.SourceKind.TASK_GRAPH,),
+                selected_paths=("pkg/service.py",),
+            ),
+        )
+        gated = retrieval.retrieve(
+            conn,
+            retrieval.RetrievalRequest(
+                query="service graph",
+                limit=5,
+                budget_bytes=2_000,
+                sources=(retrieval.SourceKind.TASK_GRAPH,),
+                selected_nodes=("file:pkg/service.py",),
+                selected_paths=("pkg/service.py",),
+            ),
+        )
+    finally:
+        db_mod.close(conn)
+
+    assert ungated.results == ()
+    assert len(gated.results) == 1
+    result = gated.results[0]
+    assert result.source_kind is retrieval.SourceKind.TASK_GRAPH
+    assert result.payload["status"] == "deferred"
+    assert result.payload["context_kind"] == "code_index_task_graph_context_deferred"
+    assert "config_unavailable" in result.payload["text"]
+
+
+def test_retrieval_task_graph_uses_builder_when_config_is_available(
+    tmp_path: Path, monkeypatch
+):
+    config = cfg_mod.load(tmp_path)
+    conn = _seed_broker_db(tmp_path)
+    seen: dict[str, object] = {}
+
+    def fake_build_task_graph_context(config_arg, **kwargs):
+        seen["config"] = config_arg
+        seen.update(kwargs)
+        return {
+            "kind": "code_index_graph_context",
+            "nodes": [{"id": "file:pkg/service.py"}],
+            "edges": [],
+            "selected_nodes": [{"id": "file:pkg/service.py"}],
+            "related_nodes": [],
+        }
+
+    monkeypatch.setattr(
+        "code_index.commands.graph_server_dispatch._build_task_graph_context",
+        fake_build_task_graph_context,
+    )
+    try:
+        response = retrieval.retrieve(
+            conn,
+            retrieval.RetrievalRequest(
+                query="service graph",
+                limit=5,
+                budget_bytes=2_000,
+                sources=(retrieval.SourceKind.TASK_GRAPH,),
+                selected_nodes=({"id": "file:pkg/service.py"},),
+                selected_paths=("pkg/service.py",),
+                graph_config=config,
+            ),
+        )
+    finally:
+        db_mod.close(conn)
+
+    assert len(response.results) == 1
+    result = response.results[0]
+    assert result.payload["status"] == "built"
+    assert result.payload["node_count"] == 1
+    assert seen["config"] is config
+    assert seen["selected_nodes"] == ["file:pkg/service.py"]
+    assert seen["selected_paths"] == ["pkg/service.py"]
