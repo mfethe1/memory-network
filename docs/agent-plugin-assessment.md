@@ -40,6 +40,9 @@ state to supervise.
   Claude settings, launcher config, starter scripts, and a demo task.
 - `plugins/code-index-agent/scripts/start_graph_server.py --check-only`
   validates configured provider commands before the server starts.
+- `plugins/code-index-agent/scripts/start_graph_server.py --root <dir>` can
+  target any local directory, initialize a missing `.code_index/index.db`, and
+  launch the live graph using this source tree through `PYTHONPATH`.
 - `CODE_INDEX_AGENT_PROVIDER=claude` and `CODE_INDEX_AGENT_PROVIDER=codex`
   provide built-in local command presets; `CODE_INDEX_AGENT_COMMAND` remains
   the escape hatch for other systems.

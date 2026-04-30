@@ -1039,6 +1039,14 @@ def _read_text_if_present(path: Path, *, max_chars: int = 12000) -> str:
     return text[:max_chars].rstrip() + "\n...[truncated]"
 
 
+def _agent_command_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    return env
+
+
 def _run_command(
     task: dict[str, Any],
     *,
@@ -1152,6 +1160,7 @@ def _run_command(
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=_agent_command_env(),
             **popen_kwargs,
         )
     except OSError as exc:

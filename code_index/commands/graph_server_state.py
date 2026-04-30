@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
@@ -31,6 +32,39 @@ def _latest_event_pk(conn: sqlite3.Connection) -> int:
     return int(row[0] or 0)
 
 
+def _agent_activity_signature(conn: sqlite3.Connection, event_pk: int) -> str:
+    try:
+        run_row = conn.execute(
+            """
+            SELECT COUNT(*) AS run_count,
+                   COALESCE(MAX(updated_at), '') AS updated_at
+              FROM agent_runs
+             WHERE archived_at IS NULL
+            """
+        ).fetchone()
+        claim_row = conn.execute(
+            """
+            SELECT COUNT(*) AS claim_count,
+                   COALESCE(MAX(updated_at), '') AS updated_at
+              FROM agent_file_claims
+             WHERE status = 'active'
+               AND (expires_at IS NULL OR expires_at >= ?)
+            """,
+            (datetime.now(timezone.utc).isoformat(timespec="milliseconds"),),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return str(event_pk)
+    return ":".join(
+        [
+            str(event_pk),
+            str(run_row["run_count"] if run_row else 0),
+            str(run_row["updated_at"] if run_row else ""),
+            str(claim_row["claim_count"] if claim_row else 0),
+            str(claim_row["updated_at"] if claim_row else ""),
+        ]
+    )
+
+
 def _notes_mtime(root: Path) -> int:
     path = notes_path(root)
     try:
@@ -39,15 +73,59 @@ def _notes_mtime(root: Path) -> int:
         return 0
 
 
-def _state_signature(config: cfg_mod.Config) -> dict[str, Any]:
-    conn = db_mod.connect(config.db_path)
+def _dynamic_edge_signature(
+    config: cfg_mod.Config,
+    *,
+    conn=None,
+    return_relationships: bool = False,
+) -> str | tuple[str, list[dict[str, Any]]]:
+    """Return a hashable signature of current agent-derived file relationships.
+
+    When *conn* is provided, the connection is reused instead of opened/closed.
+    When *return_relationships* is True, also return the raw relationships list.
+    """
+    close_conn = conn is None
+    if close_conn:
+        conn = db_mod.connect(config.db_path)
+    try:
+        db_mod.ensure_schema(conn, config)
+        relationships = agent_activity.agent_derived_file_relationships(
+            conn, limit=200, min_observations=1
+        )
+    finally:
+        if close_conn:
+            db_mod.close(conn)
+    if not relationships:
+        if return_relationships:
+            return "", []
+        return ""
+    parts = []
+    for rel in relationships:
+        parts.append(
+            f"{rel.get('source')}:{rel.get('target')}:{rel.get('observations')}"
+        )
+    signature = hashlib.sha256(
+        "|".join(parts).encode("utf-8")
+    ).hexdigest()[:32]
+    if return_relationships:
+        return signature, relationships
+    return signature
+
+
+def _state_signature(config: cfg_mod.Config, *, conn=None) -> dict[str, Any]:
+    close_conn = conn is None
+    if close_conn:
+        conn = db_mod.connect(config.db_path)
     try:
         db_mod.ensure_schema(conn, config)
         event_pk = _latest_event_pk(conn)
+        agent_signature = _agent_activity_signature(conn, event_pk)
     finally:
-        db_mod.close(conn)
+        if close_conn:
+            db_mod.close(conn)
     return {
         "event_pk": event_pk,
+        "agent_signature": agent_signature,
         "notes_mtime": _notes_mtime(config.root),
     }
 
@@ -98,6 +176,29 @@ def _agent_stream_payload(config: cfg_mod.Config) -> dict[str, Any]:
             "agent_events": snapshot["recent_events"],
             "agent_recent_files": snapshot["recent_files"],
             "active_claims": snapshot.get("active_claims", []),
+        },
+    }
+
+
+def _agent_runtime_payload() -> dict[str, Any]:
+    provider = os.environ.get("CODE_INDEX_AGENT_PROVIDER", "").strip().lower()
+    command = os.environ.get("CODE_INDEX_AGENT_COMMAND", "").strip()
+    webhook = os.environ.get("CODE_INDEX_AGENT_WEBHOOK_URL", "").strip()
+    providers = agent_providers.provider_registry_payload()
+    provider_presets = [
+        str(provider["id"])
+        for provider in providers
+        if isinstance(provider, dict) and provider.get("command_preset")
+    ]
+    return {
+        "kind": "code_index_agent_runtime",
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "dispatch": {
+            "webhook_configured": bool(webhook),
+            "local_command_configured": bool(command or provider),
+            "provider": provider or None,
+            "custom_command_configured": bool(command),
+            "provider_presets": provider_presets,
         },
     }
 
@@ -158,6 +259,7 @@ def _build_payload(config: cfg_mod.Config, args: argparse.Namespace) -> dict[str
             "agent_board_path": "/api/agent-board",
             "agent_providers_path": "/api/agent-providers",
             "agent_providers": agent_providers.provider_registry_payload(),
+            "agent_runtime": _agent_runtime_payload(),
         }
         return payload
     finally:
@@ -404,9 +506,8 @@ def _build_debug_payload(
     notes = payload.get("notes") if isinstance(payload.get("notes"), dict) else {}
     code_metrics = _embedded_code_metrics(payload)
 
-    provider = os.environ.get("CODE_INDEX_AGENT_PROVIDER", "").strip()
-    command = os.environ.get("CODE_INDEX_AGENT_COMMAND", "").strip()
-    webhook = os.environ.get("CODE_INDEX_AGENT_WEBHOOK_URL", "").strip()
+    runtime = _agent_runtime_payload()
+    dispatch = runtime["dispatch"]
     perf_payload = perf or {
         "kind": "code_index_graph_debug_perf",
         "counters": {
@@ -464,12 +565,7 @@ def _build_debug_payload(
             ),
             "include_code": not bool(getattr(args, "no_code", False)),
             "max_code_bytes": int(getattr(args, "max_code_bytes", 200_000) or 0),
-            "agent_dispatch": {
-                "webhook_configured": bool(webhook),
-                "local_command_configured": bool(command or provider),
-                "provider": provider or None,
-                "custom_command_configured": bool(command),
-            },
+            "agent_dispatch": dispatch,
         },
         "activity": {
             "active_run_count": len(agent.get("active_runs") or []),

@@ -298,3 +298,55 @@ def test_run_command_callback_failure_terminates_process_and_reports_failure(
         and event["payload"].get("process_callback") == "failed"
         for event in events
     )
+
+
+def test_run_command_sets_utf8_stdio_for_python_backed_providers(
+    tmp_path: Path, monkeypatch
+):
+    events: list[dict] = []
+
+    def fake_post_json(_callback: str, payload: dict) -> dict:
+        events.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(agent_adapter_cmd, "_post_json", fake_post_json)
+    monkeypatch.delenv("PYTHONUTF8", raising=False)
+    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    monkeypatch.delenv("PYTHONUNBUFFERED", raising=False)
+
+    script_path = tmp_path / "unicode_agent.py"
+    script_path.write_text(
+        (
+            "import os\n"
+            "import sys\n"
+            "if os.environ.get('PYTHONUTF8') != '1':\n"
+            "    print('missing PYTHONUTF8', file=sys.stderr)\n"
+            "    sys.exit(3)\n"
+            "if os.environ.get('PYTHONIOENCODING') != 'utf-8':\n"
+            "    print('missing PYTHONIOENCODING', file=sys.stderr)\n"
+            "    sys.exit(4)\n"
+            "if os.environ.get('PYTHONUNBUFFERED') != '1':\n"
+            "    print('missing PYTHONUNBUFFERED', file=sys.stderr)\n"
+            "    sys.exit(5)\n"
+            "print('DECISION unicode minus: \\u2212', flush=True)\n"
+        ),
+        encoding="utf-8",
+    )
+    task_json_path = tmp_path / "task.json"
+    task_json_path.write_text("{}", encoding="utf-8")
+
+    exit_code, result = agent_adapter_cmd._run_command(
+        {"run_id": "run-unicode", "message": "unicode output"},
+        callback="http://callback.invalid/events",
+        command=f'"{sys.executable}" "{script_path}"',
+        root=tmp_path,
+        task_json_path=task_json_path,
+    )
+
+    assert exit_code == 0
+    assert result["status"] == "completed"
+    assert any(
+        event["event_type"] == "decision"
+        and "unicode minus: -" in event["message"].replace("\u2212", "-")
+        for event in events
+    )

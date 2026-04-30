@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import hmac
 import json
 import os
 import secrets
 import threading
 import time
-from http.cookies import SimpleCookie
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
@@ -23,891 +21,61 @@ from code_index import agent_swarm
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
 from code_index import run_orchestrator
-from code_index import task_gate
-from code_index import retrieval
 from code_index.agent_collaboration import append_event_jsonl
 from code_index.commands.graph_html import render_html
 from code_index.commands.graph_notes import graph_notes_block, upsert_note
 from code_index.commands.graph_server_dispatch import (
     _build_task_collaboration_packet,
     _build_task_context_packet,
-    _build_task_graph_context,
     _cancel_local_agent_task,
     _dispatch_agent_task,
 )
+from code_index.commands.graph_server_perf import (
+    _inc_counter,
+    _make_perf_state,
+    _observe_latency,
+    _observe_retrieval_budget,
+    _perf_snapshot,
+    _perf_tick_payload,
+)
+from code_index.commands.graph_server_preflight import (
+    _build_task_draft,
+    _consume_preflight,
+    _extract_preflight_id,
+    _preflight_from_draft,
+    _preflight_required,
+    _store_preflight,
+    _task_request_from_payload,
+)
+from code_index.commands.graph_server_search import _build_search_payload
 from code_index.commands.graph_server_state import (
     _agent_stream_payload,
+    _agent_runtime_payload,
     _build_debug_payload,
     _build_payload,
+    _dynamic_edge_signature,
     _record_user_note_event,
     _state_signature,
 )
 from code_index.commands.graph_server_utils import (
+    GRAPH_SESSION_COOKIE,
+    GRAPH_SESSION_MAX_AGE_SECONDS,
     GRAPH_TOKEN_ENV_VAR,
+    _auth_page_html,
     _json_bytes,
+    _now_iso,
+    _session_cookie_value,
     _string_list,
     _validate_bearer,
 )
 from code_index.locking import writer_lock
 
 PREFLIGHT_TTL_SECONDS = 10 * 60
-GRAPH_SESSION_COOKIE = "code_index_graph_session"
-GRAPH_SESSION_MAX_AGE_SECONDS = 12 * 60 * 60
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-
-def _iso_after(seconds: float) -> str:
-    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(
-        timespec="milliseconds"
-    )
-
-
-def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def _canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _sha256_json(value: Any) -> str:
-    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
-
-
-def _preflight_secret() -> str:
-    env_secret = os.environ.get("CODE_INDEX_GRAPH_PREFLIGHT_SECRET", "").strip()
-    if env_secret:
-        return env_secret
-    token = os.environ.get(GRAPH_TOKEN_ENV_VAR, "").strip()
-    if token:
-        return token
-    return secrets.token_hex(32)
-
-
-def _session_cookie_value(secret: str, graph_token: str) -> str:
-    return hmac.new(
-        secret.encode("utf-8"),
-        f"graph-session:{graph_token}".encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-
-def _cookie_value(cookie_header: str | None, name: str) -> str | None:
-    if not cookie_header:
-        return None
-    cookie = SimpleCookie()
-    try:
-        cookie.load(cookie_header)
-    except Exception:
-        return None
-    morsel = cookie.get(name)
-    return morsel.value if morsel is not None else None
-
-
-def _make_perf_state() -> dict[str, Any]:
-    return {
-        "lock": threading.Lock(),
-        "counters": {
-            "preflight_rejections": {},
-            "auth_failures": {},
-            "sse_dropped_events": 0,
-            "claim_conflicts": 0,
-            "stale_runs": 0,
-            "retrieval_budget": {
-                "broker_configured": True,
-                "requests": 0,
-                "budget_rejections": 0,
-            },
-            "search_latency_ms": {
-                "count": 0,
-                "last": None,
-                "max": None,
-                "avg": None,
-                "by_scope": {},
-            },
-        },
-    }
-
-
-def _inc_counter(perf: dict[str, Any], group: str, key: str | None = None) -> None:
-    lock = perf.get("lock")
-    counters = perf.get("counters")
-    if not isinstance(counters, dict):
-        return
-    if lock:
-        lock.acquire()
-    try:
-        if key is None:
-            counters[group] = int(counters.get(group) or 0) + 1
-            return
-        bucket = counters.setdefault(group, {})
-        if isinstance(bucket, dict):
-            bucket[key] = int(bucket.get(key) or 0) + 1
-    finally:
-        if lock:
-            lock.release()
-
-
-def _observe_latency(
-    perf: dict[str, Any], group: str, elapsed_ms: float, key: str | None = None
-) -> None:
-    lock = perf.get("lock")
-    counters = perf.get("counters")
-    if not isinstance(counters, dict):
-        return
-    if lock:
-        lock.acquire()
-    try:
-        bucket = counters.setdefault(
-            group,
-            {"count": 0, "last": None, "max": None, "avg": None, "by_scope": {}},
-        )
-        if not isinstance(bucket, dict):
-            return
-        count = int(bucket.get("count") or 0) + 1
-        previous_avg = float(bucket.get("avg") or 0)
-        value = round(float(elapsed_ms), 2)
-        bucket["count"] = count
-        bucket["last"] = value
-        bucket["max"] = value if bucket.get("max") is None else max(float(bucket["max"]), value)
-        bucket["avg"] = round(previous_avg + ((value - previous_avg) / count), 2)
-        if key:
-            by_scope = bucket.setdefault("by_scope", {})
-            if not isinstance(by_scope, dict):
-                by_scope = {}
-                bucket["by_scope"] = by_scope
-            scoped = by_scope.setdefault(
-                key, {"count": 0, "last": None, "max": None, "avg": None}
-            )
-            if not isinstance(scoped, dict):
-                scoped = {"count": 0, "last": None, "max": None, "avg": None}
-                by_scope[key] = scoped
-            scoped_count = int(scoped.get("count") or 0) + 1
-            scoped_avg = float(scoped.get("avg") or 0)
-            scoped["count"] = scoped_count
-            scoped["last"] = value
-            scoped["max"] = (
-                value
-                if scoped.get("max") is None
-                else max(float(scoped["max"]), value)
-            )
-            scoped["avg"] = round(scoped_avg + ((value - scoped_avg) / scoped_count), 2)
-    finally:
-        if lock:
-            lock.release()
-
-
-def _observe_retrieval_budget(perf: dict[str, Any], payload: dict[str, Any]) -> None:
-    lock = perf.get("lock")
-    counters = perf.get("counters")
-    if not isinstance(counters, dict):
-        return
-    if lock:
-        lock.acquire()
-    try:
-        bucket = counters.setdefault(
-            "retrieval_budget",
-            {"broker_configured": True, "requests": 0, "budget_rejections": 0},
-        )
-        if not isinstance(bucket, dict):
-            return
-        bucket["broker_configured"] = True
-        bucket["requests"] = int(bucket.get("requests") or 0) + 1
-        retrieval_payload = payload.get("retrieval")
-        if (
-            isinstance(retrieval_payload, dict)
-            and retrieval_payload.get("truncation_reason") == "byte_budget"
-        ):
-            bucket["budget_rejections"] = int(bucket.get("budget_rejections") or 0) + 1
-    finally:
-        if lock:
-            lock.release()
-
-
-def _perf_snapshot(perf: dict[str, Any]) -> dict[str, Any]:
-    lock = perf.get("lock")
-    if lock:
-        lock.acquire()
-    try:
-        counters = json.loads(json.dumps(perf.get("counters") or {}))
-    finally:
-        if lock:
-            lock.release()
-    return {
-        "kind": "code_index_graph_debug_perf",
-        "generated_at": _now_iso(),
-        "counters": counters,
-    }
-
-
-def _perf_tick_payload(perf: dict[str, Any]) -> dict[str, Any]:
-    payload = _perf_snapshot(perf)
-    payload["type"] = "perf:tick"
-    return payload
-
-
-def _auth_page_html() -> str:
-    return """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Graph Auth</title>
-  <style>
-    body { font-family: system-ui, sans-serif; margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f8fafc; color: #111827; }
-    main { width: min(420px, calc(100vw - 32px)); border: 1px solid #d1d5db; background: white; padding: 24px; border-radius: 8px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.12); }
-    h1 { font-size: 20px; margin: 0 0 12px; }
-    p { color: #4b5563; line-height: 1.5; }
-    label { display: block; font-size: 13px; font-weight: 600; margin: 16px 0 6px; }
-    input { width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid #9ca3af; border-radius: 6px; font: inherit; }
-    button { margin-top: 14px; padding: 9px 14px; border: 1px solid #111827; border-radius: 6px; background: #111827; color: white; font: inherit; cursor: pointer; }
-    .status { min-height: 20px; margin-top: 12px; color: #b91c1c; font-size: 13px; }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>Graph server token</h1>
-    <p>Enter the local graph token to create a same-origin browser session.</p>
-    <form id="auth-form">
-      <label for="token">Token</label>
-      <input id="token" name="token" type="password" autocomplete="current-password" autofocus>
-      <button type="submit">Continue</button>
-      <div class="status" id="status"></div>
-    </form>
-  </main>
-  <script>
-    try {
-      const current = new URL(window.location.href);
-      ["token", "graph_token", "access_token"].forEach((name) => current.searchParams.delete(name));
-      window.history.replaceState({}, document.title, `${current.pathname}${current.search}${current.hash}`);
-    } catch (_err) {}
-    document.getElementById("auth-form").addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const token = document.getElementById("token").value.trim();
-      const status = document.getElementById("status");
-      if (!token) {
-        status.textContent = "Token required";
-        return;
-      }
-      const response = await fetch("/api/auth/browser-session", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if (!response.ok) {
-        status.textContent = "Invalid token";
-        return;
-      }
-      window.location.replace("/repo-graph.html");
-    });
-  </script>
-</body>
-</html>"""
-
-
-def _task_request_from_payload(
-    payload: dict[str, Any], args: argparse.Namespace
-) -> dict[str, Any]:
-    provider = str(payload.get("provider") or "").strip().lower()
-    provider_name = agent_providers.provider_display_name(
-        provider,
-        default=(provider.title() if provider else ""),
-    )
-    agent_name = str(
-        payload.get("agent_name")
-        or provider_name
-        or args.agent_name
-        or "Codex"
-    )
-    selected_nodes = _string_list(payload.get("selected_nodes"))
-    if payload.get("node_id"):
-        selected_nodes.extend(
-            node
-            for node in _string_list(payload.get("node_id"))
-            if node not in selected_nodes
-        )
-    selected_paths = _string_list(payload.get("selected_paths"))
-    if payload.get("path"):
-        selected_paths.extend(
-            path
-            for path in _string_list(payload.get("path"))
-            if path not in selected_paths
-        )
-    node = payload.get("node") if isinstance(payload.get("node"), dict) else {}
-    node_path = str(node.get("path") or "").strip()
-    if node_path and node.get("kind") == "file" and node_path not in selected_paths:
-        selected_paths.append(node_path)
-    parent_run_id = str(payload.get("parent_run_id") or "").strip()
-    run_context = (
-        payload.get("run_context")
-        if isinstance(payload.get("run_context"), dict)
-        else None
-    )
-    context = {
-        "selected_paths": selected_paths,
-        "node": node,
-        "source": "graph-server",
-    }
-    if provider:
-        context["provider"] = provider
-    if parent_run_id:
-        context["parent_run_id"] = parent_run_id
-    if run_context is not None:
-        context["run_context"] = run_context
-    blocked_by_run_ids = _string_list(
-        payload.get("blocked_by_run_ids")
-        or payload.get("blocked_by_run_id")
-        or payload.get("blocked_by")
-    )
-    if blocked_by_run_ids:
-        context["blocked_by_run_ids"] = blocked_by_run_ids
-    slice_payload = payload.get("slice") if isinstance(payload.get("slice"), dict) else {}
-    if slice_payload:
-        context["slice"] = slice_payload
-    swarm_config = agent_swarm.normalize_swarm_config(
-        payload,
-        request_provider=provider or None,
-    )
-    execution_strategy = str(swarm_config.get("execution_strategy") or "single")
-    if execution_strategy != "single":
-        context["execution_strategy"] = execution_strategy
-    public_swarm = agent_swarm.public_swarm_config(swarm_config)
-    if public_swarm:
-        context["swarm"] = public_swarm
-    return {
-        "message": str(payload.get("message") or payload.get("prompt") or "").strip(),
-        "provider": provider,
-        "agent_name": agent_name,
-        "selected_nodes": selected_nodes,
-        "selected_paths": selected_paths,
-        "node": node,
-        "parent_run_id": parent_run_id,
-        "run_context": run_context,
-        "blocked_by_run_ids": blocked_by_run_ids,
-        "slice": slice_payload,
-        "execution_strategy": execution_strategy,
-        "swarm": swarm_config,
-        "metadata": context,
-        "preflight_confirmed": bool(payload.get("preflight_confirmed")),
-    }
-
-
-def _build_task_draft(
-    config: cfg_mod.Config,
-    request: dict[str, Any],
-    *,
-    callback_base_url: str,
-) -> dict[str, Any]:
-    try:
-        context_budget = int(os.environ.get("CODE_INDEX_AGENT_CONTEXT_BUDGET") or 1600)
-    except ValueError:
-        context_budget = 1600
-    task: dict[str, Any] = {
-        "kind": "code_index_agent_task_draft",
-        "root": str(config.root),
-        "agent_name": request["agent_name"],
-        "message": request["message"],
-        "selected_nodes": request["selected_nodes"],
-        "selected_paths": request["selected_paths"],
-        "node": request["node"],
-        "callback": {
-            "agent_events_url": f"{callback_base_url}/api/agent-events",
-        },
-        "context_policy": {
-            "initial_budget_tokens": context_budget,
-            "runtime_retrieval": True,
-            "retrieval_handles": {
-                "selected_nodes": request["selected_nodes"],
-                "selected_paths": request["selected_paths"],
-            },
-        },
-    }
-    if request["provider"]:
-        task["provider"] = request["provider"]
-    if request["parent_run_id"]:
-        task["parent_run_id"] = request["parent_run_id"]
-    if request["run_context"] is not None:
-        task["run_context"] = request["run_context"]
-    if request.get("blocked_by_run_ids"):
-        task["blocked_by_run_ids"] = request["blocked_by_run_ids"]
-    if request.get("slice"):
-        task["slice"] = request["slice"]
-    if request.get("execution_strategy") == "swarm":
-        task["execution_strategy"] = "swarm"
-    public_swarm = agent_swarm.public_swarm_config(request.get("swarm"))
-    if public_swarm:
-        task["swarm"] = public_swarm
-    task["graph_context"] = _build_task_graph_context(
-        config,
-        agent_name=request["agent_name"],
-        selected_nodes=request["selected_nodes"],
-        selected_paths=request["selected_paths"],
-        node=request["node"],
-    )
-    return task
-
-
-def _claim_overlaps(
-    claims: list[dict[str, Any]], selected_paths: list[str], *, parent_run_id: str
-) -> list[dict[str, Any]]:
-    selected = {path for path in selected_paths if path}
-    overlaps: list[dict[str, Any]] = []
-    for claim in claims:
-        path = claim.get("file_path")
-        if not path or path not in selected:
-            continue
-        item = dict(claim)
-        item["same_parent_run"] = bool(parent_run_id and claim.get("run_id") == parent_run_id)
-        overlaps.append(item)
-    return overlaps
-
-
-def _care_levels_from_graph_context(graph_context: dict[str, Any]) -> list[str]:
-    levels: list[str] = []
-    for node in graph_context.get("selected_nodes") or []:
-        if isinstance(node, dict) and node.get("care_level"):
-            level = str(node["care_level"])
-            if level not in levels:
-                levels.append(level)
-    return levels
-
-
-def _preflight_from_draft(
-    *,
-    request: dict[str, Any],
-    draft: dict[str, Any],
-    active_claims: list[dict[str, Any]],
-    blocking_runs: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    graph_context = draft.get("graph_context") if isinstance(draft.get("graph_context"), dict) else {}
-    care_levels = _care_levels_from_graph_context(graph_context)
-    overlaps = _claim_overlaps(
-        active_claims,
-        list(request.get("selected_paths") or []),
-        parent_run_id=str(request.get("parent_run_id") or ""),
-    )
-    foreign_overlaps = [
-        claim for claim in overlaps if not claim.get("same_parent_run")
-    ]
-    warnings: list[dict[str, Any]] = []
-    if not request.get("selected_paths"):
-        warnings.append(
-            {
-                "kind": "no_selected_files",
-                "severity": "warning",
-                "message": "No concrete selected files were resolved for this task.",
-            }
-        )
-    if "critical" in care_levels:
-        warnings.append(
-            {
-                "kind": "critical_care",
-                "severity": "warning",
-                "message": "Selected context includes critical-care code.",
-            }
-        )
-    elif "high" in care_levels:
-        warnings.append(
-            {
-                "kind": "high_care",
-                "severity": "info",
-                "message": "Selected context includes high-care shared code.",
-            }
-        )
-    if foreign_overlaps:
-        warnings.append(
-            {
-                "kind": "overlapping_claims",
-                "severity": "warning",
-                "message": (
-                    f"{len(foreign_overlaps)} active file claim(s) overlap this task."
-                ),
-                "claims": foreign_overlaps,
-            }
-        )
-    unresolved_blockers = list(blocking_runs or [])
-    if unresolved_blockers:
-        warnings.append(
-            {
-                "kind": "active_blockers",
-                "severity": "warning",
-                "message": (
-                    f"{len(unresolved_blockers)} blocker run(s) must complete before dispatch."
-                ),
-                "runs": [
-                    {
-                        "run_id": run.get("run_id"),
-                        "agent_name": run.get("agent_name"),
-                        "status": run.get("status"),
-                        "prompt": run.get("prompt"),
-                    }
-                    for run in unresolved_blockers
-                ],
-            }
-        )
-    requires_confirmation = any(
-        warning["kind"] in {"critical_care", "overlapping_claims"}
-        for warning in warnings
-    )
-    return {
-        "status": "blocked" if unresolved_blockers else ("needs_confirmation" if requires_confirmation else "clear"),
-        "can_dispatch": not unresolved_blockers,
-        "requires_confirmation": requires_confirmation,
-        "warnings": warnings,
-        "active_claims": active_claims,
-        "overlapping_claims": overlaps,
-        "blocking_runs": unresolved_blockers,
-        "care_levels": care_levels,
-        "selected_path_count": len(request.get("selected_paths") or []),
-        "selected_node_count": len(request.get("selected_nodes") or []),
-    }
-
-
-def _preflight_required(request: dict[str, Any]) -> bool:
-    return bool(
-        request.get("selected_nodes")
-        or request.get("selected_paths")
-        or request.get("blocked_by_run_ids")
-        or (request.get("node") or {}).get("id")
-        or (request.get("node") or {}).get("path")
-    )
-
-
-def _preflight_hash_subject(
-    *,
-    request: dict[str, Any],
-    draft: dict[str, Any],
-) -> dict[str, Any]:
-    return task_gate.preflight_hash_subject(request=request, draft=draft)
-
-
-def _warning_fingerprint(preflight: dict[str, Any]) -> dict[str, Any]:
-    warnings: list[dict[str, Any]] = []
-    for warning in preflight.get("warnings") or []:
-        if not isinstance(warning, dict):
-            continue
-        claims = []
-        for claim in warning.get("claims") or []:
-            if isinstance(claim, dict):
-                claims.append(
-                    {
-                        "claim_id": claim.get("claim_id"),
-                        "file_path": claim.get("file_path"),
-                        "mode": claim.get("mode"),
-                        "run_id": claim.get("run_id"),
-                        "fence_token": claim.get("fence_token"),
-                    }
-                )
-        warnings.append(
-            {
-                "kind": warning.get("kind"),
-                "severity": warning.get("severity"),
-                "claims": sorted(claims, key=lambda c: _canonical_json(c)),
-            }
-        )
-    return {
-        "requires_confirmation": bool(preflight.get("requires_confirmation")),
-        "warnings": sorted(warnings, key=lambda w: _canonical_json(w)),
-    }
-
-
-def _build_preflight_record(
-    *,
-    secret: str,
-    request: dict[str, Any],
-    draft: dict[str, Any],
-    preflight: dict[str, Any],
-) -> dict[str, Any]:
-    created_at = _now_iso()
-    expires_at = _iso_after(PREFLIGHT_TTL_SECONDS)
-    draft_hash = _sha256_json(_preflight_hash_subject(request=request, draft=draft))
-    warning_hash = _sha256_json(_warning_fingerprint(preflight))
-    nonce = secrets.token_hex(16)
-    signature = hmac.new(
-        secret.encode("utf-8"),
-        f"{draft_hash}:{warning_hash}:{created_at}:{expires_at}:{nonce}".encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    preflight_id = f"pf_{signature[:32]}_{nonce}"
-    return {
-        "preflight_id": preflight_id,
-        "draft_hash": draft_hash,
-        "warning_hash": warning_hash,
-        "created_at": created_at,
-        "expires_at": expires_at,
-    }
-
-
-def _store_preflight(
-    conn,
-    *,
-    record: dict[str, Any],
-    request: dict[str, Any],
-    draft: dict[str, Any],
-    preflight: dict[str, Any],
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO agent_task_preflights(
-            preflight_id, draft_hash, warning_hash, status, run_id,
-            created_at, expires_at, payload_json
-        )
-        VALUES (?, ?, ?, 'active', NULL, ?, ?, ?)
-        """,
-        (
-            record["preflight_id"],
-            record["draft_hash"],
-            record["warning_hash"],
-            record["created_at"],
-            record["expires_at"],
-            _canonical_json(
-                {
-                    "request": request,
-                    "draft": draft,
-                    "preflight": preflight,
-                }
-            ),
-        ),
-    )
-
-
-def _extract_preflight_id(payload: dict[str, Any]) -> str:
-    direct = str(payload.get("preflight_id") or "").strip()
-    if direct:
-        return direct
-    preflight = payload.get("preflight") if isinstance(payload.get("preflight"), dict) else {}
-    return str(preflight.get("preflight_id") or "").strip()
-
-
-def _preflight_rejection(status: int, reason: str) -> tuple[int, dict[str, Any]]:
-    return status, {
-        "ok": False,
-        "error": reason,
-        "preflight_required": True,
-        "kind": "code_index_graph_preflight_rejection",
-    }
-
-
-def _consume_preflight(
-    conn,
-    *,
-    payload: dict[str, Any],
-    request: dict[str, Any],
-    draft: dict[str, Any],
-    preflight: dict[str, Any],
-    run_id: str,
-) -> tuple[int, dict[str, Any]] | None:
-    if not _preflight_required(request):
-        return None
-    preflight_id = _extract_preflight_id(payload)
-    if not preflight_id:
-        return _preflight_rejection(
-            HTTPStatus.PRECONDITION_REQUIRED,
-            "preflight_id is required for graph-scoped agent runs",
-        )
-    row = conn.execute(
-        """
-        SELECT *
-          FROM agent_task_preflights
-         WHERE preflight_id = ?
-         LIMIT 1
-        """,
-        (preflight_id,),
-    ).fetchone()
-    if row is None:
-        return _preflight_rejection(
-            HTTPStatus.PRECONDITION_FAILED,
-            "unknown preflight_id",
-        )
-    status = str(row["status"] or "")
-    if status != "active":
-        http_status = (
-            HTTPStatus.CONFLICT
-            if status == "consumed"
-            else HTTPStatus.PRECONDITION_FAILED
-        )
-        return _preflight_rejection(http_status, f"preflight is {status}")
-    expires_at = _parse_iso(row["expires_at"])
-    if expires_at is not None and expires_at < datetime.now(timezone.utc):
-        conn.execute(
-            "UPDATE agent_task_preflights SET status = 'expired' WHERE preflight_id = ?",
-            (preflight_id,),
-        )
-        return _preflight_rejection(
-            HTTPStatus.PRECONDITION_FAILED,
-            "preflight is expired",
-        )
-    draft_hash = _sha256_json(_preflight_hash_subject(request=request, draft=draft))
-    warning_hash = _sha256_json(_warning_fingerprint(preflight))
-    if not hmac.compare_digest(str(row["draft_hash"]), draft_hash):
-        return _preflight_rejection(
-            HTTPStatus.PRECONDITION_FAILED,
-            "preflight draft does not match current task",
-        )
-    if not hmac.compare_digest(str(row["warning_hash"]), warning_hash):
-        return _preflight_rejection(
-            HTTPStatus.PRECONDITION_FAILED,
-            "preflight warnings changed; run preflight again",
-        )
-    if preflight.get("requires_confirmation") and not request.get("preflight_confirmed"):
-        return _preflight_rejection(
-            HTTPStatus.PRECONDITION_REQUIRED,
-            "preflight confirmation is required",
-        )
-    conn.execute(
-        """
-        UPDATE agent_task_preflights
-           SET status = 'consumed',
-               run_id = ?
-         WHERE preflight_id = ?
-           AND status = 'active'
-        """,
-        (run_id, preflight_id),
-    )
-    return None
-
-
-def _search_sources_for_scope(scope: str) -> tuple[retrieval.SourceKind, ...]:
-    if scope == "files":
-        return (retrieval.SourceKind.FILE_PATH, retrieval.SourceKind.CODE_CHUNK)
-    if scope == "transcripts":
-        return (retrieval.SourceKind.TRANSCRIPT_EVENT,)
-    return retrieval.DEFAULT_SOURCES
-
-
-def _broker_file_result(
-    item: dict[str, Any],
-    *,
-    path_match_also: bool = False,
-) -> dict[str, Any]:
-    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-    source_kind = str(item.get("source_kind") or "")
-    if source_kind == retrieval.SourceKind.FILE_PATH.value:
-        return {
-            "kind": "file_path",
-            "file_path": payload.get("file_path") or item.get("file_path"),
-            "language": payload.get("language"),
-            "parse_status": payload.get("parse_status"),
-            "score": item.get("score"),
-            "snippet": payload.get("text") or payload.get("file_path") or "",
-            "handle": item.get("handle"),
-            "byte_cost": item.get("byte_cost"),
-        }
-    out = {
-        "kind": "file_content",
-        "file_path": payload.get("file_path") or item.get("file_path"),
-        "language": payload.get("language"),
-        "chunk_type": payload.get("chunk_type"),
-        "symbol_name": payload.get("symbol_name"),
-        "symbol_path": payload.get("symbol_path"),
-        "signature": payload.get("signature"),
-        "start_line": payload.get("start_line"),
-        "end_line": payload.get("end_line"),
-        "score": item.get("score"),
-        "snippet": payload.get("text") or "",
-        "handle": item.get("handle"),
-        "byte_cost": item.get("byte_cost"),
-    }
-    if path_match_also:
-        out["path_match_also"] = True
-    return out
-
-
-def _broker_transcript_result(item: dict[str, Any]) -> dict[str, Any]:
-    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-    return {
-        "kind": "transcript_event",
-        "event_pk": payload.get("event_pk"),
-        "run_id": payload.get("run_id"),
-        "agent_name": payload.get("agent_name"),
-        "status": payload.get("status"),
-        "prompt": payload.get("prompt"),
-        "timestamp": payload.get("timestamp"),
-        "event_type": payload.get("event_type"),
-        "file_path": payload.get("file_path") or item.get("file_path"),
-        "symbol_path": payload.get("symbol_path"),
-        "message": payload.get("message") or "",
-        "snippet": payload.get("text") or "",
-        "handle": item.get("handle"),
-        "byte_cost": item.get("byte_cost"),
-    }
-
-
-def _build_search_payload(
-    config: cfg_mod.Config,
-    *,
-    query: str,
-    scope: str,
-    limit: int,
-) -> dict[str, Any]:
-    normalized_scope = scope if scope in {"all", "files", "transcripts"} else "all"
-    safe_limit = max(1, min(50, int(limit or 12)))
-    conn = db_mod.connect(config.db_path)
-    try:
-        db_mod.ensure_schema(conn, config)
-        broker_response = retrieval.retrieve(
-            conn,
-            retrieval.RetrievalRequest(
-                query=query,
-                limit=safe_limit,
-                budget_bytes=20_000,
-                sources=_search_sources_for_scope(normalized_scope),
-                per_source_limit=safe_limit,
-            ),
-        ).to_dict()
-        file_results: list[dict[str, Any]] = []
-        transcript_results: list[dict[str, Any]] = []
-        seen_paths: set[str] = set()
-        for item in broker_response.get("results") or []:
-            if not isinstance(item, dict):
-                continue
-            source_kind = str(item.get("source_kind") or "")
-            if source_kind == retrieval.SourceKind.FILE_PATH.value:
-                result = _broker_file_result(item)
-                path = str(result.get("file_path") or "")
-                if path:
-                    seen_paths.add(path)
-                file_results.append(result)
-            elif source_kind == retrieval.SourceKind.CODE_CHUNK.value:
-                path = str((item.get("payload") or {}).get("file_path") or "")
-                file_results.append(
-                    _broker_file_result(item, path_match_also=path in seen_paths)
-                )
-            elif source_kind == retrieval.SourceKind.TRANSCRIPT_EVENT.value:
-                transcript_results.append(_broker_transcript_result(item))
-    finally:
-        db_mod.close(conn)
-    return {
-        "ok": True,
-        "kind": "code_index_graph_search",
-        "query": query,
-        "scope": normalized_scope,
-        "limit": safe_limit,
-        "files": file_results,
-        "transcripts": transcript_results,
-        "counts": {
-            "files": len(file_results),
-            "transcripts": len(transcript_results),
-        },
-        "retrieval": {
-            "kind": broker_response.get("kind"),
-            "bytes_used": broker_response.get("bytes_used"),
-            "budget_bytes": broker_response.get("budget_bytes"),
-            "candidate_count": broker_response.get("candidate_count"),
-            "truncation_reason": broker_response.get("truncation_reason"),
-        },
-    }
 
 
 def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
+    from code_index.commands.graph_server_utils import _cookie_value, _preflight_secret
+
     preflight_secret = _preflight_secret()
     perf_state = _make_perf_state()
 
@@ -1092,6 +260,7 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                             "ok": True,
                             "kind": "code_index_agent_provider_registry",
                             "providers": agent_providers.provider_registry_payload(),
+                            "runtime": _agent_runtime_payload(),
                         }
                     ),
                 )
@@ -1104,6 +273,12 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                 return
             if route == "/api/search":
                 self._send_search(parsed.query)
+                return
+            if route == "/api/events":
+                self._send_events(parsed.query)
+                return
+            if route == "/api/events/summary":
+                self._send_events_summary()
                 return
             if route == "/notes.json":
                 self._send_bytes(
@@ -1153,6 +328,11 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             if route == "/api/agent-task-preflight":
                 self._preflight_agent_task(payload)
                 return
+            if route.startswith("/api/agent-runs/") and route.endswith("/messages"):
+                parts = [part for part in route.split("/") if part]
+                if len(parts) == 4:
+                    self._send_agent_run_message(parts[2], payload)
+                    return
             if route.startswith("/api/agent-runs/") and route.endswith("/cancel"):
                 parts = [part for part in route.split("/") if part]
                 if len(parts) == 4:
@@ -1244,6 +424,111 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                 str(result.get("scope") or scope or "all"),
             )
             self._send_bytes(HTTPStatus.OK, _json_bytes(result))
+
+        def _send_events(self, query_string: str) -> None:
+            params = parse_qs(query_string, keep_blank_values=False)
+            run_id = str((params.get("run_id") or [""])[0]).strip()
+            event_type = str((params.get("event_type") or [""])[0]).strip().lower()
+            file_path = str((params.get("file_path") or [""])[0]).strip()
+            since = str((params.get("since") or [""])[0]).strip()
+            try:
+                limit = int((params.get("limit") or ["100"])[0])
+            except ValueError:
+                limit = 100
+            safe_limit = max(1, min(500, limit))
+            conn = db_mod.connect(config.db_path)
+            try:
+                db_mod.ensure_schema(conn, config)
+                clauses: list[str] = ["1=1"]
+                sql_params: list[Any] = []
+                if run_id:
+                    clauses.append("r.run_id = ?")
+                    sql_params.append(run_id)
+                if event_type:
+                    clauses.append("e.event_type = ?")
+                    sql_params.append(event_type)
+                if file_path:
+                    clauses.append("e.file_path = ?")
+                    sql_params.append(file_path)
+                if since:
+                    clauses.append("e.timestamp >= ?")
+                    sql_params.append(since)
+                sql = (
+                    "SELECT e.*, r.run_id, r.agent_name, r.status AS run_status "
+                    "FROM agent_events e JOIN agent_runs r ON r.run_pk = e.run_pk "
+                    f"WHERE {' AND '.join(clauses)} "
+                    "ORDER BY e.timestamp DESC, e.event_pk DESC LIMIT ?"
+                )
+                sql_params.append(safe_limit)
+                rows = conn.execute(sql, sql_params).fetchall()
+                events = [agent_activity._row_to_event(row) for row in rows]
+            finally:
+                db_mod.close(conn)
+            self._send_bytes(
+                HTTPStatus.OK,
+                _json_bytes(
+                    {
+                        "ok": True,
+                        "kind": "code_index_agent_events",
+                        "count": len(events),
+                        "events": events,
+                    }
+                ),
+            )
+
+        def _send_events_summary(self) -> None:
+            conn = db_mod.connect(config.db_path)
+            try:
+                db_mod.ensure_schema(conn, config)
+                day_ago = (
+                    datetime.now(timezone.utc) - timedelta(hours=24)
+                ).isoformat(timespec="milliseconds")
+                rows = conn.execute(
+                    """
+                    SELECT event_type, COUNT(*) AS count
+                      FROM agent_events
+                     WHERE timestamp >= ?
+                     GROUP BY event_type
+                     ORDER BY count DESC
+                    """,
+                    (day_ago,),
+                ).fetchall()
+                event_types = {row["event_type"]: int(row["count"]) for row in rows}
+                agent_rows = conn.execute(
+                    """
+                    SELECT agent_name, COUNT(*) AS run_count,
+                           MAX(updated_at) AS last_active
+                      FROM agent_runs
+                     WHERE archived_at IS NULL
+                     GROUP BY agent_name
+                     ORDER BY run_count DESC
+                    """,
+                ).fetchall()
+                agents = [
+                    {
+                        "agent_name": row["agent_name"] or "Agent",
+                        "run_count": int(row["run_count"]),
+                        "last_active": row["last_active"],
+                    }
+                    for row in agent_rows
+                ]
+                derived = agent_activity.agent_derived_file_relationships(
+                    conn, limit=20
+                )
+            finally:
+                db_mod.close(conn)
+            self._send_bytes(
+                HTTPStatus.OK,
+                _json_bytes(
+                    {
+                        "ok": True,
+                        "kind": "code_index_agent_events_summary",
+                        "event_types_24h": event_types,
+                        "agents": agents,
+                        "derived_relationships": derived,
+                    }
+                ),
+            )
 
         def _renew_file_claim(self, claim_id: str, payload: dict[str, Any]) -> None:
             from code_index import lease_manager
@@ -1414,6 +699,8 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                         active_claims=active_claims,
                         blocking_runs=blocking_runs,
                     )
+                    from code_index.commands.graph_server_preflight import _build_preflight_record
+
                     record = _build_preflight_record(
                         secret=preflight_secret,
                         request=request,
@@ -1457,6 +744,275 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                 )
                 return
             self._send_bytes(HTTPStatus.OK, _json_bytes(transcript))
+
+        def _send_agent_run_message(self, run_id: str, payload: dict[str, Any]) -> None:
+            try:
+                request = _task_request_from_payload(payload, args)
+            except ValueError as exc:
+                self._send_bytes(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": str(exc)}),
+                )
+                return
+            if not request["message"]:
+                self._send_bytes(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": "message is required"}),
+                )
+                return
+            with writer_lock(config):
+                conn = db_mod.connect(config.db_path)
+                try:
+                    db_mod.apply_schema(conn)
+                    run = agent_activity.get_run(conn, run_id)
+                    if run is None:
+                        self._send_bytes(
+                            HTTPStatus.NOT_FOUND,
+                            _json_bytes({"error": f"unknown run_id: {run_id}"}),
+                        )
+                        return
+                    if run.get("archived_at"):
+                        self._send_bytes(
+                            HTTPStatus.CONFLICT,
+                            _json_bytes(
+                                {
+                                    "error": "run is archived",
+                                    "run": run,
+                                }
+                            ),
+                        )
+                        return
+                    preflight_draft = _build_task_draft(
+                        config,
+                        request,
+                        callback_base_url=self._callback_base_url(),
+                    )
+                    active_claims = agent_activity.active_file_claims(conn, limit=200)
+                    try:
+                        blocking_runs = agent_activity.blocking_runs(
+                            conn,
+                            run_ids=request.get("blocked_by_run_ids") or [],
+                        )
+                    except ValueError as exc:
+                        self._send_bytes(
+                            HTTPStatus.BAD_REQUEST,
+                            _json_bytes({"error": str(exc)}),
+                        )
+                        return
+                    current_preflight = _preflight_from_draft(
+                        request=request,
+                        draft=preflight_draft,
+                        active_claims=active_claims,
+                        blocking_runs=blocking_runs,
+                    )
+                    rejection = _consume_preflight(
+                        conn,
+                        payload=payload,
+                        request=request,
+                        draft=preflight_draft,
+                        preflight=current_preflight,
+                        run_id=run_id,
+                    )
+                    if rejection is not None:
+                        status, body = rejection
+                        _inc_counter(
+                            perf_state,
+                            "preflight_rejections",
+                            str(body.get("error") or "unknown"),
+                        )
+                        self._send_bytes(status, _json_bytes(body))
+                        return
+                    run_metadata = (
+                        run.get("metadata")
+                        if isinstance(run.get("metadata"), dict)
+                        else {}
+                    )
+                    request = dict(request)
+                    if not payload.get("agent_name"):
+                        request["agent_name"] = run.get("agent_name") or request["agent_name"]
+                    if not request.get("provider") and run_metadata.get("provider"):
+                        request["provider"] = str(run_metadata["provider"]).strip().lower()
+                    selected_nodes = []
+                    for node_id in (request.get("selected_nodes") or []) + (
+                        run.get("selected_nodes") or []
+                    ):
+                        if node_id and node_id not in selected_nodes:
+                            selected_nodes.append(node_id)
+                    selected_paths = []
+                    for path in (
+                        (request.get("selected_paths") or [])
+                        + (run.get("active_files") or [])
+                        + (run_metadata.get("selected_paths") or [])
+                    ):
+                        if path and path not in selected_paths:
+                            selected_paths.append(path)
+                    request["selected_nodes"] = selected_nodes
+                    request["selected_paths"] = selected_paths
+                    if not request.get("node") and selected_paths:
+                        request["node"] = {
+                            "id": f"file:{selected_paths[0]}",
+                            "path": selected_paths[0],
+                            "kind": "file",
+                        }
+                    request["parent_run_id"] = request.get("parent_run_id") or run_id
+                    request["run_context"] = request.get("run_context") or {
+                        "run_id": run_id,
+                        "agent_name": run.get("agent_name") or request["agent_name"],
+                        "status": run.get("status") or "working",
+                    }
+                    request_metadata = dict(request.get("metadata") or {})
+                    if request.get("provider"):
+                        request_metadata["provider"] = request["provider"]
+                    request_metadata["parent_run_id"] = request["parent_run_id"]
+                    request_metadata["run_context"] = request["run_context"]
+                    request_metadata["same_run_message"] = True
+                    request["metadata"] = request_metadata
+                    status_text = str(run.get("status") or "").lower()
+                    if status_text in agent_activity.STOPPED_STATUSES:
+                        conn.execute(
+                            """
+                            UPDATE agent_runs
+                               SET status = 'working',
+                                   ended_at = NULL,
+                                   updated_at = ?
+                             WHERE run_id = ?
+                            """,
+                            (_now_iso(), run_id),
+                        )
+                    event = agent_activity.record_event(
+                        conn,
+                        run_id=run_id,
+                        event_type="status",
+                        file_path=(
+                            request["selected_paths"][0]
+                            if request["selected_paths"]
+                            else request["node"].get("path")
+                        ),
+                        message=request["message"],
+                        payload={
+                            "status": (
+                                "blocked"
+                                if blocking_runs
+                                else "working"
+                            ),
+                            "provider": request["provider"] or None,
+                            "same_run_message": True,
+                            "selected_nodes": request["selected_nodes"],
+                            "selected_paths": request["selected_paths"],
+                            "node": request["node"],
+                            "blocked_by_run_ids": request.get("blocked_by_run_ids")
+                            or [],
+                        },
+                    )
+                    if request["selected_paths"]:
+                        agent_activity.claim_files(
+                            conn,
+                            run_id=run_id,
+                            file_paths=request["selected_paths"],
+                            mode="review",
+                            reason="Graph message selected file.",
+                            metadata={"source": "graph-run-message"},
+                        )
+                    run = agent_activity.get_run(conn, run_id)
+                except ValueError as exc:
+                    http_status = (
+                        HTTPStatus.CONFLICT
+                        if str(exc).startswith("claim conflict:")
+                        else HTTPStatus.BAD_REQUEST
+                    )
+                    self._send_bytes(
+                        http_status,
+                        _json_bytes({"error": str(exc)}),
+                    )
+                    return
+                finally:
+                    db_mod.close(conn)
+            append_event_jsonl(config.root, event)
+            task = _build_task_draft(
+                config,
+                request,
+                callback_base_url=self._callback_base_url(),
+            )
+            task["kind"] = "code_index_agent_run_message"
+            task["run_id"] = run_id
+            task["same_run_message"] = True
+            if isinstance(payload.get("preflight"), dict):
+                task["preflight"] = payload["preflight"]
+            task["context_packet"] = _build_task_context_packet(
+                config,
+                message=request["message"],
+                selected_nodes=request["selected_nodes"],
+                selected_paths=request["selected_paths"],
+            )
+            graph_context = task["graph_context"]
+            if isinstance(task.get("context_packet"), dict):
+                task["context_packet"]["graph_context"] = graph_context
+            collaboration = _build_task_collaboration_packet(
+                config,
+                run_id=run_id,
+                agent_name=request["agent_name"],
+                selected_nodes=request["selected_nodes"],
+                selected_paths=request["selected_paths"],
+                node=request["node"],
+            )
+            task["collaboration"] = collaboration
+            if isinstance(task.get("context_packet"), dict):
+                task["context_packet"]["collaboration"] = collaboration
+            if blocking_runs:
+                dispatch = {
+                    "configured": False,
+                    "status": "blocked",
+                    "reason": "blocked_by_run_ids are not complete",
+                    "blocked_by_run_ids": request.get("blocked_by_run_ids") or [],
+                }
+            else:
+                dispatch = _dispatch_agent_task(config, task)
+            if dispatch.get("configured") and dispatch.get("status") == "sent":
+                with writer_lock(config):
+                    conn = db_mod.connect(config.db_path)
+                    try:
+                        db_mod.apply_schema(conn)
+                        dispatch_event = agent_activity.record_event(
+                            conn,
+                            run_id=run_id,
+                            event_type="status",
+                            message=(
+                                "Message dispatched to local command adapter."
+                                if dispatch.get("transport") == "local-command"
+                                else "Message dispatched to agent webhook."
+                            ),
+                            payload={"status": "working", "dispatch": dispatch},
+                        )
+                        append_event_jsonl(config.root, dispatch_event)
+                    finally:
+                        db_mod.close(conn)
+            conn = db_mod.connect(config.db_path)
+            try:
+                db_mod.ensure_schema(conn, config)
+                run = agent_activity.get_run(conn, run_id)
+                transcript = agent_activity.run_transcript(conn, run_id)
+                activity = run_orchestrator.snapshot(conn, limit=80)
+                board = activity.get("kanban") or agent_activity.kanban_board(
+                    conn, limit=25
+                )
+                board["orchestrator"] = activity.get("orchestrator")
+            finally:
+                db_mod.close(conn)
+            self._send_bytes(
+                HTTPStatus.OK,
+                _json_bytes(
+                    {
+                        "ok": True,
+                        "same_run": True,
+                        "run": run,
+                        "event": event,
+                        "dispatch": dispatch,
+                        "task": task,
+                        "board": board,
+                        "transcript": transcript,
+                    }
+                ),
+            )
 
         def _cancel_agent_run(self, run_id: str) -> None:
             local_cancel_requested = _cancel_local_agent_task(run_id)
@@ -2113,35 +1669,58 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "keep-alive")
             self.end_headers()
-            last_event_pk: int | None = None
+            last_agent_signature: str | None = None
             last_notes_mtime: int | None = None
+            last_edge_signature: str | None = None
             interval = max(0.25, float(getattr(args, "event_interval", 1.0) or 1.0))
-            while True:
-                try:
-                    signature = _state_signature(config)
-                    sent = False
-                    if signature["event_pk"] != last_event_pk:
-                        last_event_pk = signature["event_pk"]
-                        data = json.dumps(_agent_stream_payload(config))
-                        self.wfile.write(f"event: agent\ndata: {data}\n\n".encode())
-                        self.wfile.flush()
-                        sent = True
-                    if signature["notes_mtime"] != last_notes_mtime:
-                        last_notes_mtime = signature["notes_mtime"]
-                        data = json.dumps({"type": "graph", **signature})
-                        self.wfile.write(f"event: graph\ndata: {data}\n\n".encode())
-                        self.wfile.flush()
-                        sent = True
-                    data = json.dumps(_perf_tick_payload(perf_state))
-                    self.wfile.write(f"event: perf:tick\ndata: {data}\n\n".encode())
-                    self.wfile.flush()
-                    sent = True
-                    if not sent:
-                        self.wfile.write(b": heartbeat\n\n")
-                        self.wfile.flush()
-                    time.sleep(interval)
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    _inc_counter(perf_state, "sse_dropped_events")
-                    break
+            stream_conn = db_mod.connect(config.db_path)
+            try:
+                while True:
+                    try:
+                        sent_something = False
+                        signature = _state_signature(config, conn=stream_conn)
+                        if signature["agent_signature"] != last_agent_signature:
+                            last_agent_signature = signature["agent_signature"]
+                            data = json.dumps(_agent_stream_payload(config))
+                            self.wfile.write(f"event: agent\ndata: {data}\n\n".encode())
+                            self.wfile.flush()
+                            sent_something = True
+                        if signature["notes_mtime"] != last_notes_mtime:
+                            last_notes_mtime = signature["notes_mtime"]
+                            data = json.dumps({"type": "graph", **signature})
+                            self.wfile.write(f"event: graph\ndata: {data}\n\n".encode())
+                            self.wfile.flush()
+                            sent_something = True
+                        edge_result = _dynamic_edge_signature(
+                            config, conn=stream_conn, return_relationships=True
+                        )
+                        edge_signature, derived = edge_result  # type: ignore[misc]
+                        if edge_signature != last_edge_signature:
+                            last_edge_signature = edge_signature
+                            data = json.dumps(
+                                {
+                                    "type": "connection:discovered",
+                                    "signature": edge_signature,
+                                    "derived_relationships": derived,
+                                }
+                            )
+                            self.wfile.write(
+                                f"event: connection\ndata: {data}\n\n".encode()
+                            )
+                            self.wfile.flush()
+                            sent_something = True
+                        if sent_something:
+                            data = json.dumps(_perf_tick_payload(perf_state))
+                            self.wfile.write(f"event: perf:tick\ndata: {data}\n\n".encode())
+                            self.wfile.flush()
+                        else:
+                            self.wfile.write(b": heartbeat\n\n")
+                            self.wfile.flush()
+                        time.sleep(interval)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        _inc_counter(perf_state, "sse_dropped_events")
+                        break
+            finally:
+                db_mod.close(stream_conn)
 
     return GraphHandler

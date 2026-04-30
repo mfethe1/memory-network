@@ -383,6 +383,7 @@ function passesFilter(node) {
   const care = careFilter.value;
   if (!showDirs.checked && node.kind === "directory") return false;
   if (!passesLayer(node)) return false;
+  if (node.active_work) return true;
   if (care !== "all" && node.kind === "file" && node.care_level !== care) return false;
   const q = searchInput.value.trim().toLowerCase();
   if (q && !searchableText(node).includes(q)) return false;

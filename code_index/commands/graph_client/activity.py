@@ -252,6 +252,35 @@ async function postAgentTaskToServer(payload) {
   result.preflight = preflight;
   return result;
 }
+async function postAgentMessageToRun(runId, payload) {
+  if (!runId) return postAgentTaskToServer(payload);
+  if (!canPostToGraphServer()) {
+    await copyJson(payload);
+    return {
+      ok: false,
+      copied: true,
+      error: "graph-server is not active"
+    };
+  }
+  const preflight = await preflightAgentTask(payload);
+  const needsConfirmation = preflight && preflight.preflight && preflight.preflight.requires_confirmation;
+  if (needsConfirmation && !payload.preflight_confirmed) {
+    return {
+      ok: false,
+      needs_confirmation: true,
+      error: "preflight confirmation required",
+      preflight
+    };
+  }
+  payload.preflight = preflight.preflight;
+  const response = await fetchGraphPost(`/api/agent-runs/${encodeURIComponent(runId)}/messages`, payload);
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(result.error || `HTTP ${response.status}`);
+  }
+  result.preflight = preflight;
+  return result;
+}
 async function preflightAgentTask(payload) {
   const response = await fetchGraphPost((data.live && data.live.agent_preflight_path) || "/api/agent-task-preflight", payload);
   const result = await response.json();
@@ -330,7 +359,7 @@ async function archiveAgentRun(runId, button) {
     }
   }
 }
-async function showRunTranscript(runId, button) {
+async function showRunTranscript(runId, button, options = {}) {
   if (!runId || !canPostToGraphServer()) return;
   const original = button ? button.textContent : "";
   if (button) {
@@ -350,6 +379,12 @@ async function showRunTranscript(runId, button) {
     activeTab = "summary";
     renderNavigator();
     renderInspector();
+    if (options.focusComposer) {
+      setTimeout(() => {
+        const composer = document.getElementById("run-followup-message");
+        if (composer) composer.focus();
+      }, 0);
+    }
   } catch (err) {
     if (button) {
       button.textContent = err.message || original || "Stream";
@@ -570,6 +605,13 @@ function recomputeTranscriptSummary(transcript) {
 }
 function openRunTranscriptFromResponse(result) {
   if (!result || !result.run) return;
+  if (result.transcript && result.transcript.run) {
+    selectedRunTranscript = result.transcript;
+    activeTab = "summary";
+    renderNavigator();
+    renderInspector();
+    return;
+  }
   const events = sortTranscriptEvents(result.event ? [result.event] : []);
   selectedRunTranscript = {
     run: result.run,

@@ -547,6 +547,62 @@ GRAPH_CSS = r"""
       stroke: var(--focus);
       stroke-width: 3px;
     }
+    .node .agent-work-bubble {
+      cursor: pointer;
+    }
+    .node .agent-work-bubble rect,
+    .node.active .agent-work-bubble rect {
+      fill: rgba(13, 17, 23, 0.94);
+      stroke: var(--focus);
+      stroke-width: 1px;
+      filter: drop-shadow(0 3px 10px rgba(0,0,0,0.36));
+    }
+    .node .agent-work-bubble text {
+      pointer-events: none;
+      paint-order: normal;
+      stroke: none;
+      dominant-baseline: auto;
+    }
+    .node .agent-work-pulse {
+      fill: var(--focus);
+      opacity: 0.95;
+      animation: agent-work-pulse 1.05s ease-in-out infinite;
+      transform-box: fill-box;
+      transform-origin: center;
+    }
+    .node .agent-work-bubble.is-edit .agent-work-pulse {
+      fill: #ffd166;
+    }
+    .node .agent-work-bubble.is-test .agent-work-pulse {
+      fill: #9fd07f;
+    }
+    .node .agent-work-bubble.is-tool .agent-work-pulse,
+    .node .agent-work-bubble.is-navigate .agent-work-pulse {
+      fill: #5dd4c6;
+    }
+    .node .agent-work-name {
+      fill: var(--ink);
+      font-size: 11px;
+      font-weight: 700;
+      animation: agent-work-word 1.35s ease-in-out infinite;
+    }
+    .node .agent-work-message {
+      fill: var(--muted);
+      font-size: 10px;
+    }
+    .node .agent-work-bubble:hover rect,
+    .node .agent-work-bubble:focus rect {
+      stroke: #f0f6fc;
+      fill: #111827;
+    }
+    @keyframes agent-work-pulse {
+      0%, 100% { opacity: 0.45; transform: scale(0.85); }
+      45% { opacity: 1; transform: scale(1.25); }
+    }
+    @keyframes agent-work-word {
+      0%, 100% { fill: var(--ink); }
+      50% { fill: #58a6ff; }
+    }
     .node.dim,
     .edge.dim {
       opacity: 0.12;
@@ -1310,6 +1366,61 @@ GRAPH_CSS = r"""
       color: var(--muted);
       font: 11px/1.3 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
       overflow-wrap: anywhere;
+    }
+    .terminal-run-indicator {
+      min-width: 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--ink);
+      white-space: nowrap;
+    }
+    .terminal-run-indicator strong {
+      min-width: 54px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .terminal-run-indicator em {
+      max-width: min(42vw, 420px);
+      color: var(--muted);
+      font-style: normal;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .terminal-status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--focus);
+      flex: 0 0 auto;
+    }
+    .terminal-run-indicator.is-running .terminal-status-dot {
+      animation: terminal-status-pulse 1.05s ease-in-out infinite;
+    }
+    .terminal-run-indicator.is-terminal .terminal-status-dot {
+      animation: none;
+      background: var(--muted);
+    }
+    .terminal-run-indicator.is-completed .terminal-status-dot {
+      background: #9fd07f;
+    }
+    .terminal-run-indicator.is-failed .terminal-status-dot {
+      background: var(--critical);
+    }
+    .terminal-run-indicator.is-cancelled .terminal-status-dot,
+    .terminal-run-indicator.is-canceled .terminal-status-dot {
+      background: #ffd166;
+    }
+    .terminal-run-facts {
+      color: var(--muted);
+      text-align: right;
+      overflow-wrap: anywhere;
+    }
+    @keyframes terminal-status-pulse {
+      0%, 100% { opacity: 0.42; transform: scale(0.9); }
+      45% { opacity: 1; transform: scale(1.25); }
     }
     .terminal-context {
       max-height: 240px;

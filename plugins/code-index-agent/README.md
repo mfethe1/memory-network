@@ -40,7 +40,17 @@ python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 87
 ```
 
 Open `http://127.0.0.1:8767/repo-graph.html`.
-The launcher checks that configured provider commands are on `PATH`; use
+The launcher initializes `.code_index/index.db` when the target does not have
+one yet. It also injects this source tree into `PYTHONPATH`, so the same
+script can serve another local codebase without installing `code_index` first:
+
+```bash
+python E:/Projects/hackathon/memory-claude/plugins/code-index-agent/scripts/start_graph_server.py \
+  --root E:/Projects/other-repo --port 8767 --provider codex
+```
+
+Use `--refresh-index` to rescan a target that already has an index. The
+launcher checks that configured provider commands are on `PATH`; use
 `--check-only` to validate setup without starting the server.
 
 ## Launch Agent Tasks From The Browser

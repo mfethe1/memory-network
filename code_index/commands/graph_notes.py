@@ -66,6 +66,18 @@ def graph_notes_block(root: Path) -> dict[str, Any]:
     }
 
 
+def _extract_links(text: str) -> list[str]:
+    import re
+    links: list[str] = []
+    for match in re.finditer(r"\[\[([^\]]+)\]\]", text):
+        link = match.group(1).strip().replace("\\", "/")
+        while link.startswith("./"):
+            link = link[2:]
+        if link and link not in links:
+            links.append(link)
+    return links
+
+
 def upsert_note(root: Path, note: dict[str, Any]) -> dict[str, Any]:
     node_id = str(note.get("node_id") or "").strip()
     if not node_id:
@@ -86,6 +98,7 @@ def upsert_note(root: Path, note: dict[str, Any]) -> dict[str, Any]:
             "care_level": note.get("care_level"),
             "note": value,
             "summary": note.get("summary"),
+            "links": _extract_links(value),
             "updated_at": now,
         }
     else:

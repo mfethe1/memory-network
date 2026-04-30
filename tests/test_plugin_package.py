@@ -29,6 +29,17 @@ def _load_installer_module():
     return module
 
 
+def _load_launcher_module():
+    import importlib.util
+
+    script = PLUGIN_ROOT / "scripts" / "start_graph_server.py"
+    spec = importlib.util.spec_from_file_location("start_graph_server", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_code_index_agent_plugin_manifest_is_publishable():
     manifest = _load_json(PLUGIN_ROOT / ".codex-plugin" / "plugin.json")
     manifest_text = json.dumps(manifest)
@@ -86,7 +97,40 @@ def test_code_index_agent_graph_launcher_help():
     assert result.returncode == 0
     assert "--agent-command" in result.stdout
     assert "--provider" in result.stdout
+    assert "--ensure-index" in result.stdout
     assert "graph-server" in result.stdout
+
+
+def test_code_index_agent_graph_launcher_prepares_external_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    module = _load_launcher_module()
+    calls: list[tuple[list[str], str, dict[str, str]]] = []
+
+    def fake_check_call(command, *, cwd, env):
+        calls.append((command, cwd, env))
+
+    monkeypatch.setattr(module.subprocess, "check_call", fake_check_call)
+    env = module._with_source_pythonpath({})
+
+    module._ensure_index(tmp_path, env)
+
+    assert calls
+    command, cwd, call_env = calls[0]
+    assert command[:3] == [sys.executable, "-m", "code_index"]
+    assert command[3] == "init"
+    assert str(tmp_path) in command
+    assert cwd == str(tmp_path)
+    assert str(ROOT) in call_env["PYTHONPATH"]
+
+    calls.clear()
+    (tmp_path / ".code_index").mkdir()
+    (tmp_path / ".code_index" / "index.db").write_text("", encoding="utf-8")
+    module._ensure_index(tmp_path, env)
+    assert calls == []
+
+    module._ensure_index(tmp_path, env, refresh=True)
+    assert calls[0][0][3:6] == ["update", "--root", str(tmp_path)]
 
 
 def test_code_index_agent_graph_launcher_preflights_agent_command():
@@ -150,6 +194,9 @@ def test_code_index_agent_installer_writes_repo_local_config(tmp_path: Path):
     config = _load_json(tmp_path / ".code_index" / "agent-plugin.json")
     assert config["graph_server"]["provider"] == "codex"
     assert "--provider codex" in config["commands"]["start_graph"]
+    assert "--ensure-index" in config["commands"]["start_graph"]
+    assert config["mcp_server"]["env"]["PYTHONPATH"] == str(ROOT)
+    assert mcp["mcpServers"]["code-index"]["env"]["PYTHONPATH"] == str(ROOT)
     demo_task = _load_json(tmp_path / ".code_index" / "demo-agent-task.json")
     assert (
         demo_task["callback"]["agent_events_url"]

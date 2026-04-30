@@ -76,6 +76,11 @@ python plugins/code-index-agent/scripts/install_plugin.py --root . --provider co
 python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 8767 \
   --provider codex
 
+# Point the same launcher at any local codebase. If the target has no
+# .code_index/index.db yet, the launcher initializes it before serving the graph.
+python E:/Projects/hackathon/memory-claude/plugins/code-index-agent/scripts/start_graph_server.py \
+  --root E:/Projects/other-repo --port 8767 --provider codex
+
 # Import a SCIP semantic index exported as JSON
 python -m code_index import-scip --json-index index.scip.json
 
@@ -227,7 +232,11 @@ config, starter scripts, and a demo task:
 python plugins/code-index-agent/scripts/install_plugin.py --root . --provider codex --json
 ```
 
-The launcher validates configured provider executables before starting unless
+The launcher accepts any local directory via `--root`. It injects this
+`code_index` source tree into `PYTHONPATH`, initializes a missing
+`.code_index/index.db`, and then starts `graph-server`; pass `--refresh-index`
+when you explicitly want an existing target index rescanned before launch. The
+launcher validates configured provider executables before starting unless
 `--skip-provider-check` is set. The current value/readiness assessment is in
 `docs/agent-plugin-assessment.md`.
 

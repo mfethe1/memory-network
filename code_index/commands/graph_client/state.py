@@ -122,6 +122,9 @@ let terminalLastSignature = "";
 let debugSnapshot = null;
 let debugPerfTick = null;
 let debugFetchError = "";
+let agentProvidersRefreshPromise = null;
+let agentProvidersLastFetchMs = 0;
+let agentProviderConfigSignature = "";
 let clientMetrics = {
   hydrate_count: 0,
   render_count: 0,
@@ -168,6 +171,7 @@ function hydrateData(nextData, options = {}) {
   }]));
   data = nextData;
   lastGraphSignature = graphDataSignature(data);
+  agentProviderConfigSignature = agentProvidersSignatureFromLive((data && data.live) || {});
   mergeServerNotes();
   repoSubtitle.textContent =
     `${data.summary.file_count} files, ${data.summary.relation_edge_count} relation edges, generated ${data.generated_at}`;
@@ -219,9 +223,13 @@ function escapeHtml(value) {
 function graphDataSignature(payload) {
   const summary = payload.summary || {};
   const activity = payload.activity || {};
+  const live = payload.live || {};
   const recentEvent = (activity.agent_events || [])[0] || {};
   const recentEdit = (summary.recent_edits || [])[0] || {};
   const activeRuns = (((payload.agent || {}).active_runs || []).concat((payload.agent || {}).recent_runs || [])).map(run => `${run.run_id}:${run.status}:${run.updated_at}`).join("|");
+  const activeClaims = (((payload.agent || {}).active_claims || []).map(claim =>
+    `${claim.claim_id || ""}:${claim.run_id || ""}:${claim.file_path || ""}:${claim.status || ""}:${claim.updated_at || ""}`
+  )).join("|");
   const notes = Object.values((payload.notes && payload.notes.by_node) || {})
     .map(note => `${note.node_id || note.path}:${note.updated_at || ""}`)
     .sort()
@@ -233,6 +241,8 @@ function graphDataSignature(payload) {
     recentEvent: recentEvent.event_pk,
     recentEdit: `${recentEdit.file_path || ""}:${recentEdit.timestamp || ""}:${recentEdit.change_type || ""}`,
     activeRuns,
+    activeClaims,
+    agentProviders: agentProvidersSignatureFromLive(live),
     notes
   });
 }

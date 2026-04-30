@@ -105,35 +105,89 @@ function renderTerminalRows(transcript) {
   const run = (transcript && transcript.run) || {};
   const events = transcriptStreamEvents(transcript);
   if (!events.length) {
-    return `<p class="empty">No terminal output recorded for this run yet.</p>`;
+    return terminalEmptyHtml(transcript);
   }
-  return events.map(event => renderStreamEvent(event, run)).join("") + `<div class="terminal-cursor" aria-hidden="true"></div>`;
+  return events.map(event => renderStreamEvent(event, run)).join("") + terminalCursorHtml(transcript);
 }
 function terminalSignature(transcript) {
   return transcriptStreamEvents(transcript).map(eventIdentity).join("|");
+}
+function runIsTerminal(run) {
+  return isTerminalStatus((run && run.status) || "");
+}
+function runStatusClass(run) {
+  const status = String((run && run.status) || "working").toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+  return status || "working";
+}
+function runActivityLabel(event, run) {
+  const status = String((run && run.status) || "").toLowerCase();
+  if (status === "completed") return "Done";
+  if (status === "failed") return "Failed";
+  if (status === "cancelled" || status === "canceled") return "Cancelled";
+  if (status === "blocked") return "Blocked";
+  if (status === "review" || status === "needs_review" || status === "needs-review") return "Review";
+  const type = String((event && event.event_type) || "").toLowerCase();
+  const labels = {
+    edit: "Editing",
+    read: "Reading",
+    test: "Testing",
+    tool: "Using tool",
+    navigate: "Scanning",
+    decision: "Thinking",
+    task: "Starting",
+    status: "Working"
+  };
+  return labels[type] || "Working";
+}
+function runActivitySummary(transcript) {
+  const run = (transcript && transcript.run) || {};
+  const events = (transcript && transcript.events) || [];
+  const lastEvent = events.length ? events[events.length - 1] : null;
+  const statusClass = runStatusClass(run);
+  return {
+    label: runActivityLabel(lastEvent, run),
+    message: (lastEvent && lastEvent.message) || run.prompt || "",
+    className: `${runIsTerminal(run) ? "is-terminal" : "is-running"} is-${statusClass}`
+  };
+}
+function terminalCursorHtml(transcript) {
+  const run = (transcript && transcript.run) || {};
+  return runIsTerminal(run) ? "" : `<div class="terminal-cursor" aria-hidden="true"></div>`;
+}
+function terminalEmptyHtml(transcript) {
+  return `<p class="empty">No terminal output recorded for this run yet.</p>${terminalCursorHtml(transcript)}`;
 }
 function appendTerminalRows(body, transcript) {
   const run = (transcript && transcript.run) || {};
   const events = transcriptStreamEvents(transcript);
   if (!events.length) {
-    body.innerHTML = `<p class="empty">No terminal output recorded for this run yet.</p>`;
+    body.innerHTML = terminalEmptyHtml(transcript);
     return;
   }
-  if (!body.querySelector(".terminal-cursor")) {
-    body.innerHTML = `<div class="terminal-cursor" aria-hidden="true"></div>`;
+  if (body.querySelector(".empty")) {
+    body.innerHTML = "";
+  }
+  let cursor = body.querySelector(".terminal-cursor");
+  if (!cursor && !runIsTerminal(run)) {
+    body.insertAdjacentHTML("beforeend", terminalCursorHtml(transcript));
+    cursor = body.querySelector(".terminal-cursor");
   }
   const existing = new Set(
     [...body.querySelectorAll(".stream-line")]
       .map(line => line.dataset.eventKey)
       .filter(Boolean)
   );
-  let cursor = body.querySelector(".terminal-cursor");
   events.forEach(event => {
     const key = eventIdentity(event);
     if (existing.has(key)) return;
-    cursor.insertAdjacentHTML("beforebegin", renderStreamEvent(event, run));
+    if (cursor) {
+      cursor.insertAdjacentHTML("beforebegin", renderStreamEvent(event, run));
+    } else {
+      body.insertAdjacentHTML("beforeend", renderStreamEvent(event, run));
+    }
     existing.add(key);
   });
+  if (runIsTerminal(run) && cursor) cursor.remove();
 }
 function scrollTerminalToBottom() {
   const body = document.getElementById("terminal-stream-body");
@@ -163,11 +217,24 @@ function syncTerminalPanel(forceScroll = false) {
     appendTerminalRows(body, selectedRunTranscript);
     terminalLastSignature = signature;
   }
+  syncTerminalRunIndicator(selectedRunTranscript);
   updateRunTranscriptHeader(selectedRunTranscript);
   if (shouldStayPinned && (forceScroll || signature !== previousSignature)) {
     scrollTerminalToBottom();
   }
   return true;
+}
+function syncTerminalRunIndicator(transcript) {
+  const activity = runActivitySummary(transcript);
+  const bar = document.querySelector(".terminal-bar");
+  if (bar) bar.className = `terminal-bar ${activity.className}`;
+  const indicator = document.querySelector(".terminal-run-indicator");
+  if (!indicator) return;
+  indicator.className = `terminal-run-indicator ${activity.className}`;
+  const label = indicator.querySelector("strong");
+  const message = indicator.querySelector("em");
+  if (label) label.textContent = activity.label;
+  if (message) message.textContent = activity.message;
 }
 function bindSubmitOnEnter(messageBox, sendButton) {
   if (!messageBox || !sendButton) return;
@@ -206,6 +273,7 @@ function renderRunTranscript(transcript) {
     files.length ? `${files.length} file(s)` : "no files",
     decisions.length ? `${decisions.length} decision(s)` : null
   ].filter(Boolean).join(" · ");
+  const activity = runActivitySummary(transcript);
   const eventRows = events.length
     ? events.map(event => {
         const target = event.file_path || event.symbol_path || "";
@@ -221,9 +289,13 @@ function renderRunTranscript(transcript) {
     : `<p class="empty">No transcript events recorded.</p>`;
   return `
     <div class="terminal-shell">
-      <div class="terminal-bar">
-        <span>${escapeHtml(defaultProviderForRun(run).toUpperCase())}</span>
-        <span>${escapeHtml(runFacts)}</span>
+      <div class="terminal-bar ${activity.className}">
+        <span class="terminal-run-indicator ${activity.className}">
+          <span class="terminal-status-dot" aria-hidden="true"></span>
+          <strong>${escapeHtml(activity.label)}</strong>
+          <em>${escapeHtml(activity.message)}</em>
+        </span>
+        <span class="terminal-run-facts">${escapeHtml(defaultProviderForRun(run).toUpperCase())} · ${escapeHtml(runFacts)}</span>
       </div>
       <details class="terminal-context" open>
         <summary>${escapeHtml(run.run_id || "run")} · ${escapeHtml(run.started_at || "")}</summary>
@@ -239,7 +311,7 @@ function renderRunTranscript(transcript) {
           <label>
             <span>Target</span>
             <select id="run-followup-provider">
-              ${providerOptionHtml("codex")}
+              ${providerOptionHtml(defaultProviderForRun(run))}
             </select>
           </label>
           <label>
@@ -250,10 +322,11 @@ function renderRunTranscript(transcript) {
             </select>
           </label>
         </div>
-        <textarea class="note-box chat-box terminal-input" id="run-followup-message" placeholder="$ Send a follow-up with this run's files and graph context."></textarea>
+        <textarea class="note-box chat-box terminal-input" id="run-followup-message" placeholder="$ Send another message to this run."></textarea>
         <div class="actions">
-          <button class="small-button primary-action" id="send-run-followup" type="button"${canPostToGraphServer() ? "" : " disabled aria-disabled=\"true\""}>Send follow-up</button>
+          <button class="small-button primary-action" id="send-run-followup" type="button"${canPostToGraphServer() ? "" : " disabled aria-disabled=\"true\""}>Send message</button>
           <span class="inline-status" id="run-followup-status">${canPostToGraphServer() ? "Ready" : "Graph server required"}</span>
+          <span class="inline-status runtime-status" id="run-runtime-status">${escapeHtml(renderAgentRuntimeStatus())}</span>
         </div>
       </div>
     </div>
@@ -1055,6 +1128,7 @@ function renderChat(node) {
           <button class="small-button primary-action" id="send-agent-message" type="button"${disabled}>Send to agent</button>
           <button class="small-button" id="copy-agent-message-json" type="button">Copy JSON</button>
           <span class="inline-status" id="agent-chat-status">${canSubmit ? "Ready" : "Graph server required"}</span>
+          <span class="inline-status runtime-status" id="agent-runtime-status">${escapeHtml(renderAgentRuntimeStatus())}</span>
         </div>
       </div>
       <div class="section selected-context-section">
@@ -1078,6 +1152,25 @@ function renderChat(node) {
     </div>
   `;
 }
+function agentProvidersSignatureFromLive(live) {
+  const providers = Array.isArray(live && live.agent_providers) ? live.agent_providers : [];
+  const runtime = (live && live.agent_runtime) || {};
+  const dispatch = runtime.dispatch || {};
+  const providerParts = providers.map(provider => [
+    provider.id || "",
+    provider.display_name || "",
+    provider.command_preset || "",
+    (provider.capabilities || []).join(",")
+  ].join(":")).join("|");
+  const dispatchParts = [
+    dispatch.webhook_configured ? "webhook" : "",
+    dispatch.local_command_configured ? "local" : "",
+    dispatch.provider || "",
+    dispatch.custom_command_configured ? "custom" : "",
+    (dispatch.provider_presets || []).join(",")
+  ].join(":");
+  return `${providerParts}::${dispatchParts}`;
+}
 function agentProviderRegistry() {
   const live = (data && data.live) || (typeof graph !== "undefined" && graph && graph.live) || {};
   const providers = Array.isArray(live.agent_providers) ? live.agent_providers : [];
@@ -1089,6 +1182,12 @@ function agentProviderRegistry() {
 function providerOptionHtml(selected) {
   const selectedValue = String(selected || "codex");
   const providers = agentProviderRegistry().slice();
+  if (selectedValue && !providers.some(provider => String(provider.id || "") === selectedValue)) {
+    const label = selectedValue === "opencode"
+      ? "OpenCode"
+      : selectedValue.replace(/(^|[-_\s])([a-z])/g, (_match, prefix, char) => `${prefix}${char.toUpperCase()}`);
+    providers.push({ id: selectedValue, display_name: label });
+  }
   if (!providers.some(provider => String(provider.id || "") === "configured")) {
     providers.push({ id: "configured", display_name: "Configured adapter" });
   }
@@ -1100,6 +1199,81 @@ function providerOptionHtml(selected) {
     return `<option value="${escapeHtml(id)}"${selectedAttr}>${escapeHtml(label)}</option>`;
   }).join("");
 }
+function agentRuntimeConfig() {
+  const live = (data && data.live) || {};
+  return (live.agent_runtime && typeof live.agent_runtime === "object") ? live.agent_runtime : {};
+}
+function renderAgentRuntimeStatus() {
+  if (!canPostToGraphServer()) return "Static graph";
+  const runtime = agentRuntimeConfig();
+  const dispatch = (runtime && runtime.dispatch) || {};
+  if (dispatch.webhook_configured) return "Webhook dispatch ready";
+  if (dispatch.custom_command_configured) return "Custom command ready";
+  if (dispatch.local_command_configured) {
+    const provider = dispatch.provider ? agentNameForProvider(dispatch.provider) : "Local command";
+    return `${provider} dispatch ready`;
+  }
+  const presets = Array.isArray(dispatch.provider_presets) ? dispatch.provider_presets : [];
+  if (presets.length) return "Provider presets ready";
+  return "Queue only";
+}
+function applyAgentProvidersPayload(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  data.live = data.live || {};
+  const before = agentProvidersSignatureFromLive(data.live);
+  if (Array.isArray(payload.providers)) {
+    data.live.agent_providers = payload.providers;
+  }
+  if (payload.runtime && typeof payload.runtime === "object") {
+    data.live.agent_runtime = payload.runtime;
+  }
+  const after = agentProvidersSignatureFromLive(data.live);
+  agentProviderConfigSignature = after;
+  return before !== after;
+}
+function syncProviderSelectOptions(selectEl, selected = null) {
+  if (!selectEl) return;
+  const previous = selected == null ? selectEl.value : selected;
+  selectEl.innerHTML = providerOptionHtml(previous);
+  if ([...selectEl.options].some(option => option.value === previous)) {
+    selectEl.value = previous;
+  }
+}
+function syncAgentProviderControls() {
+  syncProviderSelectOptions(document.getElementById("agent-provider"));
+  syncProviderSelectOptions(document.getElementById("run-followup-provider"));
+  const statusText = renderAgentRuntimeStatus();
+  document.querySelectorAll(".runtime-status").forEach(item => {
+    item.textContent = statusText;
+  });
+}
+async function refreshAgentProviders(options = {}) {
+  if (!canPostToGraphServer()) return false;
+  const force = !!options.force;
+  const now = Date.now();
+  if (!force && now - agentProvidersLastFetchMs < 3000) return false;
+  if (agentProvidersRefreshPromise) return agentProvidersRefreshPromise;
+  agentProvidersLastFetchMs = now;
+  const path = (data.live && data.live.agent_providers_path) || "/api/agent-providers";
+  agentProvidersRefreshPromise = (async () => {
+    try {
+      const response = await fetchGraphGet(path, {
+        headers: { "Accept": "application/json" },
+        cache: "no-store"
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      const changed = applyAgentProvidersPayload(payload);
+      if (changed) syncAgentProviderControls();
+      return changed;
+    } catch (_err) {
+      return false;
+    } finally {
+      agentProvidersRefreshPromise = null;
+    }
+  })();
+  return agentProvidersRefreshPromise;
+}
 function agentNameForProvider(provider) {
   const providerId = String(provider || "").toLowerCase();
   const registryProvider = agentProviderRegistry().find(item =>
@@ -1107,6 +1281,10 @@ function agentNameForProvider(provider) {
   );
   if (registryProvider && registryProvider.display_name) {
     return String(registryProvider.display_name);
+  }
+  if (providerId === "opencode") return "OpenCode";
+  if (providerId) {
+    return providerId.replace(/(^|[-_\s])([a-z])/g, (_match, prefix, char) => `${prefix}${char.toUpperCase()}`);
   }
   return (data.agent && data.agent.name) || "Agent";
 }
@@ -1127,6 +1305,7 @@ function syncProviderForExecutionStrategy(providerSelect, strategySelect) {
 function defaultProviderForRun(run) {
   const metadata = (run && run.metadata) || {};
   const provider = String(metadata.provider || "").toLowerCase();
+  if (provider) return provider;
   if (provider === "kimi" || String((run && run.agent_name) || "").toLowerCase().includes("kimi")) return "kimi";
   if (provider === "claude" || String((run && run.agent_name) || "").toLowerCase().includes("claude")) return "claude";
   return "codex";
@@ -1164,6 +1343,7 @@ function bindRunTranscriptPanel(transcript) {
   const sendButton = document.getElementById("send-run-followup");
   const status = document.getElementById("run-followup-status");
   if (providerSelect) providerSelect.value = defaultProviderForRun((transcript && transcript.run) || {});
+  refreshAgentProviders();
   if (strategySelect) {
     strategySelect.addEventListener("change", () => {
       syncProviderForExecutionStrategy(providerSelect, strategySelect);
@@ -1181,23 +1361,31 @@ function bindRunTranscriptPanel(transcript) {
     }
     const provider = providerFromChatControl(providerSelect);
     const executionStrategy = executionStrategyFromControl(strategySelect);
+    const run = (transcript && transcript.run) || {};
+    const runProvider = defaultProviderForRun(run);
+    const taskAgentName = provider === runProvider
+      ? (run.agent_name || agentNameForProvider(provider))
+      : agentNameForProvider(provider);
     sendButton.disabled = true;
     status.textContent = "Sending";
     try {
       const payload = applyPreflightConfirmation(agentTaskPayloadFromRun(transcript, message, {
         provider,
-        agentName: agentNameForProvider(provider),
+        agentName: taskAgentName,
         executionStrategy
       }), sendButton);
-      const result = await postAgentTaskToServer(payload);
+      const runId = ((transcript && transcript.run) || {}).run_id || "";
+      const result = await postAgentMessageToRun(runId, payload);
       if (handlePreflightResult(result, sendButton, status, "Send anyway")) return;
       if (result.ok) {
-        status.textContent = result.dispatch && result.dispatch.configured
-          ? `Started ${result.run.run_id.slice(0, 8)}`
-          : `Queued ${result.run.run_id.slice(0, 8)}`;
+        status.textContent = result.same_run
+          ? `Sent ${result.run.run_id.slice(0, 8)}`
+          : (result.dispatch && result.dispatch.configured
+            ? `Started ${result.run.run_id.slice(0, 8)}`
+            : `Queued ${result.run.run_id.slice(0, 8)}`);
         applyAgentRunResponse(result);
         messageBox.value = "";
-        resetPreflightButton(sendButton, "Send follow-up");
+        resetPreflightButton(sendButton, "Send message");
         openRunTranscriptFromResponse(result);
       }
     } catch (err) {
@@ -1214,6 +1402,7 @@ function bindChatPanel(node) {
   const sendButton = document.getElementById("send-agent-message");
   const copyButton = document.getElementById("copy-agent-message-json");
   const status = document.getElementById("agent-chat-status");
+  refreshAgentProviders();
   document.querySelectorAll("[data-chat-node]").forEach(button => {
     button.addEventListener("click", () => {
       const target = nodeById.get(button.dataset.chatNode);

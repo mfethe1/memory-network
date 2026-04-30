@@ -23,7 +23,7 @@ from code_index.commands import agent_adapter_cmd
 from code_index.commands import mcp_tool_impl
 from code_index.commands.graph_notes import graph_notes_block
 from code_index.commands.graph_server_cmd import _agent_stream_payload, _make_handler
-from code_index.commands.graph_server_http import _make_perf_state, _observe_latency
+from code_index.commands.graph_server_perf import _make_perf_state, _observe_latency
 
 
 def _request_json(
@@ -267,6 +267,8 @@ def test_graph_server_agent_providers_endpoint_returns_registry(
         providers = _request_json(f"{base_url}/api/agent-providers")
         assert providers["ok"] is True
         assert providers["kind"] == "code_index_agent_provider_registry"
+        assert providers["runtime"]["dispatch"]["local_command_configured"] is False
+        assert "codex" in providers["runtime"]["dispatch"]["provider_presets"]
         providers_by_id = {
             provider["id"]: provider for provider in providers["providers"]
         }
@@ -318,6 +320,7 @@ def test_graph_server_serves_graph_and_records_notes_and_events(
         assert graph["live"]["agent_preflight_path"] == "/api/agent-task-preflight"
         assert graph["live"]["agent_runs_path"] == "/api/agent-runs"
         assert graph["live"]["agent_providers_path"] == "/api/agent-providers"
+        assert graph["live"]["agent_runtime"]["dispatch"]["provider_presets"]
         live_providers_by_id = {
             provider["id"]: provider for provider in graph["live"]["agent_providers"]
         }
@@ -327,6 +330,7 @@ def test_graph_server_serves_graph_and_records_notes_and_events(
 
         providers = _request_json(f"{base_url}/api/agent-providers")
         assert providers["kind"] == "code_index_agent_provider_registry"
+        assert providers["runtime"]["dispatch"]["provider_presets"]
         providers_by_id = {
             provider["id"]: provider for provider in providers["providers"]
         }
@@ -1120,6 +1124,92 @@ def test_graph_server_get_agent_run_returns_transcript(
         assert transcript["decisions"][0]["payload"]["status"] == "accepted"
         assert transcript["summary"]["decision_count"] == 1
         assert _request_get_status(f"{base_url}/api/agent-runs/unknown-run") == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_graph_server_posts_followup_message_to_existing_agent_run(
+    tmp_path: Path, capsys, monkeypatch
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    conn = db_mod.connect(config.db_path)
+    try:
+        db_mod.apply_schema(conn)
+        run = agent_activity.start_run(
+            conn,
+            agent_name="OpenCode",
+            prompt="Initial agent turn.",
+            selected_nodes=["file:pkg/a.py"],
+            metadata={"provider": "opencode", "selected_paths": ["pkg/a.py"]},
+            status="completed",
+        )
+    finally:
+        db_mod.close(conn)
+
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        payload = _preflight_task_payload(
+            base_url,
+            {
+                "provider": "opencode",
+                "agent_name": "OpenCode",
+                "message": "Continue in this same session.",
+                "selected_nodes": ["file:pkg/a.py"],
+                "selected_paths": ["pkg/a.py"],
+                "node": {"id": "file:pkg/a.py", "path": "pkg/a.py", "kind": "file"},
+                "parent_run_id": run["run_id"],
+            },
+        )
+        result = _request_json(
+            f"{base_url}/api/agent-runs/{run['run_id']}/messages",
+            payload,
+        )
+        assert result["ok"] is True
+        assert result["same_run"] is True
+        assert result["run"]["run_id"] == run["run_id"]
+        assert result["run"]["status"] == "working"
+        assert result["event"]["run_id"] == run["run_id"]
+        assert result["event"]["message"] == "Continue in this same session."
+        assert result["task"]["run_id"] == run["run_id"]
+        assert result["task"]["kind"] == "code_index_agent_run_message"
+        assert result["task"]["provider"] == "opencode"
+
+        transcript = _request_json(f"{base_url}/api/agent-runs/{run['run_id']}")
+        assert transcript["run"]["run_id"] == run["run_id"]
+        assert transcript["run"]["status"] == "working"
+        assert [event["message"] for event in transcript["events"]] == [
+            "Continue in this same session."
+        ]
+        assert transcript["active_files"] == ["pkg/a.py"]
+
+        conn = db_mod.connect(config.db_path)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0]
+        finally:
+            db_mod.close(conn)
+        assert count == 1
     finally:
         server.shutdown()
         server.server_close()

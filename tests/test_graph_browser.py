@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from code_index import agent_activity
+from code_index import agent_providers
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
 from code_index.cli import main
@@ -196,6 +197,10 @@ def test_graph_ui_submits_agent_task_and_streams_output(
             page.locator("#agent-runs", has_text="No queued or active runs.").wait_for(
                 timeout=10000
             )
+            page.locator(".terminal-run-indicator.is-completed", has_text="Done").wait_for(
+                timeout=10000
+            )
+            assert page.locator(".terminal-cursor").count() == 0
             page.locator("#agent-runs .past-runs summary", has_text="Past runs (1)").click()
             page.locator("#agent-runs").get_by_role("button", name="Stream").first.wait_for(
                 timeout=10000
@@ -215,6 +220,163 @@ def test_graph_ui_submits_agent_task_and_streams_output(
                 timeout=10000
             )
             page.locator("#agent-runs .past-runs").wait_for(state="detached", timeout=10000)
+        finally:
+            browser.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
+def test_graph_ui_shows_provider_neutral_agent_work_bubbles(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    conn = db_mod.connect(config.db_path)
+    try:
+        db_mod.apply_schema(conn)
+        run = agent_activity.start_run(
+            conn,
+            agent_name="OpenCode",
+            prompt="Refactor active file.",
+            selected_nodes=["file:pkg/a.py"],
+            metadata={"provider": "opencode", "selected_paths": ["pkg/a.py"]},
+            status="working",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="edit",
+            file_path="pkg/a.py",
+            message="Updating helper contract",
+            payload={"status": "working"},
+        )
+    finally:
+        db_mod.close(conn)
+
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=0.1,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(headless=True)
+        except Exception as exc:  # pragma: no cover - local browser install guard.
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            pytest.skip(f"Playwright Chromium is not installed or not launchable: {exc}")
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 760})
+            page.goto(f"{base_url}/repo-graph.html", wait_until="domcontentloaded")
+            bubble = page.locator(
+                f'.agent-work-bubble[data-run-details="{run["run_id"]}"]'
+            ).first
+            bubble.wait_for(timeout=10000)
+            bubble.locator(".agent-work-pulse").wait_for(timeout=10000)
+            assert "OpenCode" in (bubble.text_content() or "")
+            assert "Editing" in (bubble.text_content() or "")
+            assert "Updating helper contract" in (bubble.text_content() or "")
+            bubble.click()
+            page.locator("#terminal-stream-body").wait_for(timeout=10000)
+            page.locator("#run-followup-message").wait_for(timeout=10000)
+            assert page.locator("#run-followup-provider").input_value() == "opencode"
+            assert page.locator("#node-kind").text_content() == "Agent Run"
+        finally:
+            browser.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
+def test_graph_ui_refreshes_provider_registry_without_touching_runs(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=0.1,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(headless=True)
+        except Exception as exc:  # pragma: no cover - local browser install guard.
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            pytest.skip(f"Playwright Chromium is not installed or not launchable: {exc}")
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 760})
+            page.goto(f"{base_url}/repo-graph.html", wait_until="domcontentloaded")
+            page.get_by_role("button", name="Chat").click()
+            assert page.locator('#agent-provider option[value="opencode"]').count() == 0
+
+            original_payload = agent_providers.provider_registry_payload
+
+            def provider_registry_with_opencode() -> list[dict[str, object]]:
+                return original_payload() + [
+                    {
+                        "id": "opencode",
+                        "display_name": "OpenCode",
+                        "command_preset": "opencode run {provider_prompt_file}",
+                        "capabilities": ["command_preset", "provider_prompt_file"],
+                    }
+                ]
+
+            monkeypatch.setattr(
+                agent_providers,
+                "provider_registry_payload",
+                provider_registry_with_opencode,
+            )
+
+            page.evaluate("() => refreshAgentProviders({ force: true })")
+
+            page.locator('#agent-provider option[value="opencode"]').wait_for(
+                state="attached",
+                timeout=10000,
+            )
+            assert "Provider presets ready" in (
+                page.locator("#agent-runtime-status").text_content() or ""
+            )
+            conn = db_mod.connect(config.db_path)
+            try:
+                run_count = conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0]
+            finally:
+                db_mod.close(conn)
+            assert run_count == 0
         finally:
             browser.close()
             server.shutdown()

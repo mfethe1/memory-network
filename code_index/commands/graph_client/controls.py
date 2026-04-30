@@ -387,6 +387,7 @@ async function refreshGraphData(options = {}) {
       return;
     }
     hydrateData(nextData, { preserveSelection: true });
+    syncAgentProviderControls();
     seedMissingPositions();
     tickSimulation(silent ? 45 : 120);
     renderGraph();
@@ -427,6 +428,7 @@ function bindEventStream() {
     eventSource = new EventSource((data.live && data.live.events_path) || "/events");
     eventSource.onopen = () => {
       liveConnected = true;
+      refreshAgentProviders({ force: true });
       updateAgentHeader();
     };
     eventSource.onerror = () => {

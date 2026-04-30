@@ -19,10 +19,25 @@ for _parent in Path(__file__).resolve().parents:
 from code_index import agent_providers  # noqa: E402
 
 
-MCP_SERVER = {
-    "command": "python",
-    "args": ["-m", "code_index", "mcp-serve", "--root", "."],
-}
+def _source_root() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "code_index").is_dir():
+            return parent
+    return Path(__file__).resolve().parents[3]
+
+
+def _mcp_server(root: Path | None = None) -> dict[str, Any]:
+    server: dict[str, Any] = {
+        "command": "python",
+        "args": ["-m", "code_index", "mcp-serve", "--root", "."],
+    }
+    source_root = _source_root()
+    if root is None or source_root != root.resolve():
+        server["env"] = {"PYTHONPATH": str(source_root)}
+    return server
+
+
+MCP_SERVER = _mcp_server()
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,12 +97,13 @@ def install(
     }
 
     mcp_path = root / ".mcp.json"
-    mcp_payload = _merge_mcp(_read_json(mcp_path), MCP_SERVER)
+    mcp_server = _mcp_server(root)
+    mcp_payload = _merge_mcp(_read_json(mcp_path), mcp_server)
     _write_json(mcp_path, mcp_payload, report, dry_run=dry_run)
 
     if write_claude_settings:
         claude_path = root / ".claude" / "settings.local.json"
-        claude_payload = _merge_mcp(_read_json(claude_path), MCP_SERVER)
+        claude_payload = _merge_mcp(_read_json(claude_path), mcp_server)
         _write_json(claude_path, claude_payload, report, dry_run=dry_run)
 
     plugin_config_path = root / ".code_index" / "agent-plugin.json"
@@ -100,6 +116,7 @@ def install(
         host,
         "--port",
         str(port),
+        "--ensure-index",
     ]
     if agent_command:
         launcher_args.extend(["--agent-command", agent_command])
@@ -107,7 +124,7 @@ def install(
         launcher_args.extend(["--provider", provider])
     plugin_config = {
         "name": "code-index-agent",
-        "mcp_server": MCP_SERVER,
+        "mcp_server": mcp_server,
         "graph_server": {
             "host": host,
             "port": str(port),

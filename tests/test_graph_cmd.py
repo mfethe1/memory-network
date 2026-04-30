@@ -225,7 +225,10 @@ def test_graph_html_writes_standalone_view(
     assert "send-agent-message" in html
     assert "agent-provider" in html
     assert "agent_providers" in html
+    assert "agent_runtime" in html
     assert "agentProviderRegistry()" in html
+    assert "refreshAgentProviders" in html
+    assert "renderAgentRuntimeStatus" in html
     assert 'providerOptionHtml("codex")' in html
     registry_fallback = html[
         html.index("function agentProviderRegistry()"):

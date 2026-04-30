@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -643,6 +644,118 @@ def _edge_kind(counter: Counter) -> str:
     return sorted(counter.items(), key=lambda item: (-item[1], item[0]))[0][0]
 
 
+def _collect_agent_derived_edges(
+    conn: sqlite3.Connection,
+    file_nodes_by_path: dict[str, dict[str, Any]],
+    edge_id: int,
+    *,
+    limit: int = 50,
+) -> tuple[list[dict[str, Any]], int]:
+    """Add agent-derived navigation edges (co-occurrence within runs)."""
+    edges: list[dict[str, Any]] = []
+    relationships = agent_activity.agent_derived_file_relationships(
+        conn, limit=limit, min_observations=1
+    )
+    for rel in relationships:
+        src = str(rel.get("source") or "")
+        dst = str(rel.get("target") or "")
+        if src not in file_nodes_by_path or dst not in file_nodes_by_path:
+            continue
+        edge_id += 1
+        edges.append(
+            {
+                "id": f"edge:{edge_id}",
+                "source": _node_id("file", src),
+                "target": _node_id("file", dst),
+                "kind": "agent_derived",
+                "weight": max(1, int(rel.get("observations") or 1)),
+                "label": "agent_derived",
+                "detail": {
+                    "confidence": rel.get("confidence"),
+                    "observations": rel.get("observations"),
+                    "rationale": rel.get("rationale"),
+                },
+            }
+        )
+    return edges, edge_id
+
+
+def _collect_note_edges(
+    root: Path,
+    file_nodes_by_path: dict[str, dict[str, Any]],
+    edge_id: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Add note-link edges from Obsidian-style [[file_path]] references."""
+    edges: list[dict[str, Any]] = []
+    notes_payload = graph_notes_block(root)
+    for note in notes_payload.get("items") or []:
+        if not isinstance(note, dict):
+            continue
+        node_id = str(note.get("node_id") or "")
+        path = str(note.get("path") or "").strip()
+        if not path:
+            # Try to extract path from node_id like "file:path/to/file.py"
+            if node_id.startswith("file:"):
+                path = node_id[5:]
+        if path not in file_nodes_by_path:
+            continue
+        note_text = str(note.get("note") or "")
+        # Find [[...]] links
+        for match in re.finditer(r"\[\[([^\]]+)\]\]", note_text):
+            link_path = match.group(1).strip()
+            link_path = _normal_path(link_path)
+            if link_path and link_path in file_nodes_by_path and link_path != path:
+                edge_id += 1
+                edges.append(
+                    {
+                        "id": f"edge:{edge_id}",
+                        "source": _node_id("file", path),
+                        "target": _node_id("file", link_path),
+                        "kind": "note_link",
+                        "weight": 1,
+                        "label": "note_link",
+                        "detail": {"note_ref": True},
+                    }
+                )
+    return edges, edge_id
+
+
+def _collect_activity_proximity_edges(
+    conn: sqlite3.Connection,
+    file_nodes_by_path: dict[str, dict[str, Any]],
+    edge_id: int,
+    *,
+    limit: int = 8,
+) -> tuple[list[dict[str, Any]], int]:
+    """Add temporal proximity edges from recent overlapping file activity."""
+    edges: list[dict[str, Any]] = []
+    recent_activity = agent_activity.recent_file_activity(conn, limit=limit)
+    for item in recent_activity:
+        path = str(item.get("file_path") or "")
+        if path not in file_nodes_by_path:
+            continue
+        for overlap in item.get("overlapping_files") or []:
+            other_path = str(overlap.get("file_path") or "")
+            if other_path not in file_nodes_by_path or other_path == path:
+                continue
+            edge_id += 1
+            edges.append(
+                {
+                    "id": f"edge:{edge_id}",
+                    "source": _node_id("file", path),
+                    "target": _node_id("file", other_path),
+                    "kind": "activity_link",
+                    "weight": 1,
+                    "label": "activity_link",
+                    "detail": {
+                        "shared_run_id": overlap.get("run_id"),
+                        "agent_name": overlap.get("agent_name"),
+                    },
+                }
+            )
+    return edges, edge_id
+
+
 def build_graph(
     conn: sqlite3.Connection,
     root: Path,
@@ -939,6 +1052,19 @@ def build_graph(
             }
         )
 
+    derived_edges, edge_id = _collect_agent_derived_edges(
+        conn, file_nodes_by_path, edge_id, limit=50
+    )
+    edges.extend(derived_edges)
+    note_edges, edge_id = _collect_note_edges(
+        root, file_nodes_by_path, edge_id
+    )
+    edges.extend(note_edges)
+    activity_edges, edge_id = _collect_activity_proximity_edges(
+        conn, file_nodes_by_path, edge_id, limit=8
+    )
+    edges.extend(activity_edges)
+
     all_nodes = dir_nodes + nodes
     care_counts = Counter(n["care_level"] for n in nodes)
     language_counts = Counter(n["language"] for n in nodes)
@@ -1039,6 +1165,9 @@ def build_graph(
                 "inherits": "source file inherits from symbols in target file",
                 "implements": "source file implements symbols in target file",
                 "overrides": "source file overrides symbols in target file",
+                "agent_derived": "agents navigated between these files within runs",
+                "note_link": "user note explicitly links these files",
+                "activity_link": "files touched together in recent agent activity",
             },
         },
         "nodes": all_nodes,
