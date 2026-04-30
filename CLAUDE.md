@@ -46,3 +46,13 @@ Expected CLI surface:
 - `code_index tests`
 - `code_index doctor`
 - `code_index mcp-serve`
+- `code_index branch {list,diff,files,impact,compare}` — git branch comparison with index cross-reference
+- `code_index workspace {init,add,remove,list,status,query,graph}` — multi-repo workspace management
+
+Architecture notes:
+- Command modules can export `register_parser(subparsers)` so `cli_parser.py` stays
+  slim as the surface grows. `branch_cmd` and `workspace_cmd` already use this
+  pattern; older commands will migrate over time.
+- The graph HTTP server uses a lightweight `Router`/`Route` abstraction
+  (`commands/graph_server_router.py`) instead of long if/else chains. Routes match
+  method + path with `{param}` extraction and are resolved in registration order.

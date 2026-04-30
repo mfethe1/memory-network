@@ -57,6 +57,7 @@ from code_index.commands.graph_server_state import (
     _record_user_note_event,
     _state_signature,
 )
+from code_index.commands.graph_server_router import Router
 from code_index.commands.graph_server_utils import (
     GRAPH_SESSION_COOKIE,
     GRAPH_SESSION_MAX_AGE_SECONDS,
@@ -216,9 +217,202 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                 return None
             return payload
 
-        def do_GET(self) -> None:  # noqa: N802
+        @classmethod
+        def _build_router(cls) -> Router:
+            """Assemble route table. Called once during class creation."""
+            router = Router()
+            # Public (auth optional)
+            router.get("/api/auth/browser-session", cls._route_browser_session)
+            # HTML / JSON assets
+            router.get("/", cls._route_repo_graph_html)
+            router.get("/repo-graph.html", cls._route_repo_graph_html)
+            router.get("/repo-graph.json", cls._route_repo_graph_json)
+            router.get("/notes.json", cls._route_notes_json)
+            # Debug / meta
+            router.get("/api/debug", cls._route_debug)
+            router.get("/api/debug/perf", cls._route_debug_perf)
+            router.get("/api/agent-providers", cls._route_agent_providers)
+            router.get("/api/agent-board", cls._route_agent_board)
+            router.get("/api/file-claims", cls._route_file_claims)
+            router.get("/api/search", cls._route_search)
+            router.get("/api/events", cls._route_events)
+            router.get("/api/events/summary", cls._route_events_summary)
+            router.get("/api/agent-runs/{run_id}", cls._route_agent_run_get)
+            router.get("/events", cls._route_stream_events)
+            # POST routes
+            router.post("/api/auth/browser-session", cls._route_browser_session_post)
+            router.post("/api/notes", cls._route_notes_post)
+            router.post("/api/agent-runs", cls._route_agent_runs_post)
+            router.post("/api/agent-task-preflight", cls._route_preflight_post)
+            router.post("/api/agent-runs/{run_id}/messages", cls._route_agent_run_message)
+            router.post("/api/agent-runs/{run_id}/cancel", cls._route_agent_run_cancel)
+            router.post("/api/agent-runs/{run_id}/archive", cls._route_agent_run_archive)
+            router.post("/api/agent-events", cls._route_agent_events_post)
+            router.post("/api/file-claims/{claim_id}/renew", cls._route_claim_renew)
+            router.post("/api/file-claims/{claim_id}/release", cls._route_claim_release)
+            router.post("/api/file-claims", cls._route_file_claims_post)
+            return router
+
+        # ------------------------------------------------------------------
+        # Route handlers (thin wrappers around existing methods)
+        # ------------------------------------------------------------------
+
+        def _route_repo_graph_html(self, _params: dict[str, str]) -> None:
+            payload = _build_payload(config, args)
+            self._send_bytes(
+                HTTPStatus.OK,
+                render_html(payload).encode("utf-8"),
+                "text/html",
+            )
+
+        def _route_repo_graph_json(self, _params: dict[str, str]) -> None:
+            self._send_bytes(HTTPStatus.OK, _json_bytes(_build_payload(config, args)))
+
+        def _route_notes_json(self, _params: dict[str, str]) -> None:
+            self._send_bytes(
+                HTTPStatus.OK,
+                _json_bytes(graph_notes_block(config.root)),
+            )
+
+        def _route_debug(self, _params: dict[str, str]) -> None:
+            perf = _perf_snapshot(perf_state)
+            self._send_bytes(
+                HTTPStatus.OK,
+                _json_bytes(_build_debug_payload(config, args, perf)),
+            )
+
+        def _route_debug_perf(self, _params: dict[str, str]) -> None:
+            self._send_bytes(
+                HTTPStatus.OK,
+                _json_bytes(_perf_snapshot(perf_state)),
+            )
+
+        def _route_agent_providers(self, _params: dict[str, str]) -> None:
+            self._send_bytes(
+                HTTPStatus.OK,
+                _json_bytes(
+                    {
+                        "ok": True,
+                        "kind": "code_index_agent_provider_registry",
+                        "providers": agent_providers.provider_registry_payload(),
+                        "runtime": _agent_runtime_payload(),
+                    }
+                ),
+            )
+
+        def _route_agent_board(self, _params: dict[str, str]) -> None:
+            self._send_agent_board()
+
+        def _route_file_claims(self, _params: dict[str, str]) -> None:
+            self._send_file_claims()
+
+        def _route_search(self, _params: dict[str, str]) -> None:
+            parsed = urlparse(self.path)
+            self._send_search(parsed.query)
+
+        def _route_events(self, _params: dict[str, str]) -> None:
+            parsed = urlparse(self.path)
+            self._send_events(parsed.query)
+
+        def _route_events_summary(self, _params: dict[str, str]) -> None:
+            self._send_events_summary()
+
+        def _route_agent_run_get(self, params: dict[str, str]) -> None:
+            self._send_agent_run(params["run_id"])
+
+        def _route_stream_events(self, _params: dict[str, str]) -> None:
+            self._stream_events()
+
+        def _route_browser_session(self, _params: dict[str, str]) -> None:
+            # GET variant falls through to 404; auth page is handled in do_GET
+            self._send_bytes(
+                HTTPStatus.NOT_FOUND,
+                _json_bytes({"error": "not found"}),
+            )
+
+        def _route_browser_session_post(self, _params: dict[str, str]) -> None:
+            self._create_browser_session()
+
+        def _route_notes_post(self, _params: dict[str, str]) -> None:
+            payload = self._read_json_payload()
+            if payload is None:
+                return
+            try:
+                saved = upsert_note(config.root, payload)
+                _record_user_note_event(config, payload, saved)
+            except ValueError as exc:
+                self._send_bytes(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": str(exc)}),
+                )
+                return
+            self._send_bytes(HTTPStatus.OK, _json_bytes({"ok": True, "note": saved}))
+
+        def _route_agent_runs_post(self, _params: dict[str, str]) -> None:
+            payload = self._read_json_payload()
+            if payload is None:
+                return
+            self._start_agent_run(payload)
+
+        def _route_preflight_post(self, _params: dict[str, str]) -> None:
+            payload = self._read_json_payload()
+            if payload is None:
+                return
+            self._preflight_agent_task(payload)
+
+        def _route_agent_run_message(self, params: dict[str, str]) -> None:
+            payload = self._read_json_payload()
+            if payload is None:
+                return
+            self._send_agent_run_message(params["run_id"], payload)
+
+        def _route_agent_run_cancel(self, params: dict[str, str]) -> None:
+            payload = self._read_json_payload()
+            if payload is None:
+                return
+            self._cancel_agent_run(params["run_id"])
+
+        def _route_agent_run_archive(self, params: dict[str, str]) -> None:
+            payload = self._read_json_payload()
+            if payload is None:
+                return
+            self._archive_agent_run(params["run_id"])
+
+        def _route_agent_events_post(self, _params: dict[str, str]) -> None:
+            payload = self._read_json_payload()
+            if payload is None:
+                return
+            self._record_agent_event(payload)
+
+        def _route_claim_renew(self, params: dict[str, str]) -> None:
+            payload = self._read_json_payload()
+            if payload is None:
+                return
+            self._renew_file_claim(params["claim_id"], payload)
+
+        def _route_claim_release(self, params: dict[str, str]) -> None:
+            payload = self._read_json_payload()
+            if payload is None:
+                return
+            self._release_file_claim(params["claim_id"], payload)
+
+        def _route_file_claims_post(self, _params: dict[str, str]) -> None:
+            payload = self._read_json_payload()
+            if payload is None:
+                return
+            self._manage_file_claims(payload)
+
+        # ------------------------------------------------------------------
+        # Dispatch
+        # ------------------------------------------------------------------
+
+        def _dispatch(self, method: str) -> None:
             parsed = urlparse(self.path)
             route = parsed.path
+            # Public auth endpoint bypasses authorization
+            if route == "/api/auth/browser-session" and method == "POST":
+                self._create_browser_session()
+                return
             if not self._is_authorized():
                 if route in {"/", "/repo-graph.html"} and os.environ.get(
                     GRAPH_TOKEN_ENV_VAR, ""
@@ -228,141 +422,21 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                 _inc_counter(perf_state, "auth_failures", route or "unknown")
                 self._send_unauthorized()
                 return
-            if route in {"/", "/repo-graph.html"}:
-                payload = _build_payload(config, args)
+            resolved = self._router.resolve(method, route)
+            if resolved is None:
                 self._send_bytes(
-                    HTTPStatus.OK,
-                    render_html(payload).encode("utf-8"),
-                    "text/html",
+                    HTTPStatus.NOT_FOUND,
+                    _json_bytes({"error": "not found", "path": route}),
                 )
                 return
-            if route == "/repo-graph.json":
-                self._send_bytes(HTTPStatus.OK, _json_bytes(_build_payload(config, args)))
-                return
-            if route == "/api/debug":
-                perf = _perf_snapshot(perf_state)
-                self._send_bytes(
-                    HTTPStatus.OK,
-                    _json_bytes(_build_debug_payload(config, args, perf)),
-                )
-                return
-            if route == "/api/debug/perf":
-                self._send_bytes(
-                    HTTPStatus.OK,
-                    _json_bytes(_perf_snapshot(perf_state)),
-                )
-                return
-            if route == "/api/agent-providers":
-                self._send_bytes(
-                    HTTPStatus.OK,
-                    _json_bytes(
-                        {
-                            "ok": True,
-                            "kind": "code_index_agent_provider_registry",
-                            "providers": agent_providers.provider_registry_payload(),
-                            "runtime": _agent_runtime_payload(),
-                        }
-                    ),
-                )
-                return
-            if route == "/api/agent-board":
-                self._send_agent_board()
-                return
-            if route == "/api/file-claims":
-                self._send_file_claims()
-                return
-            if route == "/api/search":
-                self._send_search(parsed.query)
-                return
-            if route == "/api/events":
-                self._send_events(parsed.query)
-                return
-            if route == "/api/events/summary":
-                self._send_events_summary()
-                return
-            if route == "/notes.json":
-                self._send_bytes(
-                    HTTPStatus.OK,
-                    _json_bytes(graph_notes_block(config.root)),
-                )
-                return
-            if route.startswith("/api/agent-runs/"):
-                parts = [part for part in route.split("/") if part]
-                if len(parts) == 3:
-                    self._send_agent_run(parts[2])
-                    return
-            if route == "/events":
-                self._stream_events()
-                return
-            self._send_bytes(
-                HTTPStatus.NOT_FOUND,
-                _json_bytes({"error": "not found", "path": route}),
-            )
+            handler, params = resolved
+            handler(self, params)
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._dispatch("GET")
 
         def do_POST(self) -> None:  # noqa: N802
-            parsed = urlparse(self.path)
-            route = parsed.path
-            if route == "/api/auth/browser-session":
-                self._create_browser_session()
-                return
-            if not self._authorized():
-                return
-            payload = self._read_json_payload()
-            if payload is None:
-                return
-            if route == "/api/notes":
-                try:
-                    saved = upsert_note(config.root, payload)
-                    _record_user_note_event(config, payload, saved)
-                except ValueError as exc:
-                    self._send_bytes(
-                        HTTPStatus.BAD_REQUEST,
-                        _json_bytes({"error": str(exc)}),
-                    )
-                    return
-                self._send_bytes(HTTPStatus.OK, _json_bytes({"ok": True, "note": saved}))
-                return
-            if route == "/api/agent-runs":
-                self._start_agent_run(payload)
-                return
-            if route == "/api/agent-task-preflight":
-                self._preflight_agent_task(payload)
-                return
-            if route.startswith("/api/agent-runs/") and route.endswith("/messages"):
-                parts = [part for part in route.split("/") if part]
-                if len(parts) == 4:
-                    self._send_agent_run_message(parts[2], payload)
-                    return
-            if route.startswith("/api/agent-runs/") and route.endswith("/cancel"):
-                parts = [part for part in route.split("/") if part]
-                if len(parts) == 4:
-                    self._cancel_agent_run(parts[2])
-                    return
-            if route.startswith("/api/agent-runs/") and route.endswith("/archive"):
-                parts = [part for part in route.split("/") if part]
-                if len(parts) == 4:
-                    self._archive_agent_run(parts[2])
-                    return
-            if route == "/api/agent-events":
-                self._record_agent_event(payload)
-                return
-            if route.startswith("/api/file-claims/") and route.endswith("/renew"):
-                parts = [part for part in route.split("/") if part]
-                if len(parts) == 4:
-                    self._renew_file_claim(parts[2], payload)
-                    return
-            if route.startswith("/api/file-claims/") and route.endswith("/release"):
-                parts = [part for part in route.split("/") if part]
-                if len(parts) == 4:
-                    self._release_file_claim(parts[2], payload)
-                    return
-            if route == "/api/file-claims":
-                self._manage_file_claims(payload)
-                return
-            self._send_bytes(
-                HTTPStatus.NOT_FOUND,
-                _json_bytes({"error": "not found", "path": route}),
-            )
+            self._dispatch("POST")
 
         def _send_file_claims(self) -> None:
             conn = db_mod.connect(config.db_path)
@@ -1723,4 +1797,5 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             finally:
                 db_mod.close(stream_conn)
 
+    GraphHandler._router = GraphHandler._build_router()
     return GraphHandler
