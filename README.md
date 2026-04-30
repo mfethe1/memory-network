@@ -13,7 +13,8 @@ Project-memory summary: [`CLAUDE.md`](CLAUDE.md).
 First working vertical slice. `init`, `update`, `grep`, `symbol`, `query`,
 `doctor`, `watch`, `impact`, `tests`, `repo-map`, `embed`, `similar`,
 `ask`, `context`, `graph`, `graph-server`, `agent`, `agent-adapter`,
-`mcp-serve`, `import-scip`, and `scip-python-index` are live. See
+`mcp-serve`, `import-scip`, `scip-python-index`, `branch`, and
+`workspace` are live. See
 [Known Limitations](#known-limitations).
 
 ## Quick start
@@ -93,6 +94,21 @@ python -m code_index grep "BM25" --ignore-case
 
 # Coverage + optional-dep report
 python -m code_index doctor
+
+# Compare git branches: list, diff, files changed, impact analysis
+python -m code_index branch list
+python -m code_index branch diff main --json
+python -m code_index branch files main
+python -m code_index branch impact main --max-depth 3
+python -m code_index branch compare main feature-x
+
+# Manage multi-repo workspaces
+python -m code_index workspace init --name my-monorepo
+python -m code_index workspace add ../other-repo --name backend
+python -m code_index workspace list
+python -m code_index workspace status
+python -m code_index workspace query "auth middleware" --limit 10
+python -m code_index workspace graph --limit 50
 ```
 
 Every subcommand accepts `--json` for machine-readable output. The JSON shape
@@ -245,6 +261,7 @@ launcher validates configured provider executables before starting unless
 ```
           ┌──────────────────────────────────────────────────────┐
           │          cli.py dispatch + cli_parser.py (argparse)  │
+          │  Dynamic: modules export `register_parser(subparsers)` │
           └──────────────────────────────────────────────────────┘
                                     │
           ┌──────────────────────────────────────────────────────┐
@@ -264,9 +281,11 @@ launcher validates configured provider executables before starting unless
               grep    → search/lexical.py  (ripgrep ▸ Python re fallback)
               symbol  → search/symbol_search.py (symbols/occurrences join)
               query   → search/fts.py  (weighted BM25 over chunks_fts)
-              graph   → commands/graph_cmd.py + graph_model/html/server helpers
-              agent   → agent_activity.py + commands/agent_cmd.py
-              mcp     → retrieval_broker/code_graph/graph_context/agent_activity tools + codeindex://graph resources
+              graph        → commands/graph_cmd.py + graph_model/html/server helpers
+              agent        → agent_activity.py + commands/agent_cmd.py
+              mcp          → retrieval_broker/code_graph/graph_context/agent_activity tools + codeindex://graph resources
+              branch       → commands/branch_cmd.py (git cross-reference + impact)
+              workspace    → commands/workspace_cmd.py (multi-repo FTS/query/graph)
 ```
 
 ### Parser priority
@@ -356,7 +375,7 @@ schema repair, and CLI smoke. Tests run with the Python stdlib only.
 ```
 code_index/           core package
   cli.py              thin CLI dispatch
-  cli_parser.py       argparse command surface
+  cli_parser.py       argparse command surface (dynamic `register_parser` pattern)
   pipeline.py         shared init/update/watch pipeline
   db.py               sqlite + schema application
   schema.sql          full schema (spine + projection + reserved)

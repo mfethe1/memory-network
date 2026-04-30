@@ -13,6 +13,7 @@ from code_index.commands import (
     agent_adapter_cmd,
     agent_cmd,
     ask_cmd,
+    branch_cmd,
     context_cmd,
     doctor_cmd,
     embed_cmd,
@@ -35,6 +36,7 @@ from code_index.commands import (
     tests_cmd,
     update_cmd,
     watch_cmd,
+    workspace_cmd,
 )
 
 
@@ -782,5 +784,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_mcp.set_defaults(func=mcp_serve_cmd.run)
+
+    # New commands registered via module-level register_parser for cleaner
+    # expansion. Existing commands above will migrate to this pattern over time.
+    branch_cmd.register_parser(subparsers)
+    workspace_cmd.register_parser(subparsers)
 
     return parser
