@@ -17,10 +17,19 @@ from typing import Any
 
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "canceled"}
+TERMINAL_STATUS_VALUES = tuple(sorted(TERMINAL_STATUSES))
+TERMINAL_STATUS_PLACEHOLDERS = ",".join("?" for _ in TERMINAL_STATUS_VALUES)
+REVIEW_STATUSES = {"review", "needs_review", "needs-review"}
+STOPPED_STATUSES = TERMINAL_STATUSES | REVIEW_STATUSES
+STOPPED_STATUS_VALUES = tuple(sorted(STOPPED_STATUSES))
+STOPPED_STATUS_PLACEHOLDERS = ",".join("?" for _ in STOPPED_STATUS_VALUES)
 WORK_EVENT_TYPES = {"read", "edit", "test", "tool", "navigate", "note"}
 SUGGESTION_EVENT_TYPE = "suggestion"
 DEFAULT_ACTIVE_RUN_MAX_AGE_SECONDS = 4 * 60 * 60
 DEFAULT_CLAIM_TTL_SECONDS = 30 * 60
+VALID_CLAIM_MODES = {"read", "edit", "review", "test", "exclusive"}
+WRITE_CLAIM_MODES = ("edit", "exclusive")
+WRITE_CLAIM_PLACEHOLDERS = ",".join("?" for _ in WRITE_CLAIM_MODES)
 EVENT_CLAIM_MODES = {
     "read": "read",
     "navigate": "read",
@@ -28,6 +37,15 @@ EVENT_CLAIM_MODES = {
     "test": "test",
 }
 EXCLUSIVE_CLAIM_MODES = {"edit", "exclusive"}
+CLAIM_ROW_SELECT = """
+        SELECT c.*,
+               r.run_id,
+               r.agent_name,
+               r.status AS run_status
+          FROM agent_file_claims c
+          JOIN agent_runs r ON r.run_pk = c.run_pk
+"""
+CLAIM_ROW_ORDER = "c.updated_at DESC, c.claim_pk DESC"
 
 
 def _now_iso() -> str:
@@ -77,6 +95,12 @@ def _json_dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _public_claim_metadata(value: Any) -> Any:
+    from code_index import lease_manager
+
+    return lease_manager.redact_public_metadata(value)
+
+
 def _string_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -89,6 +113,19 @@ def _string_list(value: Any) -> list[str]:
         text = str(item).strip()
         if text and text not in out:
             out.append(text)
+    return out
+
+
+def _non_terminal_run_clause(alias: str = "r") -> str:
+    return (
+        f"LOWER(COALESCE({alias}.status, 'working')) "
+        f"NOT IN ({STOPPED_STATUS_PLACEHOLDERS})"
+    )
+
+
+def _claim_check(ok: bool, reason: str, message: str, **extra: Any) -> dict[str, Any]:
+    out = {"ok": ok, "reason": reason, "message": message}
+    out.update(extra)
     return out
 
 
@@ -171,38 +208,49 @@ def _row_to_claim(row: sqlite3.Row) -> dict[str, Any]:
         "heartbeat_at": row["heartbeat_at"],
         "expires_at": row["expires_at"],
         "released_at": row["released_at"],
+        "metadata": _public_claim_metadata(_json_loads(row["metadata_json"], {})),
+    }
+
+
+def _claim_rows(
+    conn: sqlite3.Connection,
+    clauses: list[str],
+    params: list[Any] | tuple[Any, ...],
+    *,
+    order_by: str | None = CLAIM_ROW_ORDER,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    sql = CLAIM_ROW_SELECT + f"         WHERE {' AND '.join(clauses)}"
+    query_params = list(params)
+    if order_by:
+        sql += f"\n         ORDER BY {order_by}"
+    if limit is not None:
+        sql += "\n         LIMIT ?"
+        query_params.append(max(0, int(limit)))
+    return conn.execute(sql, query_params).fetchall()
+
+
+def _row_to_blocker_run(row: sqlite3.Row, prefix: str) -> dict[str, Any]:
+    return {
+        "blocker_pk": int(row["blocker_pk"]),
+        "run_id": row[f"{prefix}_run_id"],
+        "agent_name": row[f"{prefix}_agent_name"] or "Agent",
+        "run_status": row[f"{prefix}_run_status"] or "working",
+        "prompt": row[f"{prefix}_prompt"] or "",
+        "status": row["status"] or "active",
+        "reason": row["reason"] or "",
+        "created_at": row["created_at"],
+        "resolved_at": row["resolved_at"],
         "metadata": _json_loads(row["metadata_json"], {}),
     }
 
 
 def _row_to_blocker(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "blocker_pk": int(row["blocker_pk"]),
-        "run_id": row["blocker_run_id"],
-        "agent_name": row["blocker_agent_name"] or "Agent",
-        "run_status": row["blocker_run_status"] or "working",
-        "prompt": row["blocker_prompt"] or "",
-        "status": row["status"] or "active",
-        "reason": row["reason"] or "",
-        "created_at": row["created_at"],
-        "resolved_at": row["resolved_at"],
-        "metadata": _json_loads(row["metadata_json"], {}),
-    }
+    return _row_to_blocker_run(row, "blocker")
 
 
 def _row_to_blocked_run(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "blocker_pk": int(row["blocker_pk"]),
-        "run_id": row["blocked_run_id"],
-        "agent_name": row["blocked_agent_name"] or "Agent",
-        "run_status": row["blocked_run_status"] or "working",
-        "prompt": row["blocked_prompt"] or "",
-        "status": row["status"] or "active",
-        "reason": row["reason"] or "",
-        "created_at": row["created_at"],
-        "resolved_at": row["resolved_at"],
-        "metadata": _json_loads(row["metadata_json"], {}),
-    }
+    return _row_to_blocker_run(row, "blocked")
 
 
 def _run_blockers_for_run(
@@ -257,6 +305,24 @@ def _runs_blocked_by_run(
     return [_row_to_blocked_run(row) for row in rows]
 
 
+def _run_file_claims(
+    conn: sqlite3.Connection, run_pk: int
+) -> list[dict[str, Any]]:
+    """Return active file claims for a specific run."""
+    rows = _claim_rows(
+        conn,
+        [
+            "c.run_pk = ?",
+            "c.status = 'active'",
+            "(c.expires_at IS NULL OR c.expires_at >= ?)",
+        ],
+        [run_pk, _now_iso()],
+        order_by=None,
+        limit=None,
+    )
+    return [_row_to_claim(row) for row in rows]
+
+
 def _active_files_for_run(
     conn: sqlite3.Connection, run_pk: int, *, limit: int = 5
 ) -> list[str]:
@@ -291,13 +357,33 @@ def get_run(conn: sqlite3.Connection, run_id: str) -> dict[str, Any] | None:
     return _row_to_run(conn, row)
 
 
+def _runs_from_rows(
+    conn: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    *,
+    limit: int,
+    include_orphan: bool = False,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    runs: list[dict[str, Any]] = []
+    for row in rows:
+        run = _row_to_run(conn, row)
+        if not include_orphan and _is_orphan_graph_event_run(conn, run):
+            continue
+        runs.append(run)
+        if len(runs) >= limit:
+            break
+    return runs
+
+
 def latest_active_run(
     conn: sqlite3.Connection,
     *,
     agent_name: str | None = None,
     max_age_seconds: float | None = DEFAULT_ACTIVE_RUN_MAX_AGE_SECONDS,
 ) -> dict[str, Any] | None:
-    params: list[Any] = sorted(TERMINAL_STATUSES)
+    params: list[Any] = list(STOPPED_STATUS_VALUES)
     agent_filter = ""
     age_filter = ""
     if agent_name:
@@ -307,12 +393,11 @@ def latest_active_run(
     if cutoff:
         age_filter = "AND updated_at >= ?"
         params.append(cutoff)
-    placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
     rows = conn.execute(
         f"""
         SELECT *
           FROM agent_runs
-         WHERE LOWER(COALESCE(status, 'working')) NOT IN ({placeholders})
+         WHERE LOWER(COALESCE(status, 'working')) NOT IN ({STOPPED_STATUS_PLACEHOLDERS})
            AND archived_at IS NULL
            {agent_filter}
            {age_filter}
@@ -321,11 +406,8 @@ def latest_active_run(
         """,
         params,
     ).fetchall()
-    for row in rows:
-        run = _row_to_run(conn, row)
-        if not _is_orphan_graph_event_run(conn, run):
-            return run
-    return None
+    runs = _runs_from_rows(conn, rows, limit=1)
+    return runs[0] if runs else None
 
 
 def start_run(
@@ -473,8 +555,8 @@ def add_run_blockers(
                    updated_at = ?
              WHERE run_pk = ?
                AND LOWER(COALESCE(status, '')) NOT IN ({})
-            """.format(",".join("?" for _ in TERMINAL_STATUSES)),
-            (now, run["run_pk"], *sorted(TERMINAL_STATUSES)),
+            """.format(STOPPED_STATUS_PLACEHOLDERS),
+            (now, run["run_pk"], *STOPPED_STATUS_VALUES),
         )
     else:
         _sync_blocked_runs(conn)
@@ -583,6 +665,7 @@ def claim_file(
     reason: str | None = None,
     ttl_seconds: float | None = DEFAULT_CLAIM_TTL_SECONDS,
     metadata: dict[str, Any] | None = None,
+    _record_lifecycle_event: bool = True,
 ) -> dict[str, Any]:
     run = get_run(conn, run_id)
     if run is None:
@@ -590,8 +673,11 @@ def claim_file(
     path = _normal_path(file_path)
     if not path:
         raise ValueError("file_path is required")
+    from code_index import lease_manager
+
+    lease_manager.expire_stale_leases(conn)
     claim_mode = (mode or "edit").strip().lower()
-    if claim_mode not in {"read", "edit", "review", "test", "exclusive"}:
+    if claim_mode not in VALID_CLAIM_MODES:
         raise ValueError(f"unknown claim mode: {claim_mode}")
     _raise_on_claim_conflict(
         conn,
@@ -612,10 +698,96 @@ def claim_file(
         ON CONFLICT(run_pk, file_path, mode) DO UPDATE SET
             status = 'active',
             reason = excluded.reason,
-            fence_token = excluded.fence_token,
+            fence_token = CASE
+                WHEN agent_file_claims.lease_kind = 'lease'
+                 AND agent_file_claims.status = 'active'
+                 AND agent_file_claims.lease_token_hash IS NOT NULL
+                 AND (
+                     agent_file_claims.expires_at IS NULL
+                     OR agent_file_claims.expires_at >= excluded.updated_at
+                 )
+                THEN agent_file_claims.fence_token
+                ELSE excluded.fence_token
+            END,
+            lease_token_hash = CASE
+                WHEN agent_file_claims.lease_kind = 'lease'
+                 AND agent_file_claims.status = 'active'
+                 AND agent_file_claims.lease_token_hash IS NOT NULL
+                 AND (
+                     agent_file_claims.expires_at IS NULL
+                     OR agent_file_claims.expires_at >= excluded.updated_at
+                 )
+                THEN agent_file_claims.lease_token_hash
+                ELSE NULL
+            END,
+            lease_kind = CASE
+                WHEN agent_file_claims.lease_kind = 'lease'
+                 AND agent_file_claims.status = 'active'
+                 AND agent_file_claims.lease_token_hash IS NOT NULL
+                 AND (
+                     agent_file_claims.expires_at IS NULL
+                     OR agent_file_claims.expires_at >= excluded.updated_at
+                 )
+                THEN agent_file_claims.lease_kind
+                ELSE 'claim'
+            END,
+            owner_agent = CASE
+                WHEN agent_file_claims.lease_kind = 'lease'
+                 AND agent_file_claims.status = 'active'
+                 AND agent_file_claims.lease_token_hash IS NOT NULL
+                 AND (
+                     agent_file_claims.expires_at IS NULL
+                     OR agent_file_claims.expires_at >= excluded.updated_at
+                 )
+                THEN agent_file_claims.owner_agent
+                ELSE NULL
+            END,
+            heartbeat_interval_ms = CASE
+                WHEN agent_file_claims.lease_kind = 'lease'
+                 AND agent_file_claims.status = 'active'
+                 AND agent_file_claims.lease_token_hash IS NOT NULL
+                 AND (
+                     agent_file_claims.expires_at IS NULL
+                     OR agent_file_claims.expires_at >= excluded.updated_at
+                 )
+                THEN agent_file_claims.heartbeat_interval_ms
+                ELSE NULL
+            END,
+            conflict_policy = CASE
+                WHEN agent_file_claims.lease_kind = 'lease'
+                 AND agent_file_claims.status = 'active'
+                 AND agent_file_claims.lease_token_hash IS NOT NULL
+                 AND (
+                     agent_file_claims.expires_at IS NULL
+                     OR agent_file_claims.expires_at >= excluded.updated_at
+                 )
+                THEN agent_file_claims.conflict_policy
+                ELSE NULL
+            END,
+            last_conflict_json = CASE
+                WHEN agent_file_claims.lease_kind = 'lease'
+                 AND agent_file_claims.status = 'active'
+                 AND agent_file_claims.lease_token_hash IS NOT NULL
+                 AND (
+                     agent_file_claims.expires_at IS NULL
+                     OR agent_file_claims.expires_at >= excluded.updated_at
+                 )
+                THEN agent_file_claims.last_conflict_json
+                ELSE NULL
+            END,
             updated_at = excluded.updated_at,
             heartbeat_at = excluded.heartbeat_at,
-            expires_at = excluded.expires_at,
+            expires_at = CASE
+                WHEN agent_file_claims.lease_kind = 'lease'
+                 AND agent_file_claims.status = 'active'
+                 AND agent_file_claims.lease_token_hash IS NOT NULL
+                 AND (
+                     agent_file_claims.expires_at IS NULL
+                     OR agent_file_claims.expires_at >= excluded.updated_at
+                 )
+                THEN agent_file_claims.expires_at
+                ELSE excluded.expires_at
+            END,
             released_at = NULL,
             metadata_json = excluded.metadata_json
         """,
@@ -633,21 +805,34 @@ def claim_file(
             _json_dumps(metadata or {}),
         ),
     )
-    row = conn.execute(
-        """
-        SELECT c.*,
-               r.run_id,
-               r.agent_name,
-               r.status AS run_status
-          FROM agent_file_claims c
-          JOIN agent_runs r ON r.run_pk = c.run_pk
-         WHERE c.run_pk = ?
-           AND c.file_path = ?
-           AND c.mode = ?
-        """,
-        (run["run_pk"], path, claim_mode),
-    ).fetchone()
-    return _row_to_claim(row)
+    rows = _claim_rows(
+        conn,
+        ["c.run_pk = ?", "c.file_path = ?", "c.mode = ?"],
+        [run["run_pk"], path, claim_mode],
+        order_by=None,
+        limit=1,
+    )
+    assert rows
+    claim = _row_to_claim(rows[0])
+    row_keys = set(rows[0].keys())
+    preserved_active_lease = (
+        "lease_kind" in row_keys
+        and "lease_token_hash" in row_keys
+        and str(rows[0]["lease_kind"] or "") == "lease"
+        and bool(rows[0]["lease_token_hash"])
+    )
+    if _record_lifecycle_event and not preserved_active_lease:
+        lease_manager.record_claim_event(
+            conn,
+            claim_pk=int(rows[0]["claim_pk"]),
+            event_type="created",
+            file_path=claim["file_path"],
+            mode=claim["mode"],
+            fence_token=claim.get("fence_token"),
+            message=f"Claim created for {claim['file_path']}.",
+            metadata=metadata,
+        )
+    return claim
 
 
 def _next_fence_token(conn: sqlite3.Connection, file_path: str) -> int:
@@ -681,9 +866,9 @@ def _raise_on_claim_conflict(
            AND c.run_pk != ?
            AND (c.expires_at IS NULL OR c.expires_at >= ?)
            AND r.archived_at IS NULL
-           AND LOWER(COALESCE(r.status, 'working')) NOT IN ({','.join('?' for _ in TERMINAL_STATUSES)})
+           AND {_non_terminal_run_clause("r")}
         """,
-        (file_path, run_pk, now, *sorted(TERMINAL_STATUSES)),
+        (file_path, run_pk, now, *STOPPED_STATUS_VALUES),
     ).fetchall()
     for row in rows:
         other_mode = str(row["mode"] or "")
@@ -753,94 +938,77 @@ def verify_write_claim(
 
     path = _normal_path(file_path)
     if not path:
-        return {
-            "ok": False,
-            "reason": "missing_claim",
-            "message": "missing claim: --file is required",
-        }
+        return _claim_check(False, "missing_claim", "missing claim: --file is required")
     try:
         fence = int(fence_token)
     except (TypeError, ValueError):
-        return {
-            "ok": False,
-            "reason": "stale_fence",
-            "message": f"stale fence: expected numeric fence token for {path}",
-            "file_path": path,
-        }
+        return _claim_check(
+            False,
+            "stale_fence",
+            f"stale fence: expected numeric fence token for {path}",
+            file_path=path,
+        )
     run = get_run(conn, run_id)
     if run is None:
-        return {
-            "ok": False,
-            "reason": "missing_claim",
-            "message": f"missing claim: unknown agent run_id {run_id}",
-            "run_id": run_id,
-            "file_path": path,
-        }
+        return _claim_check(
+            False,
+            "missing_claim",
+            f"missing claim: unknown agent run_id {run_id}",
+            run_id=run_id,
+            file_path=path,
+        )
 
     now = _now_iso()
-    terminal_placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
-    foreign_rows = conn.execute(
-        f"""
-        SELECT c.*,
-               r.run_id,
-               r.agent_name,
-               r.status AS run_status
-          FROM agent_file_claims c
-          JOIN agent_runs r ON r.run_pk = c.run_pk
-         WHERE c.file_path = ?
-           AND c.run_pk != ?
-           AND c.status = 'active'
-           AND c.mode IN ('edit', 'exclusive')
-           AND (c.expires_at IS NULL OR c.expires_at >= ?)
-           AND r.archived_at IS NULL
-           AND LOWER(COALESCE(r.status, 'working')) NOT IN ({terminal_placeholders})
-         ORDER BY c.updated_at DESC, c.claim_pk DESC
-        """,
-        (path, run["run_pk"], now, *sorted(TERMINAL_STATUSES)),
-    ).fetchall()
+    foreign_rows = _claim_rows(
+        conn,
+        [
+            "c.file_path = ?",
+            "c.run_pk != ?",
+            "c.status = 'active'",
+            f"c.mode IN ({WRITE_CLAIM_PLACEHOLDERS})",
+            "(c.expires_at IS NULL OR c.expires_at >= ?)",
+            "r.archived_at IS NULL",
+            _non_terminal_run_clause("r"),
+        ],
+        [path, run["run_pk"], *WRITE_CLAIM_MODES, now, *STOPPED_STATUS_VALUES],
+    )
     if foreign_rows:
         claim = _row_to_claim(foreign_rows[0])
-        return {
-            "ok": False,
-            "reason": "conflicting_claim",
-            "message": (
+        return _claim_check(
+            False,
+            "conflicting_claim",
+            (
                 "conflicting claim: "
                 f"{path} is held by {claim['agent_name']} "
                 f"({claim['run_id']}, mode={claim['mode']}, "
                 f"fence={claim['fence_token']})"
             ),
-            "run_id": run_id,
-            "file_path": path,
-            "conflicting_claim": claim,
-        }
+            run_id=run_id,
+            file_path=path,
+            conflicting_claim=claim,
+        )
 
-    own_rows = conn.execute(
-        """
-        SELECT c.*,
-               r.run_id,
-               r.agent_name,
-               r.status AS run_status
-          FROM agent_file_claims c
-          JOIN agent_runs r ON r.run_pk = c.run_pk
-         WHERE c.file_path = ?
-           AND c.run_pk = ?
-           AND c.status = 'active'
-           AND c.mode IN ('edit', 'exclusive')
-         ORDER BY c.updated_at DESC, c.claim_pk DESC
-        """,
-        (path, run["run_pk"]),
-    ).fetchall()
+    own_rows = _claim_rows(
+        conn,
+        [
+            "c.file_path = ?",
+            "c.run_pk = ?",
+            "c.status = 'active'",
+            f"c.mode IN ({WRITE_CLAIM_PLACEHOLDERS})",
+        ],
+        [path, run["run_pk"], *WRITE_CLAIM_MODES],
+    )
     if not own_rows:
-        return {
-            "ok": False,
-            "reason": "missing_claim",
-            "message": (
+        return _claim_check(
+            False,
+            "missing_claim",
+            (
                 f"missing claim: {run_id} has no active edit/exclusive claim "
                 f"for {path}"
             ),
-            "run_id": run_id,
-            "file_path": path,
-        }
+            run_id=run_id,
+            file_path=path,
+        )
 
     expired_claims = [
         _row_to_claim(row)
@@ -854,44 +1022,44 @@ def verify_write_claim(
     ]
     if not current_claims:
         claim = expired_claims[0]
-        return {
-            "ok": False,
-            "reason": "expired_claim",
-            "message": (
+        return _claim_check(
+            False,
+            "expired_claim",
+            (
                 f"expired claim: {path} claim for {run_id} expired at "
                 f"{claim['expires_at']} (fence={claim['fence_token']})"
             ),
-            "run_id": run_id,
-            "file_path": path,
-            "claim": claim,
-        }
+            run_id=run_id,
+            file_path=path,
+            claim=claim,
+        )
 
     for claim in current_claims:
         if int(claim.get("fence_token") or 0) == fence:
-            return {
-                "ok": True,
-                "reason": "verified",
-                "message": (
+            return _claim_check(
+                True,
+                "verified",
+                (
                     f"claim verified: {path} is held by {run_id} "
                     f"(mode={claim['mode']}, fence={claim['fence_token']})"
                 ),
-                "run_id": run_id,
-                "file_path": path,
-                "claim": claim,
-            }
+                run_id=run_id,
+                file_path=path,
+                claim=claim,
+            )
 
     fences = ", ".join(str(claim["fence_token"]) for claim in current_claims)
-    return {
-        "ok": False,
-        "reason": "stale_fence",
-        "message": (
+    return _claim_check(
+        False,
+        "stale_fence",
+        (
             f"stale fence: {path} for {run_id} has current fence "
             f"{fences}; got {fence}"
         ),
-        "run_id": run_id,
-        "file_path": path,
-        "current_claims": current_claims,
-    }
+        run_id=run_id,
+        file_path=path,
+        current_claims=current_claims,
+    )
 
 
 def claim_files(
@@ -935,60 +1103,51 @@ def release_claims(
     next_status = (status or "released").strip().lower()
     if next_status not in {"released", "expired"}:
         raise ValueError(f"unknown claim release status: {next_status}")
-    select_clauses = ["c.run_pk = ?", "c.status = 'active'"]
-    update_clauses = ["run_pk = ?", "status = 'active'"]
-    params: list[Any] = [run["run_pk"]]
-    path = _normal_path(file_path)
-    if path:
-        select_clauses.append("c.file_path = ?")
-        update_clauses.append("file_path = ?")
-        params.append(path)
-    if mode:
-        select_clauses.append("c.mode = ?")
-        update_clauses.append("mode = ?")
-        params.append(mode.strip().lower())
-    rows = conn.execute(
-        f"""
-        SELECT c.*,
-               r.run_id,
-               r.agent_name,
-               r.status AS run_status
-         FROM agent_file_claims c
-         JOIN agent_runs r ON r.run_pk = c.run_pk
-         WHERE {" AND ".join(select_clauses)}
-         ORDER BY c.updated_at DESC, c.claim_pk DESC
-        """,
-        params,
-    ).fetchall()
-    claim_pks = [int(row["claim_pk"]) for row in rows]
-    now = _now_iso()
-    conn.execute(
-        f"""
-        UPDATE agent_file_claims
-               SET status = ?,
-                   updated_at = ?,
-                   released_at = ?
-         WHERE {" AND ".join(update_clauses)}
-        """,
-        [next_status, now, now, *params],
-    )
-    if not claim_pks:
-        return []
-    placeholders = ",".join("?" for _ in claim_pks)
-    updated_rows = conn.execute(
-        f"""
-        SELECT c.*,
-               r.run_id,
-               r.agent_name,
-               r.status AS run_status
-          FROM agent_file_claims c
-          JOIN agent_runs r ON r.run_pk = c.run_pk
-         WHERE c.claim_pk IN ({placeholders})
-         ORDER BY c.updated_at DESC, c.claim_pk DESC
-        """,
-        claim_pks,
-    ).fetchall()
-    return [_row_to_claim(row) for row in updated_rows]
+    from code_index import lease_manager
+
+    with lease_manager._atomic(conn):
+        lease_manager.expire_stale_leases(conn)
+        select_clauses = ["c.run_pk = ?", "c.status = 'active'"]
+        params: list[Any] = [run["run_pk"]]
+        path = _normal_path(file_path)
+        if path:
+            select_clauses.append("c.file_path = ?")
+            params.append(path)
+        if mode:
+            select_clauses.append("c.mode = ?")
+            params.append(mode.strip().lower())
+        select_clauses.append("COALESCE(c.lease_kind, 'claim') != 'lease'")
+        rows = _claim_rows(conn, select_clauses, params)
+        claim_pks = [int(row["claim_pk"]) for row in rows]
+        if not claim_pks:
+            return []
+        now = _now_iso()
+        placeholders = ",".join("?" for _ in claim_pks)
+        conn.execute(
+            f"""
+            UPDATE agent_file_claims
+                   SET status = ?,
+                       lease_token_hash = NULL,
+                       updated_at = ?,
+                       released_at = ?
+             WHERE claim_pk IN ({placeholders})
+            """,
+            [next_status, now, now, *claim_pks],
+        )
+        updated_rows = _claim_rows(conn, [f"c.claim_pk IN ({placeholders})"], claim_pks)
+        claims = [_row_to_claim(row) for row in updated_rows]
+
+        for row, claim in zip(updated_rows, claims):
+            lease_manager.record_claim_event(
+                conn,
+                claim_pk=int(row["claim_pk"]),
+                event_type=next_status,
+                file_path=claim["file_path"],
+                mode=claim["mode"],
+                fence_token=claim.get("fence_token"),
+                message=f"Claim {next_status} for {claim['file_path']}.",
+            )
+        return claims
 
 
 def active_file_claims(
@@ -997,40 +1156,34 @@ def active_file_claims(
     limit: int = 100,
     file_path: str | None = None,
 ) -> list[dict[str, Any]]:
+    from code_index import lease_manager
+
+    lease_manager.expire_stale_leases(conn)
     clauses = [
         "c.status = 'active'",
         "(c.expires_at IS NULL OR c.expires_at >= ?)",
         "r.archived_at IS NULL",
-        f"LOWER(COALESCE(r.status, 'working')) NOT IN ({','.join('?' for _ in TERMINAL_STATUSES)})",
+        _non_terminal_run_clause("r"),
     ]
-    params: list[Any] = [_now_iso(), *sorted(TERMINAL_STATUSES)]
+    params: list[Any] = [_now_iso(), *STOPPED_STATUS_VALUES]
     path = _normal_path(file_path)
     if path:
         clauses.append("c.file_path = ?")
         params.append(path)
-    params.append(max(0, int(limit)))
-    rows = conn.execute(
-        f"""
-        SELECT c.*,
-               r.run_id,
-               r.agent_name,
-               r.status AS run_status
-          FROM agent_file_claims c
-          JOIN agent_runs r ON r.run_pk = c.run_pk
-         WHERE {" AND ".join(clauses)}
-         ORDER BY
-           CASE c.mode
-             WHEN 'edit' THEN 0
-             WHEN 'test' THEN 1
-             WHEN 'review' THEN 2
-             ELSE 3
-           END,
-           c.updated_at DESC,
-           c.claim_pk DESC
-         LIMIT ?
-        """,
+    rows = _claim_rows(
+        conn,
+        clauses,
         params,
-    ).fetchall()
+        order_by=(
+            "CASE c.mode "
+            "WHEN 'edit' THEN 0 "
+            "WHEN 'test' THEN 1 "
+            "WHEN 'review' THEN 2 "
+            "ELSE 3 END, "
+            "c.updated_at DESC, c.claim_pk DESC"
+        ),
+        limit=limit,
+    )
     return [_row_to_claim(row) for row in rows]
 
 
@@ -1075,16 +1228,19 @@ def record_event(
     next_status = payload_dict.get("status") if event == "status" else None
     if not next_status and event in WORK_EVENT_TYPES:
         current = str(run.get("status") or "").lower()
-        if current not in TERMINAL_STATUSES:
+        if current not in STOPPED_STATUSES:
             next_status = "working"
+    next_status_text = str(next_status or "").lower()
+    ended_at = when if next_status_text in STOPPED_STATUSES else None
     conn.execute(
         """
         UPDATE agent_runs
            SET updated_at = ?,
-               status = COALESCE(?, status)
+               status = COALESCE(?, status),
+               ended_at = COALESCE(ended_at, ?)
          WHERE run_pk = ?
         """,
-        (when, next_status, run["run_pk"]),
+        (when, next_status, ended_at, run["run_pk"]),
     )
     row = conn.execute(
         """
@@ -1110,9 +1266,9 @@ def record_event(
             reason=message or f"{event} event",
             metadata={"source": "agent_event", "event_type": event},
         )
-    if next_status and str(next_status).lower() in TERMINAL_STATUSES:
+    if next_status_text in STOPPED_STATUSES:
         release_claims(conn, run_id=run_id)
-        if str(next_status).lower() == "completed":
+        if next_status_text == "completed":
             _sync_blocked_runs(conn)
     return event_payload
 
@@ -1542,8 +1698,7 @@ def active_runs(
     limit: int = 5,
     max_age_seconds: float | None = DEFAULT_ACTIVE_RUN_MAX_AGE_SECONDS,
 ) -> list[dict[str, Any]]:
-    placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
-    params: list[Any] = sorted(TERMINAL_STATUSES)
+    params: list[Any] = list(STOPPED_STATUS_VALUES)
     cutoff = _active_cutoff_iso(max_age_seconds)
     age_filter = ""
     if cutoff:
@@ -1555,23 +1710,15 @@ def active_runs(
         f"""
         SELECT *
           FROM agent_runs
-         WHERE LOWER(COALESCE(status, 'working')) NOT IN ({placeholders})
-           AND archived_at IS NULL
-           {age_filter}
+         WHERE LOWER(COALESCE(status, 'working')) NOT IN ({STOPPED_STATUS_PLACEHOLDERS})
+            AND archived_at IS NULL
+            {age_filter}
          ORDER BY updated_at DESC, started_at DESC, run_pk DESC
          LIMIT ?
         """,
         params,
     ).fetchall()
-    runs: list[dict[str, Any]] = []
-    for row in rows:
-        run = _row_to_run(conn, row)
-        if _is_orphan_graph_event_run(conn, run):
-            continue
-        runs.append(run)
-        if len(runs) >= requested_limit:
-            break
-    return runs
+    return _runs_from_rows(conn, rows, limit=requested_limit)
 
 
 def recent_runs(
@@ -1593,15 +1740,32 @@ def recent_runs(
         """,
         (max(requested_limit, requested_limit * 4),),
     ).fetchall()
-    runs: list[dict[str, Any]] = []
-    for row in rows:
-        run = _row_to_run(conn, row)
-        if not include_orphan and _is_orphan_graph_event_run(conn, run):
-            continue
-        runs.append(run)
-        if len(runs) >= requested_limit:
-            break
-    return runs
+    return _runs_from_rows(
+        conn,
+        rows,
+        limit=requested_limit,
+        include_orphan=include_orphan,
+    )
+
+
+def child_runs(
+    conn: sqlite3.Connection,
+    *,
+    parent_run_id: str,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT *
+          FROM agent_runs
+         WHERE json_extract(metadata_json, '$.parent_run_id') = ?
+           AND archived_at IS NULL
+         ORDER BY started_at ASC, run_pk ASC
+         LIMIT ?
+        """,
+        (parent_run_id, max(1, int(limit))),
+    ).fetchall()
+    return [_row_to_run(conn, row) for row in rows]
 
 
 def recent_events(
@@ -1659,6 +1823,51 @@ def recent_file_activity(
         symbol = event.get("symbol_path")
         if symbol and symbol not in item["symbols"] and len(item["symbols"]) < 6:
             item["symbols"].append(symbol)
+
+    # Compute per-file overlapping runs
+    all_run_ids: set[str] = set()
+    for item in grouped.values():
+        all_run_ids.update(item["run_ids"])
+    run_agents: dict[str, str] = {}
+    if all_run_ids:
+        placeholders = ",".join("?" for _ in all_run_ids)
+        rows = conn.execute(
+            f"""
+            SELECT run_id, agent_name
+              FROM agent_runs
+             WHERE run_id IN ({placeholders})
+            """,
+            tuple(all_run_ids),
+        ).fetchall()
+        run_agents = {row["run_id"]: row["agent_name"] or "Agent" for row in rows}
+
+    for path in order:
+        item = grouped[path]
+        own_run_ids = set(item["run_ids"])
+        overlapping: list[dict[str, Any]] = []
+        for other_path, other_item in grouped.items():
+            if other_path == path:
+                continue
+            shared_runs = own_run_ids & set(other_item["run_ids"])
+            if shared_runs:
+                for rid in shared_runs:
+                    overlapping.append(
+                        {
+                            "file_path": other_path,
+                            "run_id": rid,
+                            "agent_name": run_agents.get(rid, "Agent"),
+                        }
+                    )
+        # Deduplicate by file_path + run_id
+        seen: set[tuple[str, str]] = set()
+        deduped: list[dict[str, Any]] = []
+        for o in overlapping:
+            key = (o["file_path"], o["run_id"])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(o)
+        item["overlapping_files"] = deduped[:10]
+
     out: list[dict[str, Any]] = []
     for rank, path in enumerate(order[:limit], start=1):
         item = dict(grouped[path])
@@ -1666,6 +1875,382 @@ def recent_file_activity(
         item["change_types"] = dict(sorted(item["change_types"].items()))
         out.append(item)
     return out
+
+
+def _overlapping_run_analysis(
+    conn: sqlite3.Connection,
+    *,
+    max_age_seconds: float | None = DEFAULT_ACTIVE_RUN_MAX_AGE_SECONDS,
+) -> list[dict[str, Any]]:
+    """Detect files actively touched by multiple runs and assess conflict risk."""
+    runs = active_runs(conn, limit=100, max_age_seconds=max_age_seconds)
+    if len(runs) < 2:
+        return []
+
+    # Batch-load active claims once
+    all_claims = active_file_claims(conn, limit=1000)
+    claims_by_run: dict[str, list[dict[str, Any]]] = {}
+    for claim in all_claims:
+        claims_by_run.setdefault(claim["run_id"], []).append(claim)
+
+    # Batch-load recent edit events per run for files without active claims
+    run_ids = [run["run_id"] for run in runs]
+    if run_ids:
+        placeholders = ",".join("?" for _ in run_ids)
+        event_rows = conn.execute(
+            f"""
+            SELECT r.run_id, e.file_path, e.event_type
+              FROM agent_events e
+              JOIN agent_runs r ON r.run_pk = e.run_pk
+             WHERE r.run_id IN ({placeholders})
+               AND e.file_path IS NOT NULL
+               AND e.event_type IN ('edit', 'test')
+            """,
+            tuple(run_ids),
+        ).fetchall()
+    else:
+        event_rows = []
+    edit_files_by_run: dict[str, set[str]] = {}
+    for row in event_rows:
+        edit_files_by_run.setdefault(row["run_id"], set()).add(row["file_path"])
+
+    run_files: dict[str, set[str]] = {}
+    for run in runs:
+        rid = run["run_id"]
+        files: set[str] = set(run.get("active_files") or [])
+        for claim in claims_by_run.get(rid, []):
+            files.add(claim["file_path"])
+        run_files[rid] = files
+
+    overlaps: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for i, run_a in enumerate(runs):
+        rid_a = run_a["run_id"]
+        files_a = run_files[rid_a]
+        for run_b in runs[i + 1 :]:
+            rid_b = run_b["run_id"]
+            shared = files_a & run_files[rid_b]
+            if not shared:
+                continue
+            pair = tuple(sorted([rid_a, rid_b]))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+
+            severity = "low"
+            for path in shared:
+                modes_a = {
+                    c["mode"]
+                    for c in claims_by_run.get(rid_a, [])
+                    if c["file_path"] == path
+                }
+                modes_b = {
+                    c["mode"]
+                    for c in claims_by_run.get(rid_b, [])
+                    if c["file_path"] == path
+                }
+                has_write_a = bool(modes_a & EXCLUSIVE_CLAIM_MODES)
+                has_write_b = bool(modes_b & EXCLUSIVE_CLAIM_MODES)
+                edited_a = path in edit_files_by_run.get(rid_a, set())
+                edited_b = path in edit_files_by_run.get(rid_b, set())
+                if (has_write_a and has_write_b) or (edited_a and edited_b):
+                    severity = "high"
+                    break
+                if has_write_a or has_write_b or edited_a or edited_b:
+                    severity = "medium"
+
+            overlaps.append(
+                {
+                    "run_id_a": rid_a,
+                    "agent_name_a": run_a["agent_name"],
+                    "run_id_b": rid_b,
+                    "agent_name_b": run_b["agent_name"],
+                    "shared_files": sorted(shared),
+                    "severity": severity,
+                    "message": (
+                        f"{run_a['agent_name']} ({rid_a[:8]}) and "
+                        f"{run_b['agent_name']} ({rid_b[:8]}) both touch "
+                        f"{len(shared)} file(s)."
+                    ),
+                }
+            )
+    return overlaps
+
+
+def agent_derived_file_relationships(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 50,
+    min_observations: int = 1,
+) -> list[dict[str, Any]]:
+    """Infer file-to-file relationships from agent navigation patterns.
+
+    When agents read or edit file A and then file B within the same run,
+    that suggests a dynamic relationship that the static AST index may miss.
+    """
+    rows = conn.execute(
+        """
+        SELECT run_pk, file_path, timestamp, event_pk
+          FROM agent_events
+         WHERE file_path IS NOT NULL
+           AND event_type IN ('read', 'edit', 'test', 'navigate')
+         ORDER BY run_pk, timestamp ASC, event_pk ASC
+        """
+    ).fetchall()
+
+    run_sequences: dict[int, list[str]] = {}
+    for row in rows:
+        run_pk = int(row["run_pk"])
+        path = row["file_path"]
+        seq = run_sequences.setdefault(run_pk, [])
+        if not seq or seq[-1] != path:
+            seq.append(path)
+
+    transition_counts: dict[tuple[str, str], int] = {}
+    for sequence in run_sequences.values():
+        deduped: list[str] = []
+        for path in sequence:
+            if not deduped or deduped[-1] != path:
+                deduped.append(path)
+        for i in range(len(deduped) - 1):
+            a, b = deduped[i], deduped[i + 1]
+            key = tuple(sorted([a, b]))
+            transition_counts[key] = transition_counts.get(key, 0) + 1
+
+    if not transition_counts:
+        return []
+
+    max_count = max(transition_counts.values())
+    relationships: list[dict[str, Any]] = []
+    for (a, b), count in sorted(
+        transition_counts.items(), key=lambda x: -x[1]
+    )[:limit]:
+        if count < min_observations:
+            continue
+        confidence = count / max_count
+        relationships.append(
+            {
+                "source": a,
+                "target": b,
+                "kind": "agent_derived",
+                "confidence": round(confidence, 3),
+                "observations": count,
+                "rationale": (
+                    f"Agents navigated between these files {count} time(s)."
+                ),
+            }
+        )
+    return relationships
+
+
+def run_trajectory(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    event_types: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return the ordered sequence of files an agent visited within a run.
+
+    Useful for predicting where an agent is likely to go next and for
+    detecting divergent navigation patterns across agentic teams.
+    """
+    run = get_run(conn, run_id)
+    if run is None:
+        return []
+    types = event_types or {"read", "edit", "test", "navigate"}
+    placeholders = ",".join("?" for _ in types)
+    rows = conn.execute(
+        f"""
+        SELECT file_path, symbol_path, event_type, timestamp, message
+          FROM agent_events
+         WHERE run_pk = ?
+           AND file_path IS NOT NULL
+           AND event_type IN ({placeholders})
+         ORDER BY timestamp ASC, event_pk ASC
+        """,
+        (run["run_pk"], *types),
+    ).fetchall()
+    trajectory: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        path = row["file_path"]
+        if not path:
+            continue
+        key = f"{path}:{row['event_type']}"
+        if key in seen:
+            continue
+        seen.add(key)
+        trajectory.append(
+            {
+                "file_path": path,
+                "symbol_path": row["symbol_path"],
+                "event_type": row["event_type"],
+                "timestamp": row["timestamp"],
+                "message": row["message"],
+            }
+        )
+    return trajectory
+
+
+def predict_next_files(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Predict which files an agent is likely to touch next.
+
+    Combines the run's current trajectory with historically derived agent
+    navigation patterns to surface likely next destinations. This helps
+    other agents anticipate coordination needs before claims are created.
+    """
+    trajectory = run_trajectory(conn, run_id)
+    if not trajectory:
+        return []
+    current_files = [t["file_path"] for t in trajectory]
+    current_set = set(current_files)
+    last_file = current_files[-1]
+
+    # Load globally derived relationships (cached in-memory would be ideal,
+    # but for now we compute a targeted subset).
+    derived = agent_derived_file_relationships(conn, limit=200)
+    candidates: dict[str, float] = {}
+    for rel in derived:
+        a, b = rel["source"], rel["target"]
+        if a == last_file and b not in current_set:
+            candidates[b] = max(candidates.get(b, 0.0), rel["confidence"])
+        elif b == last_file and a not in current_set:
+            candidates[a] = max(candidates.get(a, 0.0), rel["confidence"])
+
+    # Also boost files that appear in the same run's existing trajectory
+    # but haven't been visited recently (back-and-forth patterns).
+    for t in trajectory[:-1]:
+        path = t["file_path"]
+        if path != last_file and path not in current_set:
+            candidates[path] = candidates.get(path, 0.0) + 0.1
+
+    # Boost files that are structurally related (imports) to current files.
+    if current_files:
+        placeholders = ",".join("?" for _ in current_files)
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT df.file_path
+              FROM relations r
+              JOIN occurrences so ON so.symbol_pk = r.src_symbol_pk
+                                   AND so.role = 'definition'
+              JOIN files sf ON sf.file_pk = so.file_pk
+              JOIN occurrences do ON do.symbol_pk = r.dst_symbol_pk
+                                   AND do.role = 'definition'
+              JOIN files df ON df.file_pk = do.file_pk
+             WHERE sf.file_path IN ({placeholders})
+               AND r.relation_kind IN ('calls', 'imports')
+               AND sf.deleted_at IS NULL
+               AND df.deleted_at IS NULL
+            """,
+            tuple(current_files),
+        ).fetchall()
+        for row in rows:
+            path = row["file_path"]
+            if path and path not in current_set:
+                candidates[path] = candidates.get(path, 0.0) + 0.25
+
+    sorted_candidates = sorted(
+        candidates.items(), key=lambda x: -x[1]
+    )[:limit]
+    return [
+        {"file_path": path, "confidence": round(score, 3), "reason": "trajectory_prediction"}
+        for path, score in sorted_candidates
+    ]
+
+
+def dependency_claim_warnings(
+    conn: sqlite3.Connection,
+    selected_paths: list[str],
+    *,
+    run_id: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Find active claims on files that selected_paths depend on.
+
+    This surfaces transitive coordination risks: even if no other agent
+    has claimed the exact same file, someone may be editing a dependency
+    that could break your work.
+    """
+    paths = [_normal_path(p) for p in selected_paths if _normal_path(p)]
+    if not paths:
+        return []
+    placeholders = ",".join("?" for _ in paths)
+    # Find files that selected_paths call or import (one hop).
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT df.file_path
+          FROM relations r
+          JOIN occurrences so ON so.symbol_pk = r.src_symbol_pk
+                               AND so.role = 'definition'
+          JOIN files sf ON sf.file_pk = so.file_pk
+          JOIN occurrences do ON do.symbol_pk = r.dst_symbol_pk
+                               AND do.role = 'definition'
+          JOIN files df ON df.file_pk = do.file_pk
+         WHERE sf.file_path IN ({placeholders})
+           AND r.relation_kind IN ('calls', 'imports', 'inherits', 'implements')
+           AND sf.deleted_at IS NULL
+           AND df.deleted_at IS NULL
+        """,
+        tuple(paths),
+    ).fetchall()
+    dependency_files = {row["file_path"] for row in rows if row["file_path"]}
+    if not dependency_files:
+        return []
+
+    # Find active claims on those dependency files from OTHER runs.
+    now = _now_iso()
+    dep_placeholders = ",".join("?" for _ in dependency_files)
+    clauses = [
+        "c.status = 'active'",
+        f"c.file_path IN ({dep_placeholders})",
+        "(c.expires_at IS NULL OR c.expires_at >= ?)",
+        "r.archived_at IS NULL",
+        _non_terminal_run_clause("r"),
+    ]
+    params: list[Any] = list(dependency_files)
+    params.append(now)
+    params.extend(STOPPED_STATUS_VALUES)
+    if run_id:
+        clauses.append("r.run_id != ?")
+        params.append(run_id)
+
+    claim_rows = conn.execute(
+        f"""
+        SELECT c.file_path, c.mode, c.reason,
+               r.run_id, r.agent_name, r.status AS run_status
+          FROM agent_file_claims c
+          JOIN agent_runs r ON r.run_pk = c.run_pk
+         WHERE {" AND ".join(clauses)}
+         ORDER BY c.mode = 'edit' DESC, c.mode = 'exclusive' DESC, c.updated_at DESC
+         LIMIT ?
+        """,
+        (*params, max(0, int(limit))),
+    ).fetchall()
+
+    warnings: list[dict[str, Any]] = []
+    for row in claim_rows:
+        mode = str(row["mode"] or "")
+        severity = "high" if mode in EXCLUSIVE_CLAIM_MODES else "medium"
+        warnings.append(
+            {
+                "file_path": row["file_path"],
+                "claimed_by_run_id": row["run_id"],
+                "claimed_by_agent": row["agent_name"] or "Agent",
+                "claim_mode": mode,
+                "claim_reason": row["reason"] or "",
+                "severity": severity,
+                "message": (
+                    f"{row['agent_name'] or 'Agent'} has an active {mode} claim on "
+                    f"{row['file_path']}, which your selected files depend on."
+                ),
+            }
+        )
+    return warnings
 
 
 def activity_snapshot(
@@ -1686,4 +2271,8 @@ def activity_snapshot(
         ),
         "active_claims": active_file_claims(conn, limit=100),
         "kanban": kanban_board(conn, limit=10),
+        "overlapping_runs": _overlapping_run_analysis(
+            conn, max_age_seconds=active_run_max_age_seconds
+        ),
+        "derived_relationships": agent_derived_file_relationships(conn, limit=50),
     }

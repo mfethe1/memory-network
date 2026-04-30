@@ -198,6 +198,16 @@ function directoryDepth(path) {
   if (!path || path === ".") return 0;
   return path.split("/").filter(Boolean).length;
 }
+function allDirectoryIds() {
+  const ids = nodes
+    .filter(node => node.kind === "directory")
+    .sort((a, b) => directoryDepth(a.path) - directoryDepth(b.path) || a.path.localeCompare(b.path))
+    .map(node => node.id);
+  return ids.length ? ids : [directoryNodeId(".")];
+}
+function defaultExpandedDirectoryIds() {
+  return allDirectoryIds();
+}
 function ancestorDirectoryIdsForNode(node) {
   if (!node) return [directoryNodeId(".")];
   const directory = node.kind === "file" ? node.directory : node.directory;

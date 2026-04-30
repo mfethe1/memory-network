@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = "10"
+SCHEMA_VERSION = "11"
 SCHEMA_FILE = Path(__file__).with_name("schema.sql")
 
 
@@ -180,6 +180,9 @@ def _migrate_if_needed(conn: sqlite3.Connection, prior: str | None) -> None:
     if prior == "9":
         # v9 → v10 adds first-class run blocker edges for task-board planning.
         return
+    if prior == "10":
+        # v10 → v11 adds durable file lease metadata and lifecycle events.
+        return
     # Unknown older version: safest local policy is to drop the derived tables
     # and let the next reindex rebuild them. Canonical tables survive.
     for t in ("test_edges", "unresolved_calls"):
@@ -197,12 +200,19 @@ _EXPECTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("embeddings", "content_hash", "TEXT"),
     ("agent_runs", "archived_at", "TEXT"),
     ("agent_file_claims", "fence_token", "INTEGER NOT NULL DEFAULT 0"),
+    ("agent_file_claims", "lease_token_hash", "TEXT"),
+    ("agent_file_claims", "lease_kind", "TEXT NOT NULL DEFAULT 'claim'"),
+    ("agent_file_claims", "owner_agent", "TEXT"),
+    ("agent_file_claims", "heartbeat_interval_ms", "INTEGER"),
+    ("agent_file_claims", "conflict_policy", "TEXT"),
+    ("agent_file_claims", "last_conflict_json", "TEXT"),
 )
 
 _EXPECTED_TABLES: tuple[str, ...] = (
     "agent_runs",
     "agent_events",
     "agent_file_claims",
+    "agent_file_claim_events",
     "agent_task_preflights",
     "agent_run_blockers",
 )

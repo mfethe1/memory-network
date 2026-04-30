@@ -16,19 +16,15 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.request import Request, urlopen
+
+from code_index import agent_providers
 
 
 AGENT_COMMAND_ENV_VAR = "CODE_INDEX_AGENT_COMMAND"
 AGENT_PROVIDER_ENV_VAR = "CODE_INDEX_AGENT_PROVIDER"
-PROVIDER_COMMANDS = {
-    "claude": "claude -p {provider_prompt}",
-    "codex": (
-        "codex exec -C {root} -s workspace-write --json "
-        "-o {last_message} - < {provider_prompt_file}"
-    ),
-}
+PROVIDER_COMMANDS = agent_providers.PROVIDER_COMMANDS
 STRUCTURED_EVENT_TYPES = {
     "read",
     "edit",
@@ -192,6 +188,21 @@ def _task_provider_prompt_path(root: Path, task: dict[str, Any]) -> Path:
     return _task_run_dir(root, task) / "provider-prompt.txt"
 
 
+def _task_mcp_config_path(root: Path, task: dict[str, Any]) -> Path:
+    return _task_run_dir(root, task) / "mcp.json"
+
+
+def _build_mcp_config(root: Path) -> dict[str, Any]:
+    return {
+        "mcpServers": {
+            "code-index": {
+                "command": sys.executable,
+                "args": ["-m", "code_index", "mcp-serve", "--root", str(root)],
+            }
+        }
+    }
+
+
 def _build_provider_prompt(
     task: dict[str, Any],
     *,
@@ -285,6 +296,8 @@ def _build_provider_prompt(
         "Keep the graph UI current by emitting CODE_INDEX_EVENT JSON lines or "
         "posting to callback.agent_events_url with this run_id when you read, "
         "edit, test, navigate, make a decision, or finish.\n"
+        "If a code-index MCP server is available, use it for repo-map, symbol, "
+        "context, and impact lookups instead of broad manual scanning.\n"
         "If the request asks for a code change, make the edit in the workspace, "
         "run the most relevant verification you can, and end with changed files, "
         "tests run, and any risk or blocker."
@@ -300,6 +313,7 @@ def _format_command(
     task_json_path: Path,
     last_message_path: Path | None = None,
     provider_prompt_path: Path | None = None,
+    mcp_config_path: Path | None = None,
 ) -> str:
     selected_paths = _string_list(task.get("selected_paths"))
     selected_nodes = _string_list(task.get("selected_nodes"))
@@ -307,6 +321,7 @@ def _format_command(
     run_id = str(task.get("run_id") or "")
     last_message = last_message_path or _task_last_message_path(root, task)
     prompt_path = provider_prompt_path or _task_provider_prompt_path(root, task)
+    mcp_path = mcp_config_path or _task_mcp_config_path(root, task)
     provider_prompt = _build_provider_prompt(
         task,
         root=root,
@@ -328,6 +343,8 @@ def _format_command(
             "last_message_raw": str(last_message),
             "provider_prompt_file": _shell_quote(prompt_path),
             "provider_prompt_file_raw": str(prompt_path),
+            "mcp_config_file": _shell_quote(mcp_path),
+            "mcp_config_file_raw": str(mcp_path),
             "selected_paths": _shell_join(selected_paths),
             "selected_paths_raw": " ".join(selected_paths),
             "selected_nodes": _shell_join(selected_nodes),
@@ -343,23 +360,30 @@ def resolve_agent_command(
 ) -> tuple[str | None, str]:
     command_value = command
     if command_value:
-        provider_value = (provider or "").strip().lower()
-        return command_value, provider_value if provider_value in PROVIDER_COMMANDS else "custom"
-    provider_value = (provider or "").strip().lower()
+        provider_value = agent_providers.normalize_provider_id(provider)
+        return (
+            command_value,
+            provider_value if provider_value in PROVIDER_COMMANDS else "custom",
+        )
+    provider_value = agent_providers.normalize_provider_id(provider)
     if provider_value and provider_value != "custom":
         preset = PROVIDER_COMMANDS.get(provider_value)
         if not preset:
-            raise ValueError(f"unknown agent provider: {provider_value}")
+            agent_providers.require_provider(provider_value)
+            raise ValueError(f"agent provider has no command preset: {provider_value}")
         return preset, provider_value
     command_value = os.environ.get(AGENT_COMMAND_ENV_VAR)
     if command_value:
         return command_value, "custom"
-    provider_value = (os.environ.get(AGENT_PROVIDER_ENV_VAR) or "custom").strip().lower()
-    if provider_value in {"", "custom"}:
+    provider_value = agent_providers.normalize_provider_id(
+        os.environ.get(AGENT_PROVIDER_ENV_VAR)
+    )
+    if provider_value == "custom":
         return None, "custom"
     preset = PROVIDER_COMMANDS.get(provider_value)
     if not preset:
-        raise ValueError(f"unknown agent provider: {provider_value}")
+        agent_providers.require_provider(provider_value)
+        raise ValueError(f"agent provider has no command preset: {provider_value}")
     return preset, provider_value
 
 
@@ -486,7 +510,7 @@ def _json_output_event(line: str) -> dict[str, Any] | None:
         return None
     event_type = str(payload.get("event_type") or payload.get("type") or "").strip().lower()
     if event_type not in STRUCTURED_EVENT_TYPES:
-        return _codex_jsonl_output_event(payload)
+        return _provider_jsonl_output_event(payload)
     event_payload = payload.get("payload") or {}
     if not isinstance(event_payload, dict):
         event_payload = {"value": event_payload}
@@ -551,6 +575,85 @@ def _text_from_item(item: dict[str, Any]) -> str:
         if parts:
             return "\n".join(parts)
     return ""
+
+
+def _content_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for part in value:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text") or part.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(part for part in parts if part)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _safe_json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError:
+            return {"raw": value}
+        return payload if isinstance(payload, dict) else {"value": payload}
+    return {}
+
+
+def _tool_call_name(tool_call: dict[str, Any]) -> str:
+    function = tool_call.get("function")
+    if isinstance(function, dict) and function.get("name"):
+        return str(function["name"])
+    return str(tool_call.get("name") or tool_call.get("tool_name") or "tool")
+
+
+def _tool_call_args(tool_call: dict[str, Any]) -> dict[str, Any]:
+    function = tool_call.get("function")
+    if isinstance(function, dict) and "arguments" in function:
+        return _safe_json_dict(function.get("arguments"))
+    for key in ("arguments", "args", "input"):
+        if key in tool_call:
+            return _safe_json_dict(tool_call.get(key))
+    return {}
+
+
+def _tool_call_file_path(tool_calls: list[dict[str, Any]]) -> str | None:
+    path_keys = ("file_path", "path", "filepath", "target_file", "filename")
+    for tool_call in tool_calls:
+        args = _tool_call_args(tool_call)
+        for key in path_keys:
+            value = args.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _tool_call_event_type(tool_calls: list[dict[str, Any]]) -> str:
+    names = " ".join(_tool_call_name(call).lower() for call in tool_calls)
+    commands = " ".join(
+        str(_tool_call_args(call).get("command") or "").lower()
+        for call in tool_calls
+    )
+    if any(token in names for token in ("edit", "write", "replace", "patch")):
+        return "edit"
+    if any(token in names for token in ("read", "open", "view")):
+        return "read"
+    if any(token in commands for token in ("pytest", "test", "npm test", "ruff", "mypy")):
+        return "test"
+    if any(token in names for token in ("grep", "glob", "search", "list", "find")):
+        return "navigate"
+    return "tool"
+
+
+def _provider_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
+    return _codex_jsonl_output_event(payload) or _kimi_jsonl_output_event(payload)
 
 
 def _codex_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -635,6 +738,76 @@ def _codex_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
             "symbol_path": None,
             "status": None,
             "payload": {"provider_event": event_type, "item_type": item_type},
+        }
+    return None
+
+
+def _kimi_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
+    role = str(payload.get("role") or "").strip().lower()
+    if not role:
+        return None
+    tool_calls = payload.get("tool_calls")
+    tool_call_items = [
+        item for item in tool_calls if isinstance(item, dict)
+    ] if isinstance(tool_calls, list) else []
+    content = _content_text(payload.get("content")).strip()
+    provider_payload: dict[str, Any] = {
+        "provider_event": "kimi.message",
+        "role": role,
+    }
+    if tool_call_items:
+        provider_payload["tool_calls"] = [
+            {
+                "id": str(item.get("id") or ""),
+                "name": _tool_call_name(item),
+                "arguments": _tool_call_args(item),
+            }
+            for item in tool_call_items
+        ]
+
+    if role == "assistant":
+        if tool_call_items:
+            names = ", ".join(_tool_call_name(item) for item in tool_call_items)
+            detail = f"Kimi requested tool call: {names}" if names else "Kimi requested a tool call."
+            if content:
+                detail = f"{content}\n{detail}"
+            return {
+                "event_type": _tool_call_event_type(tool_call_items),
+                "message": detail,
+                "file_path": _tool_call_file_path(tool_call_items),
+                "symbol_path": None,
+                "status": None,
+                "payload": provider_payload,
+            }
+        if content:
+            return {
+                "event_type": "decision",
+                "message": content,
+                "file_path": None,
+                "symbol_path": None,
+                "status": None,
+                "payload": provider_payload,
+            }
+    if role == "tool":
+        tool_call_id = str(payload.get("tool_call_id") or "").strip()
+        if tool_call_id:
+            provider_payload["tool_call_id"] = tool_call_id
+        return {
+            "event_type": "tool",
+            "message": content or "Kimi tool returned.",
+            "file_path": None,
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+    if role == "user" and content:
+        return {
+            "event_type": "note",
+            "message": content,
+            "file_path": None,
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
         }
     return None
 
@@ -876,10 +1049,12 @@ def _run_command(
     command_timeout: float | None = None,
     max_output_events: int = 400,
     cancel_event: threading.Event | None = None,
+    process_started_callback: Callable[[int, str], None] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     selected_paths = _string_list(task.get("selected_paths"))
     last_message_path = _task_last_message_path(root, task)
     provider_prompt_path = _task_provider_prompt_path(root, task)
+    mcp_config_path = _task_mcp_config_path(root, task)
     try:
         last_message_path.unlink()
     except OSError:
@@ -890,6 +1065,10 @@ def _run_command(
         task_json_path=task_json_path,
     )
     provider_prompt_path.write_text(provider_prompt, encoding="utf-8")
+    mcp_config_path.write_text(
+        json.dumps(_build_mcp_config(root), indent=2) + "\n",
+        encoding="utf-8",
+    )
     formatted = _format_command(
         command,
         task,
@@ -897,6 +1076,7 @@ def _run_command(
         task_json_path=task_json_path,
         last_message_path=last_message_path,
         provider_prompt_path=provider_prompt_path,
+        mcp_config_path=mcp_config_path,
     )
     command_label = command
     candidate_paths = _task_candidate_paths(task, root)
@@ -918,6 +1098,7 @@ def _run_command(
                 "task_json": str(task_json_path),
                 "last_message": str(last_message_path),
                 "provider_prompt": str(provider_prompt_path),
+                "mcp_config": str(mcp_config_path),
             },
         )
     )
@@ -991,6 +1172,44 @@ def _run_command(
             "responses": responses,
             "error": str(exc),
         }
+
+    if process_started_callback is not None:
+        try:
+            process_started_callback(process.pid, command_label)
+        except Exception as exc:
+            _terminate_process_tree(process, force=False)
+            return_code = _wait_after_interrupt(process, force=False)
+            error_type = type(exc).__name__
+            error = f"{error_type}: {exc}"
+            message = f"Command adapter process registry callback failed: {error}"
+            try:
+                responses.append(
+                    _post_status(
+                        callback,
+                        task,
+                        message=message,
+                        status="failed",
+                        payload={
+                            "adapter": "command",
+                            "process_callback": "failed",
+                            "pid": process.pid,
+                            "error_type": error_type,
+                            "error": str(exc),
+                        },
+                    )
+                )
+                events_sent += 1
+            except OSError:
+                pass
+            return 1, {
+                "ok": False,
+                "status": "failed",
+                "run_id": task.get("run_id"),
+                "events_sent": events_sent,
+                "responses": responses,
+                "error": message,
+                "process_exit_code": return_code,
+            }
 
     _post_json(
         callback,
@@ -1109,6 +1328,12 @@ def _run_command(
         )
         events_sent += 1
 
+    last_decision = str(stream_state.get("last_decision_message") or "").strip()
+    if last_decision and not _read_text_if_present(last_message_path):
+        try:
+            last_message_path.write_text(last_decision + "\n", encoding="utf-8")
+        except OSError:
+            pass
     final_message = _read_text_if_present(last_message_path)
     if final_message and final_message != stream_state.get("last_decision_message"):
         _post_json(
@@ -1193,6 +1418,7 @@ def run_task(
     command_timeout: float | None = None,
     max_output_events: int = 400,
     cancel_event: threading.Event | None = None,
+    process_started_callback: Callable[[int, str], None] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     callback = callback_url or _callback_from_task(task)
     if not callback:
@@ -1235,6 +1461,7 @@ def run_task(
             command_timeout=command_timeout,
             max_output_events=max_output_events,
             cancel_event=cancel_event,
+            process_started_callback=process_started_callback,
         )
         if result.get("command"):
             result["provider"] = command_provider

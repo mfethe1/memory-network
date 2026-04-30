@@ -17,11 +17,13 @@ from pathlib import Path
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
 from code_index import agent_activity
+from code_index import lease_manager
 from code_index.cli import main
 from code_index.commands import agent_adapter_cmd
 from code_index.commands import mcp_tool_impl
 from code_index.commands.graph_notes import graph_notes_block
 from code_index.commands.graph_server_cmd import _agent_stream_payload, _make_handler
+from code_index.commands.graph_server_http import _make_perf_state, _observe_latency
 
 
 def _request_json(
@@ -67,6 +69,22 @@ def _request_status(
             return int(response.status)
     except urllib.error.HTTPError as exc:
         return int(exc.code)
+
+
+def _request_raw_status(
+    url: str, body: bytes, headers: dict | None = None
+) -> tuple[int, str]:
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers=dict(headers or {}),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return int(response.status), response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return int(exc.code), exc.read().decode("utf-8")
 
 
 def _preflight_task_payload(
@@ -194,6 +212,72 @@ def _wait_for_event_message(
     raise AssertionError(f"event containing {needle!r} was not recorded: {last_messages}")
 
 
+def _wait_for_process_row(config: cfg_mod.Config, run_id: str) -> dict:
+    deadline = time.time() + 5
+    last_status = None
+    while time.time() < deadline:
+        conn = db_mod.connect(config.db_path)
+        try:
+            row = conn.execute(
+                """
+                SELECT p.*, r.run_id
+                  FROM agent_run_processes p
+                  JOIN agent_runs r ON r.run_pk = p.run_pk
+                 WHERE r.run_id = ?
+                 ORDER BY p.process_pk DESC
+                 LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+        finally:
+            db_mod.close(conn)
+        if row is not None:
+            last_status = row["status"]
+            if row["status"] in {"completed", "failed", "cancelled", "orphaned"}:
+                return dict(row)
+        time.sleep(0.05)
+    raise AssertionError(f"process row for {run_id} did not finish: {last_status}")
+
+
+def test_graph_server_agent_providers_endpoint_returns_registry(
+    tmp_path: Path, capsys, monkeypatch
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("def value() -> int:\n    return 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        providers = _request_json(f"{base_url}/api/agent-providers")
+        assert providers["ok"] is True
+        assert providers["kind"] == "code_index_agent_provider_registry"
+        providers_by_id = {
+            provider["id"]: provider for provider in providers["providers"]
+        }
+        assert providers_by_id["codex"]["display_name"] == "Codex"
+        assert "stream_json_output" in providers_by_id["kimi"]["capabilities"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_graph_server_serves_graph_and_records_notes_and_events(
     tmp_path: Path, capsys, monkeypatch
 ):
@@ -233,8 +317,21 @@ def test_graph_server_serves_graph_and_records_notes_and_events(
         assert graph["live"]["search_path"] == "/api/search"
         assert graph["live"]["agent_preflight_path"] == "/api/agent-task-preflight"
         assert graph["live"]["agent_runs_path"] == "/api/agent-runs"
+        assert graph["live"]["agent_providers_path"] == "/api/agent-providers"
+        live_providers_by_id = {
+            provider["id"]: provider for provider in graph["live"]["agent_providers"]
+        }
+        assert live_providers_by_id["codex"]["display_name"] == "Codex"
         assert graph["agent"]["active_files"] == ["pkg/a.py"]
         assert "file:pkg/a.py" in {node["id"] for node in graph["nodes"]}
+
+        providers = _request_json(f"{base_url}/api/agent-providers")
+        assert providers["kind"] == "code_index_agent_provider_registry"
+        providers_by_id = {
+            provider["id"]: provider for provider in providers["providers"]
+        }
+        assert providers_by_id["codex"]["display_name"] == "Codex"
+        assert "stream_json_output" in providers_by_id["kimi"]["capabilities"]
 
         debug = _request_json(f"{base_url}/api/debug")
         assert debug["kind"] == "code_index_graph_debug"
@@ -425,6 +522,333 @@ def test_graph_server_serves_graph_and_records_notes_and_events(
         thread.join(timeout=5)
 
 
+def test_graph_server_exposes_review_queue_in_all_agent_board_payloads(
+    tmp_path: Path, capsys, monkeypatch
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    conn = db_mod.connect(config.db_path)
+    try:
+        review_run = agent_activity.start_run(
+            conn,
+            agent_name="Kimi",
+            prompt="Implementation ready for user review.",
+            status="working",
+        )
+        agent_activity.end_run(conn, run_id=review_run["run_id"], status="review")
+    finally:
+        db_mod.close(conn)
+
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        graph = _request_json(f"{base_url}/repo-graph.json")
+        graph_review = graph["agent"]["orchestrator"]["review_runs"]
+        assert [run["run_id"] for run in graph_review] == [review_run["run_id"]]
+        assert graph_review[0]["run_health"]["health"] == "needs_review"
+        assert (
+            graph["agent"]["kanban"]["columns"]["review"]["runs"][0]["run_health"][
+                "health"
+            ]
+            == "needs_review"
+        )
+
+        stream = _agent_stream_payload(config)
+        assert [
+            run["run_id"]
+            for run in stream["agent"]["orchestrator"]["review_runs"]
+        ] == [review_run["run_id"]]
+
+        board = _request_json(f"{base_url}/api/agent-board")
+        assert [run["run_id"] for run in board["orchestrator"]["review_runs"]] == [
+            review_run["run_id"]
+        ]
+        assert (
+            board["columns"]["review"]["runs"][0]["run_health"]["health"]
+            == "needs_review"
+        )
+
+        task = _request_json(
+            f"{base_url}/api/agent-runs",
+            {"agent_name": "Codex", "message": "Queue a follow-up task."},
+        )
+        assert task["ok"] is True
+        assert [
+            run["run_id"]
+            for run in task["board"]["orchestrator"]["review_runs"]
+        ] == [review_run["run_id"]]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_graph_server_starts_agent_swarm_as_child_runs(tmp_path: Path, capsys, monkeypatch):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        result = _request_json(
+            f"{base_url}/api/agent-runs",
+            _preflight_task_payload(
+                base_url,
+                {
+                    "provider": "custom",
+                    "execution_strategy": "agent_swarm",
+                    "message": "Run a coordinated implementation swarm.",
+                    "selected_nodes": ["file:pkg/a.py"],
+                    "selected_paths": ["pkg/a.py"],
+                    "node": {
+                        "id": "file:pkg/a.py",
+                        "path": "pkg/a.py",
+                        "kind": "file",
+                    },
+                    "swarm": {
+                        "enabled": True,
+                        "provider": "custom",
+                        "size": 2,
+                        "roles": ["coordinator", "implementer"],
+                    },
+                },
+            ),
+        )
+        assert result["ok"] is True
+        assert result["run"]["metadata"]["execution_strategy"] == "swarm"
+        assert result["run"]["metadata"]["swarm"]["role"] == "lead"
+        assert (
+            result["run"]["metadata"]["swarm"]["completion_policy"]
+            == "all_children_terminal"
+        )
+        assert result["run"]["status"] == "working"
+        assert result["task"]["execution_strategy"] == "swarm"
+        assert result["task"]["swarm"]["provider"] == "custom"
+        assert any(
+            child["role"] == "implementer" and child["provider"] == "custom"
+            for child in result["task"]["swarm_children"]
+        )
+        assert [child["role"] for child in result["task"]["swarm_children"]] == [
+            "coordinator",
+            "implementer",
+        ]
+        assert result["dispatch"]["transport"] == "swarm"
+        assert result["dispatch"]["status"] == "not_configured"
+        assert len(result["dispatch"]["children"]) == 2
+
+        conn = db_mod.connect(config.db_path)
+        try:
+            child_runs = [
+                run
+                for run in agent_activity.recent_runs(conn, limit=10)
+                if (run.get("metadata") or {}).get("parent_run_id")
+                == result["run"]["run_id"]
+            ]
+        finally:
+            db_mod.close(conn)
+        assert len(child_runs) == 2
+        assert {run["status"] for run in child_runs} == {"queued"}
+        assert {
+            (run.get("metadata") or {}).get("swarm", {}).get("role")
+            for run in child_runs
+        } == {"coordinator", "implementer"}
+        conn = db_mod.connect(config.db_path)
+        try:
+            claims = agent_activity.active_file_claims(
+                conn,
+                file_path="pkg/a.py",
+                limit=20,
+            )
+        finally:
+            db_mod.close(conn)
+        modes_by_agent = {claim["agent_name"]: claim["mode"] for claim in claims}
+        assert any(mode == "edit" for mode in modes_by_agent.values())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_graph_server_reconciles_swarm_parent_when_children_stop(
+    tmp_path: Path, capsys, monkeypatch
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        result = _request_json(
+            f"{base_url}/api/agent-runs",
+            {
+                "provider": "custom",
+                "execution_strategy": "agent_swarm",
+                "message": "Run a completion-only swarm.",
+                "swarm": {
+                    "enabled": True,
+                    "provider": "custom",
+                    "size": 2,
+                    "roles": ["coordinator", "reviewer"],
+                },
+            },
+        )
+        children = result["task"]["swarm_children"]
+        assert len(children) == 2
+
+        first = _request_json(
+            f"{base_url}/api/agent-events",
+            {
+                "run_id": children[0]["run_id"],
+                "event_type": "status",
+                "message": "Coordinator done.",
+                "status": "completed",
+            },
+        )
+        assert first["swarm_reconciliation"]["changed"] is False
+        conn = db_mod.connect(config.db_path)
+        try:
+            parent = agent_activity.get_run(conn, result["run"]["run_id"])
+        finally:
+            db_mod.close(conn)
+        assert parent["status"] == "working"
+
+        second = _request_json(
+            f"{base_url}/api/agent-events",
+            {
+                "run_id": children[1]["run_id"],
+                "event_type": "status",
+                "message": "Reviewer done.",
+                "status": "completed",
+            },
+        )
+
+        assert second["swarm_reconciliation"]["changed"] is True
+        assert second["swarm_reconciliation"]["status"] == "review"
+        conn = db_mod.connect(config.db_path)
+        try:
+            parent = agent_activity.get_run(conn, result["run"]["run_id"])
+        finally:
+            db_mod.close(conn)
+        assert parent["status"] == "review"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_graph_server_rolls_back_swarm_start_when_child_claims_conflict(
+    tmp_path: Path, capsys, monkeypatch
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        payload = _preflight_task_payload(
+            base_url,
+            {
+                "provider": "custom",
+                "execution_strategy": "agent_swarm",
+                "message": "Start a conflicting edit swarm.",
+                "selected_nodes": ["file:pkg/a.py"],
+                "selected_paths": ["pkg/a.py"],
+                "node": {"id": "file:pkg/a.py", "path": "pkg/a.py", "kind": "file"},
+                "swarm": {
+                    "enabled": True,
+                    "provider": "custom",
+                    "size": 2,
+                    "roles": ["implementer", "implementer"],
+                },
+            },
+        )
+
+        assert _request_status(f"{base_url}/api/agent-runs", payload) == 409
+
+        conn = db_mod.connect(config.db_path)
+        try:
+            assert agent_activity.recent_runs(conn, limit=10) == []
+            assert agent_activity.active_file_claims(conn, limit=10) == []
+        finally:
+            db_mod.close(conn)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_graph_server_streams_perf_tick_with_sanitized_counters(
     tmp_path: Path, capsys, monkeypatch
 ):
@@ -470,6 +894,161 @@ def test_graph_server_streams_perf_tick_with_sanitized_counters(
         assert "lease_token" not in serialized
         assert "bearer_token" not in serialized
         assert "session_cookie" not in serialized
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_graph_server_renews_and_releases_file_claim(tmp_path: Path, capsys, monkeypatch):
+    monkeypatch.delenv("CODE_INDEX_GRAPH_TOKEN", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text(
+        "def value():\n    return 1\n",
+        encoding="utf-8",
+    )
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    conn = db_mod.connect(config.db_path)
+    try:
+        db_mod.apply_schema(conn)
+        run = agent_activity.start_run(conn, agent_name="Codex", prompt="edit")
+        lease = lease_manager.create_lease(
+            conn,
+            run_id=run["run_id"],
+            file_path="pkg/a.py",
+            mode="edit",
+            reason="endpoint test",
+        )
+    finally:
+        db_mod.close(conn)
+
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=0.1,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        tokenless_release = _request_json(
+            f"{base_url}/api/file-claims",
+            {
+                "action": "release",
+                "run_id": lease["claim"]["run_id"],
+                "file_paths": ["pkg/a.py"],
+                "mode": "edit",
+            },
+        )
+        assert tokenless_release["ok"] is True
+        assert tokenless_release["claims"] == []
+        assert any(
+            claim["claim_id"] == lease["claim"]["claim_id"]
+            for claim in tokenless_release["active_claims"]
+        )
+
+        malformed_renew_status = _request_status(
+            f"{base_url}/api/file-claims/{lease['claim']['claim_id']}/renew",
+            {
+                "lease_token": lease["lease_token"],
+                "fence_token": "abc-fence-secret",
+            },
+        )
+        assert malformed_renew_status == 400
+        conn = db_mod.connect(config.db_path)
+        try:
+            events = lease_manager.claim_events(
+                conn,
+                claim_id=lease["claim"]["claim_id"],
+            )
+        finally:
+            db_mod.close(conn)
+        assert [event["event_type"] for event in events] == ["created", "denied"]
+        assert events[-1]["metadata"] == {"reason": "bad_fence"}
+        serialized_events = json.dumps(events, sort_keys=True)
+        assert lease["lease_token"] not in serialized_events
+        assert "abc-fence-secret" not in serialized_events
+
+        renewed = _request_json(
+            f"{base_url}/api/file-claims/{lease['claim']['claim_id']}/renew",
+            {
+                "lease_token": lease["lease_token"],
+                "fence_token": lease["claim"]["fence_token"],
+            },
+        )
+        released = _request_json(
+            f"{base_url}/api/file-claims/{lease['claim']['claim_id']}/release",
+            {"lease_token": lease["lease_token"]},
+        )
+
+        assert renewed["ok"] is True
+        assert renewed["claim"]["claim_id"] == lease["claim"]["claim_id"]
+        assert released["claim"]["status"] == "released"
+        assert "lease_token" not in json.dumps(released, sort_keys=True)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_graph_server_latency_observer_repairs_malformed_scoped_counters():
+    perf = _make_perf_state()
+    latency = perf["counters"]["search_latency_ms"]
+
+    latency["by_scope"] = "unexpected"
+    _observe_latency(perf, "search_latency_ms", 12.5, "all")
+    assert latency["by_scope"]["all"]["count"] == 1
+    assert latency["by_scope"]["all"]["avg"] == 12.5
+
+    latency["by_scope"]["all"] = "unexpected"
+    _observe_latency(perf, "search_latency_ms", 17.5, "all")
+    assert latency["count"] == 2
+    assert latency["avg"] == 15.0
+    assert latency["by_scope"]["all"]["count"] == 1
+    assert latency["by_scope"]["all"]["avg"] == 17.5
+
+
+def test_graph_server_rejects_non_object_json_posts(tmp_path: Path, capsys, monkeypatch):
+    monkeypatch.delenv("CODE_INDEX_GRAPH_TOKEN", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        status, body = _request_raw_status(
+            f"{base_url}/api/agent-events",
+            b"[]",
+            {"Content-Type": "application/json"},
+        )
+        assert status == 400
+        assert json.loads(body)["error"] == "JSON body must be an object"
     finally:
         server.shutdown()
         server.server_close()
@@ -589,6 +1168,115 @@ def test_graph_server_requires_and_consumes_preflight_for_graph_tasks(
         assert perf["counters"]["preflight_rejections"][
             "preflight_id is required for graph-scoped agent runs"
         ] == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_graph_server_rejects_preflight_when_execution_strategy_is_tampered(
+    tmp_path: Path, capsys, monkeypatch
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        payload = {
+            "provider": "custom",
+            "agent_name": "Codex",
+            "message": "Preflight this as a single task.",
+            "selected_nodes": ["file:pkg/a.py"],
+            "selected_paths": ["pkg/a.py"],
+            "node": {"id": "file:pkg/a.py", "path": "pkg/a.py", "kind": "file"},
+            "execution_strategy": "single",
+        }
+        preflighted = _preflight_task_payload(base_url, payload)
+        tampered = dict(preflighted)
+        tampered["execution_strategy"] = "agent_swarm"
+        tampered["swarm"] = {
+            "enabled": True,
+            "provider": "custom",
+            "size": 2,
+            "roles": ["coordinator", "tester"],
+        }
+
+        assert _request_status(f"{base_url}/api/agent-runs", tampered) == 412
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_graph_server_rejects_preflight_when_swarm_shape_is_tampered(
+    tmp_path: Path, capsys, monkeypatch
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        payload = {
+            "provider": "custom",
+            "agent_name": "Codex",
+            "message": "Preflight this as a swarm task.",
+            "selected_nodes": ["file:pkg/a.py"],
+            "selected_paths": ["pkg/a.py"],
+            "node": {"id": "file:pkg/a.py", "path": "pkg/a.py", "kind": "file"},
+            "execution_strategy": "agent_swarm",
+            "swarm": {
+                "enabled": True,
+                "provider": "custom",
+                "size": 2,
+                "roles": ["coordinator", "tester"],
+            },
+        }
+        preflighted = _preflight_task_payload(base_url, payload)
+        tampered = dict(preflighted)
+        tampered["swarm"] = {
+            "enabled": True,
+            "provider": "custom",
+            "size": 3,
+            "roles": ["coordinator", "implementer", "tester"],
+        }
+
+        assert _request_status(f"{base_url}/api/agent-runs", tampered) == 412
     finally:
         server.shutdown()
         server.server_close()
@@ -1342,6 +2030,12 @@ def test_graph_server_dispatches_local_command_adapter(
         finally:
             db_mod.close(conn)
         assert any("local dispatch: Run from graph UI." in event["message"] for event in recent)
+        process = _wait_for_process_row(config, task_response["run"]["run_id"])
+        assert process["transport"] == "local-command"
+        assert process["provider"] == task_response["dispatch"]["provider"]
+        assert process["status"] == "completed"
+        assert process["exit_code"] == 0
+        assert isinstance(process["pid"], int)
     finally:
         server.shutdown()
         server.server_close()
@@ -1511,6 +2205,8 @@ def test_graph_server_cancel_interrupts_local_command_adapter_process(
         assert not finished_path.exists()
         run = _wait_for_run_status(config, run_id, "cancelled")
         assert run["status"] == "cancelled"
+        process = _wait_for_process_row(config, run_id)
+        assert process["status"] == "cancelled"
     finally:
         server.shutdown()
         server.server_close()

@@ -63,7 +63,7 @@ def lookup(
     # retry against the resolved canonical name. Marks hits with
     # `via_reexport=True` so consumers can surface the indirection.
     if not results and "." in query:
-        from code_index.pipeline import _build_reexport_map
+        from code_index.relation_resolver import _build_reexport_map
 
         rx_map = _build_reexport_map(conn)
         seen: set[str] = {query}

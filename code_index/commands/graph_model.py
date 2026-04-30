@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from code_index import agent_activity
+from code_index import run_orchestrator
 from code_index.commands.graph_notes import graph_notes_block
 
 
@@ -657,8 +658,8 @@ def build_graph(
     symbols_by_file = _collect_symbols_by_file(conn)
     context_by_file = _collect_context_by_file(conn)
     index_recent_edits, _index_recent_edits_by_file = _collect_recent_edits(conn)
-    activity_snapshot = agent_activity.activity_snapshot(
-        conn, event_limit=120, file_limit=8
+    activity_snapshot = run_orchestrator.annotate_activity_snapshot(
+        agent_activity.activity_snapshot(conn, event_limit=120, file_limit=8)
     )
     agent_recent_events = activity_snapshot["recent_events"]
     active_claims = activity_snapshot.get("active_claims", [])
@@ -992,6 +993,7 @@ def build_graph(
             "recent_runs": activity_snapshot.get("recent_runs", []),
             "active_claims": active_claims,
             "kanban": activity_snapshot.get("kanban"),
+            "orchestrator": activity_snapshot.get("orchestrator"),
             "status": agent_status,
         },
         "summary": {
@@ -1045,5 +1047,7 @@ def build_graph(
             "Importance is a deterministic heuristic over indexed relations, symbols, tests, edits, and path role.",
             "External dependencies and dynamic runtime calls are not graph nodes.",
             "Unsupported files use heuristic file-level chunks, so their summaries are less precise.",
+            "Call and inheritance edges are best-effort; dynamic dispatch and runtime metaprogramming are not captured.",
+            "Agent-derived relationships are inferred from navigation patterns, not static analysis.",
         ],
     }

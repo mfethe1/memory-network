@@ -10,11 +10,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+for _parent in Path(__file__).resolve().parents:
+    if (_parent / "code_index").is_dir():
+        if str(_parent) not in sys.path:
+            sys.path.insert(0, str(_parent))
+        break
 
-PROVIDER_COMMANDS = {
-    "claude": "claude -p {message}",
-    "codex": "codex exec {message}",
-}
+from code_index import agent_providers  # noqa: E402
+
+
+PROVIDER_COMMANDS = agent_providers.PROVIDER_COMMANDS
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,17 +28,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--root", default=".", help="repo root to serve")
     parser.add_argument("--host", default="127.0.0.1", help="bind host")
-    parser.add_argument("--port", default="8768", help="bind port")
+    parser.add_argument("--port", default="8767", help="bind port")
     parser.add_argument(
         "--agent-command",
         help=(
-            "local command template for graph-submitted tasks, for example "
-            "'claude -p {message}' or 'codex exec {message}'"
+            "local command template for graph-submitted tasks; placeholders include "
+            "{message}, {provider_prompt}, {provider_prompt_file}, {last_message}, "
+            "{mcp_config_file}, {root}, and {task_json}"
         ),
     )
     parser.add_argument(
         "--provider",
-        choices=["custom", "claude", "codex"],
+        choices=agent_providers.provider_choices(),
         default="custom",
         help="provider preset used when --agent-command is omitted",
     )
@@ -76,13 +82,21 @@ def _command_executable(command: str) -> str | None:
 def _resolve_agent_command(args: argparse.Namespace) -> tuple[str | None, str]:
     if args.agent_command:
         return args.agent_command, "custom"
-    if args.provider != "custom":
-        return PROVIDER_COMMANDS[args.provider], args.provider
+    provider = agent_providers.normalize_provider_id(args.provider)
+    if provider != "custom":
+        preset = PROVIDER_COMMANDS.get(provider)
+        if preset is None:
+            agent_providers.require_provider(provider)
+            raise ValueError(f"agent provider has no command preset: {provider}")
+        return preset, provider
     return None, "custom"
 
 
 def _validate_agent_command(args: argparse.Namespace) -> tuple[bool, str]:
-    command, provider = _resolve_agent_command(args)
+    try:
+        command, provider = _resolve_agent_command(args)
+    except ValueError as exc:
+        return False, str(exc)
     if not command:
         return True, "no local agent command configured"
     executable = _command_executable(command)

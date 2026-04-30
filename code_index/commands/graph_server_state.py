@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from code_index import agent_activity
+from code_index import agent_providers
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
+from code_index import run_orchestrator
 from code_index.agent_collaboration import append_event_jsonl
 from code_index.commands.graph_model import build_graph
 from code_index.commands.graph_notes import notes_path
@@ -55,8 +57,8 @@ def _agent_stream_payload(config: cfg_mod.Config) -> dict[str, Any]:
     try:
         db_mod.ensure_schema(conn, config)
         event_pk = _latest_event_pk(conn)
-        snapshot = agent_activity.activity_snapshot(
-            conn, event_limit=80, file_limit=8
+        snapshot = run_orchestrator.annotate_activity_snapshot(
+            agent_activity.activity_snapshot(conn, event_limit=80, file_limit=8)
         )
     finally:
         db_mod.close(conn)
@@ -89,6 +91,7 @@ def _agent_stream_payload(config: cfg_mod.Config) -> dict[str, Any]:
             "recent_runs": snapshot.get("recent_runs", []),
             "active_claims": snapshot.get("active_claims", []),
             "kanban": snapshot.get("kanban"),
+            "orchestrator": snapshot.get("orchestrator"),
             "status": "working" if snapshot["active_runs"] else "idle",
         },
         "activity": {
@@ -153,6 +156,8 @@ def _build_payload(config: cfg_mod.Config, args: argparse.Namespace) -> dict[str
             "agent_runs_path": "/api/agent-runs",
             "agent_events_path": "/api/agent-events",
             "agent_board_path": "/api/agent-board",
+            "agent_providers_path": "/api/agent-providers",
+            "agent_providers": agent_providers.provider_registry_payload(),
         }
         return payload
     finally:

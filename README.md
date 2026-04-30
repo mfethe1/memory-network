@@ -73,7 +73,7 @@ python -m code_index agent-adapter --mode command \
 
 # Start the repo-local plugin launcher for Claude/Codex/other command adapters
 python plugins/code-index-agent/scripts/install_plugin.py --root . --provider codex --json
-python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 8768 \
+python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 8767 \
   --provider codex
 
 # Import a SCIP semantic index exported as JSON
@@ -116,8 +116,9 @@ uses this to highlight active files and the last edited files before the index
 has been refreshed.
 
 When served through `graph-server`, the Chat tab can submit a task for the
-selected node and choose the configured adapter, Codex CLI, or Claude CLI per
-message. The Notes tab keeps the same submit/export path for saved guidance.
+selected node and choose the configured adapter, Codex CLI, Claude CLI, or Kimi
+Code CLI per message. The Notes tab keeps the same submit/export path for saved
+guidance.
 Browser task submission now runs as draft -> preflight -> dispatch:
 `POST /api/agent-task-preflight` builds the normalized task draft, graph
 context, runtime retrieval policy, care warnings, and active file-claim
@@ -128,8 +129,11 @@ callback URL, and dispatches the task when an adapter is configured. Set
 `CODE_INDEX_AGENT_WEBHOOK_URL` to send task JSON to an HTTP webhook, or set
 `CODE_INDEX_AGENT_COMMAND` to launch a local command adapter directly from the
 graph server. You can also set
-`CODE_INDEX_AGENT_PROVIDER=claude` or `CODE_INDEX_AGENT_PROVIDER=codex` for
-built-in local presets. Each submitted task includes a bounded
+`CODE_INDEX_AGENT_PROVIDER=claude`, `CODE_INDEX_AGENT_PROVIDER=codex`, or
+`CODE_INDEX_AGENT_PROVIDER=kimi` for built-in local presets. The Kimi preset
+uses non-interactive stream JSON mode, thinking mode, one Ralph iteration, and a
+per-run MCP config that exposes `code_index mcp-serve` to the agent. Each
+submitted task includes a bounded
 `context_packet` with repo-map, selected files/nodes, matching chunks, graph
 notes, and recent agent activity. The command adapter streams stdout/stderr
 back as graph events and marks the run completed or failed from the process

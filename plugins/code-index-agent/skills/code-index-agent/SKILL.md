@@ -33,7 +33,7 @@ python -m code_index init --json
 | Build an agent handoff packet | `python -m code_index context "task" --json` |
 | Understand blast radius | `python -m code_index impact Symbol --json` |
 | Find affected tests | `python -m code_index tests Symbol --runner pytest` |
-| Open the browser graph | `python -m code_index graph-server --port 8768` |
+| Open the browser graph | `python -m code_index graph-server --port 8767` |
 
 ## Live Graph Control Plane
 
@@ -41,18 +41,20 @@ Install repo-local integration files:
 
 ```bash
 python plugins/code-index-agent/scripts/install_plugin.py --root . --provider codex --json
+# or use Kimi Code CLI for browser-submitted coding tasks
+python plugins/code-index-agent/scripts/install_plugin.py --root . --provider kimi --json
 ```
 
 Start the graph server:
 
 ```bash
-python -m code_index graph-server --port 8768
+python -m code_index graph-server --port 8767
 ```
 
 Open:
 
 ```text
-http://127.0.0.1:8768/repo-graph.html
+http://127.0.0.1:8767/repo-graph.html
 ```
 
 To let graph-submitted tasks launch a local agent command, set
@@ -64,8 +66,8 @@ placeholders: `{message}`, `{run_id}`, `{root}`, `{task_json}`,
 Examples:
 
 ```bash
-CODE_INDEX_AGENT_PROVIDER=claude python -m code_index graph-server --port 8768
-CODE_INDEX_AGENT_PROVIDER=codex python -m code_index graph-server --port 8768
+CODE_INDEX_AGENT_PROVIDER=claude python -m code_index graph-server --port 8767
+CODE_INDEX_AGENT_PROVIDER=codex python -m code_index graph-server --port 8767
 ```
 
 The browser cancel button interrupts the local command process tree and records

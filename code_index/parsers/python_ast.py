@@ -5,12 +5,14 @@ priority order when parsing Python in v1. Emits:
 
 - symbols: module, class, function, method
 - occurrences: definition + import (as import references)
-- relations: contains (class -> method, module -> class/function), imports
+- relations: contains (class -> method, module -> class/function), imports,
+  calls (function/method -> callee), inherits (class -> base)
 - chunks: module + class + function/method (no inner-block splits in v1)
 
 Known limits (tracked, not bugs):
 - Does not follow imports or resolve cross-file references beyond the name.
-- Does not infer overrides or call graph (calls relation is not emitted yet).
+- Calls and inheritance use best-effort scope resolution; dynamic dispatch
+  (e.g., getattr, method passed as variable) is not tracked.
 - Decorators stored as source slices, not resolved to symbols.
 """
 

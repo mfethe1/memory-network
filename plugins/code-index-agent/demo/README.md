@@ -20,7 +20,7 @@ On non-Windows shells:
 sh .code_index/start-code-index-agent.sh
 ```
 
-3. Open `http://127.0.0.1:8768/repo-graph.html`.
+3. Open `http://127.0.0.1:8767/repo-graph.html`.
 
 4. Select a file, open the Notes tab, submit a task, then click `View` in the
 agent runs pane to inspect the transcript.

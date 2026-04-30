@@ -190,24 +190,117 @@ def test_graph_ui_submits_agent_task_and_streams_output(
             assert composer_box is not None
             assert composer_box["y"] > body_box["y"]
             assert page.locator("#run-followup-message").is_visible()
+            task = json.loads(seen_task_path.read_text(encoding="utf-8"))
+            run = _wait_for_run_status(config, task["run_id"], "completed")
+            assert run["status"] == "completed"
+            page.locator("#agent-runs", has_text="No queued or active runs.").wait_for(
+                timeout=10000
+            )
+            page.locator("#agent-runs .past-runs summary", has_text="Past runs (1)").click()
             page.locator("#agent-runs").get_by_role("button", name="Stream").first.wait_for(
                 timeout=10000
             )
             page.locator('[data-nav-node="file:pkg/b.py"]').first.click()
+            page.locator("#agent-runs .past-runs summary", has_text="Past runs (1)").click()
             page.locator("#agent-runs .run-select").first.click()
             page.locator("#terminal-stream-body").wait_for(timeout=10000)
 
-            task = json.loads(seen_task_path.read_text(encoding="utf-8"))
             assert task["graph_context"]["kind"] == "code_index_graph_context"
             assert task["context_packet"]["graph_context"] == task["graph_context"]
             assert task["collaboration"]["kind"] == "code_index_agent_collaboration"
             assert task["graph_context"]["selected_nodes"][0]["path"] == "pkg/a.py"
-            run = _wait_for_run_status(config, task["run_id"], "completed")
-            assert run["status"] == "completed"
+            page.locator("#agent-runs .past-runs summary", has_text="Past runs (1)").click()
             page.locator("#agent-runs").get_by_role("button", name="Archive").first.click()
             page.locator("#agent-runs", has_text="No queued or active runs.").wait_for(
                 timeout=10000
             )
+            page.locator("#agent-runs .past-runs").wait_for(state="detached", timeout=10000)
+        finally:
+            browser.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
+def test_graph_ui_migrates_stale_directory_state_to_expanded_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    (tmp_path / "pkg" / "sub" / "inner").mkdir(parents=True)
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "sub" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "sub" / "inner" / "leaf.py").write_text(
+        "def leaf() -> int:\n    return 1\n",
+        encoding="utf-8",
+    )
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=0.1,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(headless=True)
+        except Exception as exc:  # pragma: no cover - local browser install guard.
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            pytest.skip(f"Playwright Chromium is not installed or not launchable: {exc}")
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 820})
+            page.goto(f"{base_url}/repo-graph.html", wait_until="domcontentloaded")
+            root = page.evaluate(
+                "() => JSON.parse(document.getElementById('graph-data').textContent).root"
+            )
+            page.evaluate(
+                """root => {
+                  localStorage.setItem(
+                    `code_index_graph_view:${root}`,
+                    JSON.stringify({
+                      directoryExpansionDefaultVersion: 1,
+                      expandedDirs: ["dir:."]
+                    })
+                  );
+                }""",
+                root,
+            )
+            page.reload(wait_until="domcontentloaded")
+
+            page.locator('[data-nav-node="dir:pkg"]').wait_for(timeout=10000)
+            page.locator('[data-nav-node="dir:pkg/sub"]').wait_for(timeout=10000)
+            page.locator('[data-nav-node="dir:pkg/sub/inner"]').wait_for(timeout=10000)
+            page.locator(
+                '[data-nav-tree="true"][data-nav-node="file:pkg/sub/inner/leaf.py"]'
+            ).wait_for(timeout=10000)
+            page.wait_for_function(
+                """root => {
+                  const raw = localStorage.getItem(`code_index_graph_view:${root}`);
+                  if (!raw) return false;
+                  const saved = JSON.parse(raw);
+                  return saved.directoryExpansionDefaultVersion === 2;
+                }""",
+                arg=root,
+                timeout=10000,
+            )
+            saved = page.evaluate(
+                """root => JSON.parse(localStorage.getItem(`code_index_graph_view:${root}`))""",
+                root,
+            )
+            assert saved["directoryExpansionDefaultVersion"] == 2
+            assert saved["directoryExpansionMode"] == "all"
+            assert "dir:pkg/sub/inner" in saved["expandedDirs"]
         finally:
             browser.close()
             server.shutdown()

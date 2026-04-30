@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from code_index import __version__
 from code_index import agent_activity
+from code_index import agent_providers
 from code_index.commands import (
     agent_adapter_cmd,
     agent_cmd,
@@ -27,6 +28,7 @@ from code_index.commands import (
     rebuild_fts_cmd,
     rebuild_tests_cmd,
     repo_map_cmd,
+    run_orchestrator_cmd,
     similar_cmd,
     scip_python_cmd,
     symbol_cmd,
@@ -592,12 +594,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "command template for command mode; placeholders include "
             "{message}, {provider_prompt}, {run_id}, {root}, {task_json}, "
-            "{last_message}, and {selected_paths}"
+            "{last_message}, {provider_prompt_file}, {mcp_config_file}, and "
+            "{selected_paths}"
         ),
     )
     p_agent_adapter.add_argument(
         "--provider",
-        choices=["custom", "claude", "codex"],
+        choices=agent_providers.provider_choices(),
         default="custom",
         help=(
             "provider preset used when --command is omitted; also accepts "
@@ -626,6 +629,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="finish dry-run mode with failed status",
     )
     p_agent_adapter.set_defaults(func=agent_adapter_cmd.run)
+
+    p_run_orchestrator = subparsers.add_parser(
+        "run-orchestrator",
+        help="inspect or apply Agent Run lifecycle orchestration",
+    )
+    _add_common(p_run_orchestrator)
+    p_run_orchestrator.add_argument(
+        "--apply",
+        action="store_true",
+        help="apply deterministic lifecycle actions instead of reporting only",
+    )
+    p_run_orchestrator.add_argument(
+        "--known-dead-run-id",
+        action="append",
+        default=[],
+        help="run id whose process liveness is known dead; repeatable",
+    )
+    p_run_orchestrator.add_argument(
+        "--quiet-after-seconds",
+        type=float,
+        default=600.0,
+        help="seconds without activity before health becomes quiet",
+    )
+    p_run_orchestrator.add_argument(
+        "--stale-after-seconds",
+        type=float,
+        default=agent_activity.DEFAULT_ACTIVE_RUN_MAX_AGE_SECONDS,
+        help="seconds without activity before health becomes stale",
+    )
+    p_run_orchestrator.set_defaults(func=run_orchestrator_cmd.run)
 
     p_import_scip = subparsers.add_parser(
         "import-scip",

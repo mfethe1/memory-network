@@ -36,10 +36,10 @@ The plugin `.mcp.json` exposes that command as the `code-index` MCP server.
 ## Start The Live Graph
 
 ```bash
-python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 8768
+python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 8767
 ```
 
-Open `http://127.0.0.1:8768/repo-graph.html`.
+Open `http://127.0.0.1:8767/repo-graph.html`.
 The launcher checks that configured provider commands are on `PATH`; use
 `--check-only` to validate setup without starting the server.
 
@@ -48,13 +48,13 @@ The launcher checks that configured provider commands are on `PATH`; use
 Claude example:
 
 ```bash
-python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 8768 --provider claude
+python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 8767 --provider claude
 ```
 
 Codex example:
 
 ```bash
-python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 8768 --provider codex
+python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 8767 --provider codex
 ```
 
 Use `--agent-command` when another local agent needs a custom command. Command

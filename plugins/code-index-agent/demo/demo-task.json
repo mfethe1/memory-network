@@ -6,6 +6,6 @@
   ],
   "selected_paths": [],
   "callback": {
-    "agent_events_url": "http://127.0.0.1:8768/api/agent-events"
+    "agent_events_url": "http://127.0.0.1:8767/api/agent-events"
   }
 }

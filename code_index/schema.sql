@@ -229,6 +229,25 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_updated ON agent_runs(updated_at);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_archived ON agent_runs(archived_at);
 
+CREATE TABLE IF NOT EXISTS agent_run_processes (
+    process_pk    INTEGER PRIMARY KEY,
+    process_id    TEXT NOT NULL UNIQUE,
+    run_pk        INTEGER NOT NULL REFERENCES agent_runs(run_pk) ON DELETE CASCADE,
+    transport     TEXT NOT NULL,
+    provider      TEXT,
+    pid           INTEGER,
+    command_label TEXT,
+    status        TEXT NOT NULL,
+    started_at    TEXT NOT NULL,
+    heartbeat_at  TEXT,
+    ended_at      TEXT,
+    exit_code     INTEGER,
+    metadata_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_run_processes_run ON agent_run_processes(run_pk);
+CREATE INDEX IF NOT EXISTS idx_agent_run_processes_status_heartbeat ON agent_run_processes(status, heartbeat_at);
+
 CREATE TABLE IF NOT EXISTS agent_events (
     event_pk     INTEGER PRIMARY KEY,
     run_pk       INTEGER NOT NULL REFERENCES agent_runs(run_pk) ON DELETE CASCADE,
@@ -254,6 +273,12 @@ CREATE TABLE IF NOT EXISTS agent_file_claims (
     status        TEXT NOT NULL DEFAULT 'active', -- active | released | expired
     reason        TEXT,
     fence_token   INTEGER NOT NULL DEFAULT 0,
+    lease_token_hash TEXT,
+    lease_kind    TEXT NOT NULL DEFAULT 'claim',
+    owner_agent   TEXT,
+    heartbeat_interval_ms INTEGER,
+    conflict_policy TEXT,
+    last_conflict_json TEXT,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
     heartbeat_at  TEXT,
@@ -268,6 +293,23 @@ CREATE INDEX IF NOT EXISTS idx_agent_file_claims_file ON agent_file_claims(file_
 CREATE INDEX IF NOT EXISTS idx_agent_file_claims_status ON agent_file_claims(status);
 CREATE INDEX IF NOT EXISTS idx_agent_file_claims_expires ON agent_file_claims(expires_at);
 CREATE INDEX IF NOT EXISTS idx_agent_file_claims_fence ON agent_file_claims(file_path, fence_token);
+
+CREATE TABLE IF NOT EXISTS agent_file_claim_events (
+    claim_event_pk INTEGER PRIMARY KEY,
+    claim_pk       INTEGER NOT NULL REFERENCES agent_file_claims(claim_pk) ON DELETE CASCADE,
+    event_type     TEXT NOT NULL, -- created | renewed | released | expired | denied
+    timestamp      TEXT NOT NULL,
+    file_path      TEXT NOT NULL,
+    mode           TEXT NOT NULL,
+    fence_token    INTEGER,
+    message        TEXT,
+    metadata_json  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_file_claim_events_claim
+    ON agent_file_claim_events(claim_pk, timestamp);
+CREATE INDEX IF NOT EXISTS idx_agent_file_claim_events_file
+    ON agent_file_claim_events(file_path, timestamp);
 
 CREATE TABLE IF NOT EXISTS agent_task_preflights (
     preflight_pk INTEGER PRIMARY KEY,

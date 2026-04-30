@@ -18,8 +18,12 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from code_index import agent_activity
+from code_index import agent_providers
+from code_index import agent_swarm
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
+from code_index import run_orchestrator
+from code_index import task_gate
 from code_index import retrieval
 from code_index.agent_collaboration import append_event_jsonl
 from code_index.commands.graph_html import render_html
@@ -177,23 +181,25 @@ def _observe_latency(
         bucket["avg"] = round(previous_avg + ((value - previous_avg) / count), 2)
         if key:
             by_scope = bucket.setdefault("by_scope", {})
-            if isinstance(by_scope, dict):
-                scoped = by_scope.setdefault(
-                    key, {"count": 0, "last": None, "max": None, "avg": None}
-                )
-                if isinstance(scoped, dict):
-                    scoped_count = int(scoped.get("count") or 0) + 1
-                    scoped_avg = float(scoped.get("avg") or 0)
-                    scoped["count"] = scoped_count
-                    scoped["last"] = value
-                    scoped["max"] = (
-                        value
-                        if scoped.get("max") is None
-                        else max(float(scoped["max"]), value)
-                    )
-            scoped["avg"] = round(
-                        scoped_avg + ((value - scoped_avg) / scoped_count), 2
-                    )
+            if not isinstance(by_scope, dict):
+                by_scope = {}
+                bucket["by_scope"] = by_scope
+            scoped = by_scope.setdefault(
+                key, {"count": 0, "last": None, "max": None, "avg": None}
+            )
+            if not isinstance(scoped, dict):
+                scoped = {"count": 0, "last": None, "max": None, "avg": None}
+                by_scope[key] = scoped
+            scoped_count = int(scoped.get("count") or 0) + 1
+            scoped_avg = float(scoped.get("avg") or 0)
+            scoped["count"] = scoped_count
+            scoped["last"] = value
+            scoped["max"] = (
+                value
+                if scoped.get("max") is None
+                else max(float(scoped["max"]), value)
+            )
+            scoped["avg"] = round(scoped_avg + ((value - scoped_avg) / scoped_count), 2)
     finally:
         if lock:
             lock.release()
@@ -311,9 +317,13 @@ def _task_request_from_payload(
     payload: dict[str, Any], args: argparse.Namespace
 ) -> dict[str, Any]:
     provider = str(payload.get("provider") or "").strip().lower()
+    provider_name = agent_providers.provider_display_name(
+        provider,
+        default=(provider.title() if provider else ""),
+    )
     agent_name = str(
         payload.get("agent_name")
-        or (provider.title() if provider else "")
+        or provider_name
         or args.agent_name
         or "Codex"
     )
@@ -362,6 +372,16 @@ def _task_request_from_payload(
     slice_payload = payload.get("slice") if isinstance(payload.get("slice"), dict) else {}
     if slice_payload:
         context["slice"] = slice_payload
+    swarm_config = agent_swarm.normalize_swarm_config(
+        payload,
+        request_provider=provider or None,
+    )
+    execution_strategy = str(swarm_config.get("execution_strategy") or "single")
+    if execution_strategy != "single":
+        context["execution_strategy"] = execution_strategy
+    public_swarm = agent_swarm.public_swarm_config(swarm_config)
+    if public_swarm:
+        context["swarm"] = public_swarm
     return {
         "message": str(payload.get("message") or payload.get("prompt") or "").strip(),
         "provider": provider,
@@ -373,6 +393,8 @@ def _task_request_from_payload(
         "run_context": run_context,
         "blocked_by_run_ids": blocked_by_run_ids,
         "slice": slice_payload,
+        "execution_strategy": execution_strategy,
+        "swarm": swarm_config,
         "metadata": context,
         "preflight_confirmed": bool(payload.get("preflight_confirmed")),
     }
@@ -418,6 +440,11 @@ def _build_task_draft(
         task["blocked_by_run_ids"] = request["blocked_by_run_ids"]
     if request.get("slice"):
         task["slice"] = request["slice"]
+    if request.get("execution_strategy") == "swarm":
+        task["execution_strategy"] = "swarm"
+    public_swarm = agent_swarm.public_swarm_config(request.get("swarm"))
+    if public_swarm:
+        task["swarm"] = public_swarm
     task["graph_context"] = _build_task_graph_context(
         config,
         agent_name=request["agent_name"],
@@ -559,24 +586,7 @@ def _preflight_hash_subject(
     request: dict[str, Any],
     draft: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
-        "request": {
-            "agent_name": request.get("agent_name"),
-            "message": request.get("message"),
-            "provider": request.get("provider") or "",
-            "selected_nodes": request.get("selected_nodes") or [],
-            "selected_paths": request.get("selected_paths") or [],
-            "node": request.get("node") or {},
-            "parent_run_id": request.get("parent_run_id") or "",
-            "run_context": request.get("run_context"),
-            "blocked_by_run_ids": request.get("blocked_by_run_ids") or [],
-            "slice": request.get("slice") or {},
-        },
-        "draft": {
-            "root": draft.get("root"),
-            "context_policy": draft.get("context_policy") or {},
-        },
-    }
+    return task_gate.preflight_hash_subject(request=request, draft=draft)
 
 
 def _warning_fingerprint(preflight: dict[str, Any]) -> dict[str, Any]:
@@ -999,6 +1009,45 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                 headers={"Set-Cookie": cookie},
             )
 
+        def _read_json_payload(self) -> dict[str, Any] | None:
+            raw_length = self.headers.get("Content-Length") or "0"
+            try:
+                length = int(raw_length)
+            except ValueError:
+                self._send_bytes(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": "invalid Content-Length"}),
+                )
+                return None
+            if length < 0:
+                self._send_bytes(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": "invalid Content-Length"}),
+                )
+                return None
+            try:
+                body = self.rfile.read(length).decode("utf-8")
+                payload = json.loads(body or "{}")
+            except UnicodeDecodeError:
+                self._send_bytes(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": "body must be UTF-8 JSON"}),
+                )
+                return None
+            except json.JSONDecodeError:
+                self._send_bytes(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": "invalid JSON body"}),
+                )
+                return None
+            if not isinstance(payload, dict):
+                self._send_bytes(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": "JSON body must be an object"}),
+                )
+                return None
+            return payload
+
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             route = parsed.path
@@ -1033,6 +1082,18 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                 self._send_bytes(
                     HTTPStatus.OK,
                     _json_bytes(_perf_snapshot(perf_state)),
+                )
+                return
+            if route == "/api/agent-providers":
+                self._send_bytes(
+                    HTTPStatus.OK,
+                    _json_bytes(
+                        {
+                            "ok": True,
+                            "kind": "code_index_agent_provider_registry",
+                            "providers": agent_providers.provider_registry_payload(),
+                        }
+                    ),
                 )
                 return
             if route == "/api/agent-board":
@@ -1071,15 +1132,8 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                 return
             if not self._authorized():
                 return
-            length = int(self.headers.get("Content-Length") or "0")
-            try:
-                body = self.rfile.read(length).decode("utf-8")
-                payload = json.loads(body or "{}")
-            except json.JSONDecodeError:
-                self._send_bytes(
-                    HTTPStatus.BAD_REQUEST,
-                    _json_bytes({"error": "invalid JSON body"}),
-                )
+            payload = self._read_json_payload()
+            if payload is None:
                 return
             if route == "/api/notes":
                 try:
@@ -1112,6 +1166,16 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             if route == "/api/agent-events":
                 self._record_agent_event(payload)
                 return
+            if route.startswith("/api/file-claims/") and route.endswith("/renew"):
+                parts = [part for part in route.split("/") if part]
+                if len(parts) == 4:
+                    self._renew_file_claim(parts[2], payload)
+                    return
+            if route.startswith("/api/file-claims/") and route.endswith("/release"):
+                parts = [part for part in route.split("/") if part]
+                if len(parts) == 4:
+                    self._release_file_claim(parts[2], payload)
+                    return
             if route == "/api/file-claims":
                 self._manage_file_claims(payload)
                 return
@@ -1142,7 +1206,11 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             conn = db_mod.connect(config.db_path)
             try:
                 db_mod.ensure_schema(conn, config)
-                board = agent_activity.kanban_board(conn, limit=25)
+                activity = run_orchestrator.snapshot(conn, limit=80)
+                board = activity.get("kanban") or agent_activity.kanban_board(
+                    conn, limit=25
+                )
+                board["orchestrator"] = activity.get("orchestrator")
             finally:
                 db_mod.close(conn)
             self._send_bytes(HTTPStatus.OK, _json_bytes(board))
@@ -1176,6 +1244,57 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                 str(result.get("scope") or scope or "all"),
             )
             self._send_bytes(HTTPStatus.OK, _json_bytes(result))
+
+        def _renew_file_claim(self, claim_id: str, payload: dict[str, Any]) -> None:
+            from code_index import lease_manager
+
+            try:
+                ttl_raw = payload.get("ttl_seconds", 1800)
+                ttl_seconds = None if ttl_raw is None else float(ttl_raw)
+                with writer_lock(config):
+                    conn = db_mod.connect(config.db_path)
+                    try:
+                        db_mod.apply_schema(conn)
+                        claim = lease_manager.renew_lease(
+                            conn,
+                            claim_id=claim_id,
+                            lease_token=str(payload.get("lease_token") or ""),
+                            fence_token=payload.get("fence_token"),
+                            ttl_seconds=ttl_seconds,
+                        )
+                    finally:
+                        db_mod.close(conn)
+            except (TypeError, ValueError) as exc:
+                self._send_bytes(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": str(exc)}),
+                )
+                return
+            self._send_bytes(HTTPStatus.OK, _json_bytes({"ok": True, "claim": claim}))
+
+        def _release_file_claim(self, claim_id: str, payload: dict[str, Any]) -> None:
+            from code_index import lease_manager
+
+            try:
+                with writer_lock(config):
+                    conn = db_mod.connect(config.db_path)
+                    try:
+                        db_mod.apply_schema(conn)
+                        claim = lease_manager.release_lease(
+                            conn,
+                            claim_id=claim_id,
+                            lease_token=str(payload.get("lease_token") or ""),
+                            status=str(payload.get("status") or "released"),
+                        )
+                    finally:
+                        db_mod.close(conn)
+            except ValueError as exc:
+                self._send_bytes(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": str(exc)}),
+                )
+                return
+            self._send_bytes(HTTPStatus.OK, _json_bytes({"ok": True, "claim": claim}))
 
         def _manage_file_claims(self, payload: dict[str, Any]) -> None:
             run_id = str(payload.get("run_id") or "").strip()
@@ -1254,7 +1373,14 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             )
 
         def _preflight_agent_task(self, payload: dict[str, Any]) -> None:
-            request = _task_request_from_payload(payload, args)
+            try:
+                request = _task_request_from_payload(payload, args)
+            except ValueError as exc:
+                self._send_bytes(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": str(exc)}),
+                )
+                return
             if not request["message"]:
                 self._send_bytes(
                     HTTPStatus.BAD_REQUEST,
@@ -1346,7 +1472,7 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                         )
                         return
                     status = str(run.get("status") or "").lower()
-                    if status in agent_activity.TERMINAL_STATUSES:
+                    if status in agent_activity.STOPPED_STATUSES:
                         self._send_bytes(
                             HTTPStatus.CONFLICT,
                             _json_bytes(
@@ -1423,7 +1549,14 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             return f"http://{host}"
 
         def _start_agent_run(self, payload: dict[str, Any]) -> None:
-            request = _task_request_from_payload(payload, args)
+            try:
+                request = _task_request_from_payload(payload, args)
+            except ValueError as exc:
+                self._send_bytes(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": str(exc)}),
+                )
+                return
             if not request["message"]:
                 self._send_bytes(
                     HTTPStatus.BAD_REQUEST,
@@ -1431,103 +1564,215 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                 )
                 return
             planned_run_id = secrets.token_hex(16)
+            swarm_config = (
+                request.get("swarm") if isinstance(request.get("swarm"), dict) else {}
+            )
+            swarm_enabled = bool(swarm_config.get("enabled"))
+            swarm_child_runs: list[dict[str, Any]] = []
+            swarm_child_events: list[dict[str, Any]] = []
+            swarm_child_specs: list[dict[str, Any]] = []
             with writer_lock(config):
                 conn = db_mod.connect(config.db_path)
                 try:
                     db_mod.apply_schema(conn)
-                    active_claims = agent_activity.active_file_claims(conn, limit=200)
                     preflight_draft = _build_task_draft(
                         config,
                         request,
                         callback_base_url=self._callback_base_url(),
                     )
                     try:
-                        blocking_runs = agent_activity.blocking_runs(
-                            conn,
-                            run_ids=request.get("blocked_by_run_ids") or [],
-                        )
+                        with db_mod.transaction(conn):
+                            active_claims = agent_activity.active_file_claims(
+                                conn,
+                                limit=200,
+                            )
+                            try:
+                                blocking_runs = agent_activity.blocking_runs(
+                                    conn,
+                                    run_ids=request.get("blocked_by_run_ids") or [],
+                                )
+                            except ValueError as exc:
+                                self._send_bytes(
+                                    HTTPStatus.BAD_REQUEST,
+                                    _json_bytes({"error": str(exc)}),
+                                )
+                                return
+                            current_preflight = _preflight_from_draft(
+                                request=request,
+                                draft=preflight_draft,
+                                active_claims=active_claims,
+                                blocking_runs=blocking_runs,
+                            )
+                            rejection = _consume_preflight(
+                                conn,
+                                payload=payload,
+                                request=request,
+                                draft=preflight_draft,
+                                preflight=current_preflight,
+                                run_id=planned_run_id,
+                            )
+                            if rejection is not None:
+                                status, body = rejection
+                                _inc_counter(
+                                    perf_state,
+                                    "preflight_rejections",
+                                    str(body.get("error") or "unknown"),
+                                )
+                                self._send_bytes(status, _json_bytes(body))
+                                return
+                            initial_status = (
+                                "blocked"
+                                if blocking_runs
+                                else ("working" if swarm_enabled else "queued")
+                            )
+                            run_metadata = dict(request["metadata"])
+                            if swarm_enabled:
+                                run_metadata = agent_swarm.swarm_parent_metadata(
+                                    run_metadata,
+                                    swarm_config,
+                                )
+                                request = dict(request)
+                                request["metadata"] = run_metadata
+                            run = agent_activity.start_run(
+                                conn,
+                                run_id=planned_run_id,
+                                agent_name=request["agent_name"],
+                                prompt=request["message"],
+                                selected_nodes=request["selected_nodes"],
+                                metadata=run_metadata,
+                                status=initial_status,
+                            )
+                            if request.get("blocked_by_run_ids"):
+                                agent_activity.add_run_blockers(
+                                    conn,
+                                    run_id=run["run_id"],
+                                    blocked_by_run_ids=request["blocked_by_run_ids"],
+                                    reason=(
+                                        "Task waits for blocker run(s) before dispatch."
+                                    ),
+                                    metadata={"source": "graph-task"},
+                                )
+                                run = agent_activity.get_run(conn, run["run_id"]) or run
+                            event = agent_activity.record_event(
+                                conn,
+                                run_id=run["run_id"],
+                                event_type="task",
+                                file_path=(
+                                    request["selected_paths"][0]
+                                    if request["selected_paths"]
+                                    else request["node"].get("path")
+                                ),
+                                message=request["message"],
+                                payload={
+                                    "status": run.get("status") or "queued",
+                                    "provider": request["provider"] or None,
+                                    "execution_strategy": request.get(
+                                        "execution_strategy"
+                                    ),
+                                    "swarm": agent_swarm.public_swarm_config(
+                                        swarm_config
+                                    ),
+                                    "selected_nodes": request["selected_nodes"],
+                                    "selected_paths": request["selected_paths"],
+                                    "node": request["node"],
+                                    "preflight_confirmed": request[
+                                        "preflight_confirmed"
+                                    ],
+                                    "blocked_by_run_ids": request.get(
+                                        "blocked_by_run_ids"
+                                    )
+                                    or [],
+                                },
+                            )
+                            if request["selected_paths"]:
+                                agent_activity.claim_files(
+                                    conn,
+                                    run_id=run["run_id"],
+                                    file_paths=request["selected_paths"],
+                                    mode="review",
+                                    reason="Graph task selected file.",
+                                    metadata={"source": "graph-task"},
+                                )
+                            run = agent_activity.get_run(conn, run["run_id"])
+                            if swarm_enabled and not blocking_runs and run:
+                                swarm_child_specs = agent_swarm.child_run_specs(
+                                    request,
+                                    parent_run_id=run["run_id"],
+                                    swarm=swarm_config,
+                                )
+                                for spec in swarm_child_specs:
+                                    child_run = agent_activity.start_run(
+                                        conn,
+                                        run_id=secrets.token_hex(16),
+                                        agent_name=str(spec["agent_name"]),
+                                        prompt=str(spec["prompt"]),
+                                        selected_nodes=request["selected_nodes"],
+                                        metadata=spec.get("metadata") or {},
+                                        status="queued",
+                                    )
+                                    child_role = spec.get("role") or {}
+                                    child_event = agent_activity.record_event(
+                                        conn,
+                                        run_id=child_run["run_id"],
+                                        event_type="task",
+                                        file_path=(
+                                            request["selected_paths"][0]
+                                            if request["selected_paths"]
+                                            else request["node"].get("path")
+                                        ),
+                                        message=str(spec["prompt"]),
+                                        payload={
+                                            "status": "queued",
+                                            "provider": spec.get("provider"),
+                                            "execution_strategy": "swarm_child",
+                                            "durable_execution_strategy": "swarm",
+                                            "parent_run_id": run["run_id"],
+                                            "swarm": (
+                                                spec.get("metadata") or {}
+                                            ).get("swarm"),
+                                            "swarm_role": child_role,
+                                            "selected_nodes": request["selected_nodes"],
+                                            "selected_paths": request["selected_paths"],
+                                        },
+                                    )
+                                    if request["selected_paths"]:
+                                        agent_activity.claim_files(
+                                            conn,
+                                            run_id=child_run["run_id"],
+                                            file_paths=request["selected_paths"],
+                                            mode=str(
+                                                spec.get("claim_mode") or "review"
+                                            ),
+                                            reason=(
+                                                "Agent Swarm child selected file."
+                                            ),
+                                            metadata={
+                                                "source": "agent-swarm",
+                                                "parent_run_id": run["run_id"],
+                                                "role": child_role.get("role"),
+                                            },
+                                        )
+                                    swarm_child_runs.append(
+                                        agent_activity.get_run(conn, child_run["run_id"])
+                                        or child_run
+                                    )
+                                    swarm_child_events.append(child_event)
                     except ValueError as exc:
+                        http_status = (
+                            HTTPStatus.CONFLICT
+                            if str(exc).startswith("claim conflict:")
+                            else HTTPStatus.BAD_REQUEST
+                        )
                         self._send_bytes(
-                            HTTPStatus.BAD_REQUEST,
+                            http_status,
                             _json_bytes({"error": str(exc)}),
                         )
                         return
-                    current_preflight = _preflight_from_draft(
-                        request=request,
-                        draft=preflight_draft,
-                        active_claims=active_claims,
-                        blocking_runs=blocking_runs,
-                    )
-                    rejection = _consume_preflight(
-                        conn,
-                        payload=payload,
-                        request=request,
-                        draft=preflight_draft,
-                        preflight=current_preflight,
-                        run_id=planned_run_id,
-                    )
-                    if rejection is not None:
-                        status, body = rejection
-                        _inc_counter(
-                            perf_state,
-                            "preflight_rejections",
-                            str(body.get("error") or "unknown"),
-                        )
-                        self._send_bytes(status, _json_bytes(body))
-                        return
-                    run = agent_activity.start_run(
-                        conn,
-                        run_id=planned_run_id,
-                        agent_name=request["agent_name"],
-                        prompt=request["message"],
-                        selected_nodes=request["selected_nodes"],
-                        metadata=request["metadata"],
-                        status="blocked" if blocking_runs else "queued",
-                    )
-                    if request.get("blocked_by_run_ids"):
-                        agent_activity.add_run_blockers(
-                            conn,
-                            run_id=run["run_id"],
-                            blocked_by_run_ids=request["blocked_by_run_ids"],
-                            reason=(
-                                "Task waits for blocker run(s) before dispatch."
-                            ),
-                            metadata={"source": "graph-task"},
-                        )
-                        run = agent_activity.get_run(conn, run["run_id"]) or run
-                    event = agent_activity.record_event(
-                        conn,
-                        run_id=run["run_id"],
-                        event_type="task",
-                        file_path=(
-                            request["selected_paths"][0]
-                            if request["selected_paths"]
-                            else request["node"].get("path")
-                        ),
-                        message=request["message"],
-                        payload={
-                            "status": run.get("status") or "queued",
-                            "provider": request["provider"] or None,
-                            "selected_nodes": request["selected_nodes"],
-                            "selected_paths": request["selected_paths"],
-                            "node": request["node"],
-                            "preflight_confirmed": request["preflight_confirmed"],
-                            "blocked_by_run_ids": request.get("blocked_by_run_ids") or [],
-                        },
-                    )
-                    if request["selected_paths"]:
-                        agent_activity.claim_files(
-                            conn,
-                            run_id=run["run_id"],
-                            file_paths=request["selected_paths"],
-                            mode="review",
-                            reason="Graph task selected file.",
-                            metadata={"source": "graph-task"},
-                        )
-                    run = agent_activity.get_run(conn, run["run_id"])
                 finally:
                     db_mod.close(conn)
             append_event_jsonl(config.root, event)
+            for child_event in swarm_child_events:
+                append_event_jsonl(config.root, child_event)
             task = _build_task_draft(
                 config,
                 request,
@@ -1563,6 +1808,120 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                     "status": "blocked",
                     "reason": "blocked_by_run_ids are not complete",
                     "blocked_by_run_ids": request.get("blocked_by_run_ids") or [],
+                }
+            elif swarm_enabled:
+                swarm_tasks: list[dict[str, Any]] = []
+                child_dispatches: list[dict[str, Any]] = []
+                for child_run, spec in zip(swarm_child_runs, swarm_child_specs):
+                    child_request = dict(request)
+                    child_request.update(
+                        {
+                            "agent_name": spec["agent_name"],
+                            "provider": spec["provider"],
+                            "message": spec["prompt"],
+                            "parent_run_id": task["run_id"],
+                            "metadata": spec.get("metadata") or {},
+                            "execution_strategy": "single",
+                            "swarm": {"enabled": False},
+                        }
+                    )
+                    child_task = _build_task_draft(
+                        config,
+                        child_request,
+                        callback_base_url=self._callback_base_url(),
+                    )
+                    child_task["kind"] = "code_index_agent_task"
+                    child_task["run_id"] = child_run["run_id"]
+                    child_task["parent_run_id"] = task["run_id"]
+                    child_task["execution_strategy"] = "swarm_child"
+                    child_task["swarm"] = {
+                        "parent_run_id": task["run_id"],
+                        "role": spec.get("role"),
+                        "provider": spec.get("provider"),
+                    }
+                    child_task["context_packet"] = _build_task_context_packet(
+                        config,
+                        message=str(spec["prompt"]),
+                        selected_nodes=request["selected_nodes"],
+                        selected_paths=request["selected_paths"],
+                    )
+                    if isinstance(child_task.get("context_packet"), dict):
+                        child_task["context_packet"]["graph_context"] = child_task[
+                            "graph_context"
+                        ]
+                    child_collaboration = _build_task_collaboration_packet(
+                        config,
+                        run_id=str(child_task["run_id"]),
+                        agent_name=str(spec["agent_name"]),
+                        selected_nodes=request["selected_nodes"],
+                        selected_paths=request["selected_paths"],
+                        node=request["node"],
+                    )
+                    child_task["collaboration"] = child_collaboration
+                    if isinstance(child_task.get("context_packet"), dict):
+                        child_task["context_packet"][
+                            "collaboration"
+                        ] = child_collaboration
+                    child_dispatch = _dispatch_agent_task(config, child_task)
+                    if (
+                        child_dispatch.get("configured")
+                        and child_dispatch.get("status") == "sent"
+                    ):
+                        with writer_lock(config):
+                            conn = db_mod.connect(config.db_path)
+                            try:
+                                db_mod.apply_schema(conn)
+                                dispatch_event = agent_activity.record_event(
+                                    conn,
+                                    run_id=str(child_task["run_id"]),
+                                    event_type="status",
+                                    message="Swarm child dispatched to agent webhook.",
+                                    payload={
+                                        "status": "working",
+                                        "dispatch": child_dispatch,
+                                    },
+                                )
+                                append_event_jsonl(config.root, dispatch_event)
+                            finally:
+                                db_mod.close(conn)
+                    swarm_tasks.append(child_task)
+                    child_dispatches.append(
+                        {
+                            "run_id": child_task["run_id"],
+                            "role": (spec.get("role") or {}).get("role"),
+                            "dispatch": child_dispatch,
+                        }
+                    )
+                if swarm_child_runs:
+                    conn = db_mod.connect(config.db_path)
+                    try:
+                        db_mod.ensure_schema(conn, config)
+                        swarm_child_runs = [
+                            agent_activity.get_run(conn, str(child["run_id"])) or child
+                            for child in swarm_child_runs
+                        ]
+                    finally:
+                        db_mod.close(conn)
+                task["swarm_children"] = [
+                    {
+                        "run_id": child.get("run_id"),
+                        "agent_name": child.get("agent_name"),
+                        "status": child.get("status"),
+                        "role": (spec.get("role") or {}).get("role"),
+                        "provider": spec.get("provider"),
+                    }
+                    for child, spec in zip(swarm_child_runs, swarm_child_specs)
+                ]
+                any_configured = any(
+                    bool(item["dispatch"].get("configured"))
+                    for item in child_dispatches
+                )
+                dispatch = {
+                    "configured": any_configured,
+                    "status": "swarm_started" if any_configured else "not_configured",
+                    "transport": "swarm",
+                    "children": child_dispatches,
+                    "task_count": len(swarm_tasks),
                 }
             else:
                 dispatch = _dispatch_agent_task(config, task)
@@ -1600,7 +1959,11 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             conn = db_mod.connect(config.db_path)
             try:
                 db_mod.ensure_schema(conn, config)
-                board = agent_activity.kanban_board(conn, limit=25)
+                activity = run_orchestrator.snapshot(conn, limit=80)
+                board = activity.get("kanban") or agent_activity.kanban_board(
+                    conn, limit=25
+                )
+                board["orchestrator"] = activity.get("orchestrator")
             finally:
                 db_mod.close(conn)
             self._send_bytes(
@@ -1686,6 +2049,34 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                         payload=event_payload,
                     )
                     updated_run = agent_activity.get_run(conn, event["run_id"])
+                    swarm_reconciliation = None
+                    if str((updated_run or {}).get("status") or "").lower() in (
+                        agent_activity.STOPPED_STATUSES
+                    ):
+                        metadata = (
+                            updated_run.get("metadata")
+                            if isinstance((updated_run or {}).get("metadata"), dict)
+                            else {}
+                        )
+                        swarm_metadata = (
+                            metadata.get("swarm")
+                            if isinstance(metadata.get("swarm"), dict)
+                            else {}
+                        )
+                        parent_run_id = metadata.get(
+                            "parent_run_id"
+                        ) or swarm_metadata.get("parent_run_id")
+                        if parent_run_id:
+                            try:
+                                swarm_reconciliation = (
+                                    agent_swarm.reconcile_swarm_parent(
+                                        conn,
+                                        parent_run_id=str(parent_run_id),
+                                    )
+                                )
+                            except ValueError as exc:
+                                swarm_reconciliation = {"error": str(exc)}
+                            updated_run = agent_activity.get_run(conn, event["run_id"])
                     suggestions_event = None
                     suggestions = None
                     if str((updated_run or {}).get("status") or "").lower() in {
@@ -1709,6 +2100,7 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                         "ok": True,
                         "run": updated_run,
                         "event": event,
+                        "swarm_reconciliation": swarm_reconciliation,
                         "suggestions_event": suggestions_event,
                         "suggestions": suggestions,
                     }

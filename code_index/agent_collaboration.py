@@ -207,6 +207,28 @@ def build_collaboration_packet(
         claim for claim in active_claims if claim.get("overlaps_selected")
     ][:20]
 
+    # Transitively warn about claims on dependency files.
+    dependency_warnings = agent_activity.dependency_claim_warnings(
+        conn, list(selected), run_id=run_id, limit=20
+    )
+
+    # Predict where peer runs are likely heading next.
+    trajectory_hints: list[dict[str, Any]] = []
+    for peer_run in active_peer_runs[:8]:
+        peer_id = peer_run.get("run_id")
+        if not peer_id:
+            continue
+        predictions = agent_activity.predict_next_files(conn, peer_id, limit=3)
+        if predictions:
+            trajectory_hints.append(
+                {
+                    "run_id": peer_id,
+                    "agent_name": peer_run.get("agent_name") or "Agent",
+                    "current_files": peer_run.get("active_files", []),
+                    "likely_next_files": predictions,
+                }
+            )
+
     global_path = global_events_jsonl_path(root)
     run_path = run_events_jsonl_path(root, run_id)
     return {
@@ -233,11 +255,15 @@ def build_collaboration_packet(
         "active_peer_runs": active_peer_runs[:8],
         "active_file_claims": active_claims,
         "overlapping_file_claims": overlapping_claims,
+        "dependency_claim_warnings": dependency_warnings,
+        "trajectory_hints": trajectory_hints,
         "recent_peer_events": recent_peer_events,
         "overlapping_file_events": overlapping_file_events,
         "guidance": [
             "Read active_peer_runs and overlapping_file_events before editing.",
             "Treat overlapping_file_claims as live coordination warnings before editing.",
+            "Check dependency_claim_warnings: another agent may be editing a file your selection depends on.",
+            "Review trajectory_hints to anticipate where peer agents are heading next.",
             "If another active run overlaps a selected file, emit a decision check-in before changing that file.",
             "Use the global JSONL feed for a lightweight view of other agents' recent work.",
         ],

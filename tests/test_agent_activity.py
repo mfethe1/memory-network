@@ -11,6 +11,8 @@ import pytest
 from code_index import agent_activity
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
+from code_index import lease_manager
+from code_index import run_orchestrator
 from code_index.cli import main
 
 
@@ -110,6 +112,137 @@ def test_file_claims_use_fence_tokens_and_reject_conflicting_edits(tmp_path: Pat
         db_mod.close(conn)
 
 
+def test_claim_file_records_claim_lifecycle_events(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(conn, agent_name="Codex", prompt="edit")
+
+        claim = agent_activity.claim_file(
+            conn,
+            run_id=run["run_id"],
+            file_path="pkg/a.py",
+            mode="edit",
+            reason="compatibility claim",
+        )
+        agent_activity.release_claims(
+            conn,
+            run_id=run["run_id"],
+            file_path="pkg/a.py",
+        )
+
+        rows = conn.execute(
+            """
+            SELECT e.event_type
+              FROM agent_file_claim_events e
+              JOIN agent_file_claims c ON c.claim_pk = e.claim_pk
+             WHERE c.claim_id = ?
+             ORDER BY e.claim_event_pk
+            """,
+            (claim["claim_id"],),
+        ).fetchall()
+        assert [row["event_type"] for row in rows] == ["created", "released"]
+    finally:
+        db_mod.close(conn)
+
+
+def test_public_release_claims_skips_first_class_leases(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(conn, agent_name="Codex", prompt="edit")
+        lease = lease_manager.create_lease(
+            conn,
+            run_id=run["run_id"],
+            file_path="pkg/a.py",
+            mode="edit",
+            reason="durable lease",
+        )
+
+        released = agent_activity.release_claims(
+            conn,
+            run_id=run["run_id"],
+            file_path="pkg/a.py",
+        )
+        renewed = lease_manager.renew_lease(
+            conn,
+            claim_id=lease["claim"]["claim_id"],
+            lease_token=lease["lease_token"],
+            fence_token=lease["claim"]["fence_token"],
+            ttl_seconds=600,
+        )
+
+        assert released == []
+        assert renewed["status"] == "active"
+        assert agent_activity.active_file_claims(conn, file_path="pkg/a.py")
+    finally:
+        db_mod.close(conn)
+
+
+def test_end_run_does_not_release_active_first_class_lease(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(conn, agent_name="Codex", prompt="edit")
+        lease = lease_manager.create_lease(
+            conn,
+            run_id=run["run_id"],
+            file_path="pkg/a.py",
+            mode="edit",
+            reason="durable lease",
+        )
+
+        agent_activity.end_run(conn, run_id=run["run_id"], status="completed")
+        row = conn.execute(
+            "SELECT status FROM agent_file_claims WHERE claim_id = ?",
+            (lease["claim"]["claim_id"],),
+        ).fetchone()
+        renewed = lease_manager.renew_lease(
+            conn,
+            claim_id=lease["claim"]["claim_id"],
+            lease_token=lease["lease_token"],
+            fence_token=lease["claim"]["fence_token"],
+            ttl_seconds=600,
+        )
+        events = lease_manager.claim_events(conn, claim_id=lease["claim"]["claim_id"])
+
+        assert row["status"] == "active"
+        assert renewed["status"] == "active"
+        assert [event["event_type"] for event in events] == ["created", "renewed"]
+    finally:
+        db_mod.close(conn)
+
+
+def test_terminal_status_cleanup_expires_stale_first_class_lease(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(conn, agent_name="Codex", prompt="edit")
+        lease = lease_manager.create_lease(
+            conn,
+            run_id=run["run_id"],
+            file_path="pkg/a.py",
+            mode="edit",
+            reason="short durable lease",
+            ttl_seconds=0.001,
+        )
+        time.sleep(0.02)
+
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="status",
+            message="done",
+            payload={"status": "completed"},
+        )
+        row = conn.execute(
+            "SELECT status FROM agent_file_claims WHERE claim_id = ?",
+            (lease["claim"]["claim_id"],),
+        ).fetchone()
+        events = lease_manager.claim_events(conn, claim_id=lease["claim"]["claim_id"])
+
+        assert row["status"] == "expired"
+        assert [event["event_type"] for event in events] == ["created", "expired"]
+    finally:
+        db_mod.close(conn)
+
+
 def test_run_blockers_drive_task_board_and_unblock_on_completion(tmp_path: Path):
     _config, conn = _activity_db(tmp_path)
     try:
@@ -163,6 +296,95 @@ def test_run_blockers_drive_task_board_and_unblock_on_completion(tmp_path: Path)
         assert blocker["run_id"] in {
             run["run_id"] for run in board["columns"]["done"]["runs"]
         }
+    finally:
+        db_mod.close(conn)
+
+
+def test_review_status_is_stopped_but_visible_on_board(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(conn, agent_name="Codex", prompt="needs review")
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="edit",
+            file_path="pkg/a.py",
+            message="Edited file.",
+        )
+        reviewed = agent_activity.end_run(conn, run_id=run["run_id"], status="review")
+
+        assert reviewed["status"] == "review"
+        assert agent_activity.active_runs(conn, max_age_seconds=None) == []
+        assert agent_activity.active_file_claims(conn) == []
+        board = agent_activity.kanban_board(conn)
+        assert [item["run_id"] for item in board["columns"]["review"]["runs"]] == [
+            run["run_id"]
+        ]
+    finally:
+        db_mod.close(conn)
+
+
+def test_run_orchestrator_classifies_and_moves_dead_claimless_run_to_review(
+    tmp_path: Path,
+):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(conn, agent_name="Kimi", prompt="implement feature")
+        health = run_orchestrator.classify_run(
+            run,
+            active_claims=[],
+            process_liveness="dead",
+        )
+        assert health["health"] == "orphaned"
+
+        result = run_orchestrator.apply(
+            conn,
+            known_dead_run_ids={run["run_id"]},
+        )
+
+        updated = agent_activity.get_run(conn, run["run_id"])
+        assert updated is not None
+        assert updated["status"] == "review"
+        assert result["actions"] == [
+            {
+                "action": "move_to_review",
+                "run_id": run["run_id"],
+                "reason": "known_dead_without_active_claims",
+            }
+        ]
+        assert result["orchestrator"]["run_health"][run["run_id"]]["health"] == (
+            "needs_review"
+        )
+    finally:
+        db_mod.close(conn)
+
+
+def test_status_event_to_review_sets_ended_at_and_releases_claims(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(conn, agent_name="Kimi", prompt="status event")
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="edit",
+            file_path="pkg/a.py",
+            message="Edited file.",
+        )
+        assert agent_activity.active_file_claims(conn)
+
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="status",
+            message="Ready for review.",
+            payload={"status": "review"},
+        )
+
+        updated = agent_activity.get_run(conn, run["run_id"])
+        assert updated is not None
+        assert updated["status"] == "review"
+        assert updated["ended_at"]
+        assert agent_activity.active_file_claims(conn) == []
     finally:
         db_mod.close(conn)
 
@@ -830,3 +1052,148 @@ def test_post_run_suggestions_include_diagnostics_and_affected_tests(
         "diagnostics",
         "affected_tests",
     }
+
+
+def test_overlapping_run_analysis_detects_shared_files_and_severity(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run_a = agent_activity.start_run(conn, agent_name="Codex", prompt="edit a")
+        run_b = agent_activity.start_run(conn, agent_name="Claude", prompt="edit b")
+
+        agent_activity.claim_file(
+            conn, run_id=run_a["run_id"], file_path="pkg/shared.py", mode="edit"
+        )
+        agent_activity.claim_file(
+            conn, run_id=run_b["run_id"], file_path="pkg/shared.py", mode="read"
+        )
+        agent_activity.claim_file(
+            conn, run_id=run_a["run_id"], file_path="pkg/a.py", mode="edit"
+        )
+
+        overlaps = agent_activity._overlapping_run_analysis(conn)
+        assert len(overlaps) == 1
+        assert {overlaps[0]["run_id_a"], overlaps[0]["run_id_b"]} == {
+            run_a["run_id"],
+            run_b["run_id"],
+        }
+        assert "pkg/shared.py" in overlaps[0]["shared_files"]
+        # read + edit overlap should be medium severity
+        assert overlaps[0]["severity"] == "medium"
+        assert "both touch" in overlaps[0]["message"]
+
+        # When both runs have edit events on the same file, severity is high
+        agent_activity.release_claims(
+            conn, run_id=run_a["run_id"], file_path="pkg/shared.py"
+        )
+        agent_activity.release_claims(
+            conn, run_id=run_b["run_id"], file_path="pkg/shared.py"
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run_a["run_id"],
+            event_type="edit",
+            file_path="pkg/shared.py",
+            message="Edited by run_a.",
+        )
+        agent_activity.release_claims(
+            conn, run_id=run_a["run_id"], file_path="pkg/shared.py"
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run_b["run_id"],
+            event_type="edit",
+            file_path="pkg/shared.py",
+            message="Edited by run_b.",
+        )
+        overlaps = agent_activity._overlapping_run_analysis(conn)
+        assert overlaps[0]["severity"] == "high"
+    finally:
+        db_mod.close(conn)
+
+
+def test_agent_derived_file_relationships_from_navigation(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(conn, agent_name="Codex", prompt="refactor")
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="read",
+            file_path="pkg/a.py",
+            timestamp="2099-01-01T00:00:00+00:00",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="edit",
+            file_path="pkg/b.py",
+            timestamp="2099-01-01T00:00:01+00:00",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="read",
+            file_path="pkg/c.py",
+            timestamp="2099-01-01T00:00:02+00:00",
+        )
+
+        rels = agent_activity.agent_derived_file_relationships(conn)
+        paths = {(r["source"], r["target"]) for r in rels}
+        assert ("pkg/a.py", "pkg/b.py") in paths or ("pkg/b.py", "pkg/a.py") in paths
+        assert ("pkg/b.py", "pkg/c.py") in paths or ("pkg/c.py", "pkg/b.py") in paths
+        for r in rels:
+            assert r["kind"] == "agent_derived"
+            assert r["confidence"] > 0
+            assert r["observations"] >= 1
+    finally:
+        db_mod.close(conn)
+
+
+def test_activity_snapshot_includes_overlap_and_derived_relationships(
+    tmp_path: Path,
+):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run_a = agent_activity.start_run(conn, agent_name="Codex", prompt="edit a")
+        run_b = agent_activity.start_run(conn, agent_name="Claude", prompt="edit b")
+        agent_activity.claim_file(
+            conn, run_id=run_a["run_id"], file_path="pkg/shared.py", mode="edit"
+        )
+        agent_activity.claim_file(
+            conn, run_id=run_b["run_id"], file_path="pkg/shared.py", mode="read"
+        )
+
+        snapshot = agent_activity.activity_snapshot(conn)
+        assert "overlapping_runs" in snapshot
+        assert "derived_relationships" in snapshot
+        assert len(snapshot["overlapping_runs"]) == 1
+    finally:
+        db_mod.close(conn)
+
+
+def test_recent_file_activity_includes_overlapping_files(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(conn, agent_name="Codex", prompt="edit")
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="edit",
+            file_path="pkg/a.py",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="edit",
+            file_path="pkg/b.py",
+        )
+
+        files = agent_activity.recent_file_activity(conn)
+        assert len(files) == 2
+        for f in files:
+            assert "overlapping_files" in f
+            # Both files were touched by the same run, so they overlap
+            assert len(f["overlapping_files"]) == 1
+            assert f["overlapping_files"][0]["file_path"] != f["file_path"]
+    finally:
+        db_mod.close(conn)

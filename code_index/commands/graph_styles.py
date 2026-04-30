@@ -155,7 +155,7 @@ GRAPH_CSS = r"""
     .nav-actions {
       margin-top: 9px;
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 6px;
     }
     .nav-actions button {
@@ -250,6 +250,28 @@ GRAPH_CSS = r"""
     .run-row.active {
       background: #1f2833;
     }
+    .past-runs {
+      margin-top: 6px;
+      border-top: 1px solid var(--line);
+      padding-top: 6px;
+    }
+    .past-runs summary {
+      min-height: 26px;
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 11px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .past-runs summary:hover {
+      color: var(--ink);
+    }
+    .past-run-list {
+      display: grid;
+      gap: 4px;
+      margin-top: 4px;
+    }
     .run-select {
       min-width: 0;
       min-height: 27px;
@@ -326,6 +348,34 @@ GRAPH_CSS = r"""
     .task-column.ready .task-column-head {
       color: #ffd166;
     }
+    .task-column.review .task-column-head {
+      color: #ffd166;
+    }
+    .review-queue-card {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid rgba(255, 209, 102, 0.55);
+      border-radius: 6px;
+      background: rgba(255, 209, 102, 0.08);
+      color: var(--ink);
+      display: grid;
+      gap: 3px;
+      padding: 7px 8px;
+      font: inherit;
+      font-size: 11px;
+      text-align: left;
+      cursor: pointer;
+    }
+    .review-queue-card strong,
+    .review-queue-card span {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .review-queue-card span {
+      color: var(--muted);
+    }
     .task-card {
       width: 100%;
       min-height: 32px;
@@ -360,6 +410,15 @@ GRAPH_CSS = r"""
       min-height: 24px;
       color: var(--muted);
       cursor: default;
+    }
+    .task-card.needs_review {
+      border-color: rgba(255, 209, 102, 0.55);
+      background: rgba(255, 209, 102, 0.08);
+    }
+    .task-card.stale,
+    .task-card.orphaned,
+    .task-card.blocked {
+      border-color: rgba(255, 107, 107, 0.55);
     }
     .breadcrumb-list {
       display: flex;
@@ -579,6 +638,28 @@ GRAPH_CSS = r"""
       line-height: 1.25;
       overflow-wrap: anywhere;
     }
+    .inspector-title-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
+      gap: 10px;
+    }
+    .panel-expand {
+      min-height: 30px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--field);
+      color: var(--muted);
+      font: inherit;
+      font-size: 11px;
+      padding: 5px 8px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .panel-expand:hover {
+      color: var(--ink);
+      border-color: var(--line-strong);
+    }
     .meta {
       display: flex;
       flex-wrap: wrap;
@@ -637,6 +718,11 @@ GRAPH_CSS = r"""
       overflow: auto;
       padding: 14px 16px 18px;
     }
+    .panel-body.chat-view {
+      min-height: 0;
+      overflow: auto;
+      padding: 0;
+    }
     .panel-body.terminal-view {
       overflow: hidden;
       padding: 0;
@@ -649,6 +735,62 @@ GRAPH_CSS = r"""
       font-size: 13px;
       line-height: 1.5;
     }
+    .summary-overview {
+      display: grid;
+      gap: 12px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .summary-copy {
+      display: grid;
+      gap: 5px;
+    }
+    .summary-copy h3 {
+      margin: 0;
+      color: var(--ink);
+      font-size: 14px;
+      line-height: 1.25;
+    }
+    .summary-copy p {
+      margin: 0;
+      color: #d6dde6;
+      font-size: 13px;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+    .summary-copy span,
+    .summary-note {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .summary-stat-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 8px;
+    }
+    .summary-stat {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+      background: var(--panel-2);
+      display: grid;
+      gap: 3px;
+    }
+    .summary-stat span,
+    .summary-stat small {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
+    .summary-stat strong {
+      color: var(--ink);
+      font-size: 14px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
     .section {
       margin-top: 16px;
     }
@@ -658,6 +800,99 @@ GRAPH_CSS = r"""
       color: var(--muted);
       text-transform: uppercase;
       letter-spacing: 0.08em;
+    }
+    .summary-scan {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 14px;
+    }
+    .summary-insights {
+      color: #c9d1d9;
+    }
+    .compact-kv {
+      grid-template-columns: 96px minmax(0, 1fr);
+      font-size: 12px;
+    }
+    .summary-symbols {
+      gap: 7px;
+    }
+    .summary-symbols li {
+      display: grid;
+      gap: 2px;
+    }
+    .summary-symbols strong {
+      color: var(--ink);
+      font-weight: 600;
+      overflow-wrap: anywhere;
+    }
+    .summary-symbols span {
+      color: var(--muted);
+    }
+    .summary-section-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: start;
+      margin-bottom: 8px;
+    }
+    .summary-section-head h3,
+    .summary-section-head p {
+      margin: 0;
+    }
+    .summary-section-head p {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+      overflow-wrap: anywhere;
+    }
+    .summary-section-head span {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.3;
+      text-align: right;
+      white-space: nowrap;
+    }
+    .summary-ref-list {
+      display: grid;
+      gap: 6px;
+    }
+    .summary-file-ref {
+      width: 100%;
+      min-height: 32px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--field);
+      color: var(--ink);
+      font: inherit;
+      font-size: 12px;
+      line-height: 1.3;
+      padding: 6px 8px;
+      text-align: left;
+      display: grid;
+      grid-template-columns: 30px minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+      cursor: pointer;
+    }
+    .summary-file-ref:hover {
+      border-color: var(--line-strong);
+      background: #1f2833;
+    }
+    .summary-file-ref span {
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .summary-file-ref strong {
+      min-width: 0;
+      font-weight: 500;
+      overflow-wrap: anywhere;
+    }
+    .summary-file-ref.missing {
+      color: var(--muted);
+      cursor: default;
     }
     .kv {
       display: grid;
@@ -696,9 +931,167 @@ GRAPH_CSS = r"""
     textarea.chat-box {
       min-height: 126px;
     }
+    .chat-workspace {
+      min-height: 100%;
+      display: grid;
+      align-content: start;
+      gap: 14px;
+      padding: 14px 16px 18px;
+    }
+    .chat-timeline-section {
+      min-height: 0;
+      display: grid;
+      gap: 8px;
+    }
+    .timeline-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .timeline-head h3 {
+      margin: 0;
+    }
+    .timeline-head span {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.3;
+      white-space: nowrap;
+    }
+    .timeline-scroll {
+      max-height: clamp(280px, 46vh, 720px);
+      min-height: 180px;
+      overflow: auto;
+      padding-right: 4px;
+      overscroll-behavior: contain;
+      scroll-behavior: auto;
+    }
+    .timeline-scroll:focus {
+      outline: 1px solid var(--line-strong);
+      outline-offset: 2px;
+      border-radius: 6px;
+    }
+    .chat-event-list {
+      align-content: start;
+    }
     .agent-chat {
       display: grid;
       gap: 10px;
+    }
+    .agent-focus {
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 14px;
+      display: grid;
+      gap: 10px;
+    }
+    .agent-focus-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: start;
+    }
+    .agent-focus-head h3 {
+      margin: 0;
+      color: var(--ink);
+      font-size: 14px;
+      line-height: 1.25;
+    }
+    .agent-focus-head p,
+    .focus-current {
+      margin: 3px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+    .phase-pill {
+      border: 1px solid rgba(88,166,255,0.55);
+      border-radius: 999px;
+      padding: 4px 8px;
+      background: rgba(88,166,255,0.12);
+      color: #b7d6ff;
+      font-size: 11px;
+      line-height: 1.2;
+      white-space: nowrap;
+    }
+    .focus-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 8px;
+    }
+    .focus-block {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px;
+      background: var(--panel-2);
+      display: grid;
+      align-content: start;
+      gap: 7px;
+    }
+    .focus-block h4 {
+      margin: 0;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.25;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .focus-list {
+      display: grid;
+      gap: 6px;
+    }
+    .focus-row {
+      min-width: 0;
+      display: grid;
+      gap: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .focus-row span,
+    .focus-row strong {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+    .focus-row strong {
+      color: var(--ink);
+      font-weight: 600;
+    }
+    .focus-row code {
+      display: block;
+      margin-top: 2px;
+      padding: 5px 6px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--field);
+      color: #dbeafe;
+      font: 11px/1.35 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+    .chat-file-chip {
+      width: 100%;
+      min-height: 28px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--field);
+      color: var(--ink);
+      font: inherit;
+      font-size: 11px;
+      line-height: 1.3;
+      padding: 5px 7px;
+      text-align: left;
+      overflow-wrap: anywhere;
+      cursor: pointer;
+    }
+    .chat-file-chip.active {
+      border-color: rgba(88,166,255,0.65);
+      background: rgba(88,166,255,0.1);
+    }
+    .chat-file-chip.missing {
+      color: var(--muted);
+      cursor: default;
     }
     .chat-controls {
       display: grid;
@@ -844,6 +1237,49 @@ GRAPH_CSS = r"""
     .compact-event {
       padding: 8px 9px;
     }
+    .agent-event-card {
+      display: grid;
+      gap: 5px;
+      border-left: 3px solid var(--line-strong);
+    }
+    .agent-event-card.is-editing {
+      border-left-color: var(--focus);
+    }
+    .agent-event-card.is-testing {
+      border-left-color: var(--medium);
+    }
+    .agent-event-card.is-blocked {
+      border-left-color: var(--critical);
+    }
+    .agent-event-card.is-review {
+      border-left-color: #ffd166;
+    }
+    .event-card-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .event-card-head strong {
+      margin: 0;
+      text-transform: capitalize;
+    }
+    .event-card-head span {
+      font: 11px/1.3 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+    .agent-message-text {
+      max-height: 240px;
+      overflow: auto;
+      padding: 7px 8px;
+      border: 1px solid rgba(139,148,158,0.16);
+      border-radius: 6px;
+      background: rgba(5,8,13,0.48);
+      color: #c9d1d9;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font: 11px/1.45 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      overscroll-behavior: contain;
+    }
     .stream-list {
       display: grid;
       gap: 8px;
@@ -876,7 +1312,7 @@ GRAPH_CSS = r"""
       overflow-wrap: anywhere;
     }
     .terminal-context {
-      max-height: 160px;
+      max-height: 240px;
       overflow: auto;
       border-bottom: 1px solid #202934;
       background: #070b10;
@@ -892,6 +1328,7 @@ GRAPH_CSS = r"""
     }
     .terminal-context-grid {
       display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
       gap: 12px;
       padding: 0 10px 10px;
     }
@@ -915,7 +1352,7 @@ GRAPH_CSS = r"""
       max-height: none;
       min-height: 0;
       height: 100%;
-      align-content: end;
+      align-content: start;
     }
     .terminal-composer {
       min-width: 0;

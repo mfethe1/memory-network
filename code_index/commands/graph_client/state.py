@@ -24,6 +24,8 @@ const recentFilesEl = document.getElementById("recent-files");
 const treeViewEl = document.getElementById("tree-view");
 const navParent = document.getElementById("nav-parent");
 const navCenter = document.getElementById("nav-center");
+const navExpandAll = document.getElementById("nav-expand-all");
+const navCollapseAll = document.getElementById("nav-collapse-all");
 const searchInput = document.getElementById("search");
 const layerMode = document.getElementById("layer-mode");
 const careFilter = document.getElementById("care-filter");
@@ -42,6 +44,7 @@ const neighborhoodStatus = document.getElementById("neighborhood-status");
 const nodeKind = document.getElementById("node-kind");
 const nodeTitle = document.getElementById("node-title");
 const nodeMeta = document.getElementById("node-meta");
+const panelExpandButton = document.getElementById("panel-expand");
 const panelBody = document.getElementById("panel-body");
 const tabSummary = document.getElementById("tab-summary");
 const tabChat = document.getElementById("tab-chat");
@@ -92,12 +95,13 @@ const navWidthKey = `code_index_graph_nav_width:${data.root}`;
 const panelWidthKey = `code_index_graph_panel_width:${data.root}`;
 const viewStateKey = `code_index_graph_view:${data.root}`;
 const graphTokenKey = `code_index_graph_token:${data.root}`;
+const DIRECTORY_EXPANSION_DEFAULT_VERSION = 2;
 let notes = loadNotes();
 let eventSource = null;
 let liveConnected = false;
 let refreshing = false;
 let viewState = loadViewState();
-let expandedDirs = new Set(viewState.expandedDirs || ["dir:."]);
+let expandedDirs = new Set(Array.isArray(viewState.expandedDirs) ? viewState.expandedDirs : ["dir:."]);
 let neighborhoodDepth = Math.max(1, Math.min(3, Number(viewState.neighborhoodDepth || 1)));
 let graphAdjacencyCache = null;
 let neighborhoodCache = null;
@@ -133,8 +137,10 @@ let clientMetrics = {
 
 function updateAgentHeader() {
   const agent = data.agent || {};
+  const orchestrator = agent.orchestrator || {};
   const activeFiles = agent.active_files || data.focus_paths || [];
   const activeClaims = agent.active_claims || [];
+  const reviewRuns = orchestrator.review_runs || [];
   const activeAgents = (agent.active_agents && agent.active_agents.length)
     ? agent.active_agents.join(", ")
     : (agent.name || "Agent");
@@ -143,10 +149,11 @@ function updateAgentHeader() {
   const liveStatus = liveRefresh.checked
     ? (liveConnected ? "live" : "connecting")
     : "manual";
-  agentName.textContent = `${activeAgents} · ${status} · ${liveStatus}`;
+  const reviewText = reviewRuns.length ? ` · ${reviewRuns.length} review` : "";
+  agentName.textContent = `${activeAgents} · ${status}${reviewText} · ${liveStatus}`;
   agentFiles.textContent = activeFiles.length
     ? activeFiles.join(", ")
-    : (activeClaims.length ? `${activeClaims.length} active file claim(s)` : (activeRuns.length ? `${activeRuns.length} tracked run(s)` : "No active file"));
+    : (reviewRuns.length ? `${reviewRuns.length} run(s) waiting for review` : (activeClaims.length ? `${activeClaims.length} active file claim(s)` : (activeRuns.length ? `${activeRuns.length} tracked run(s)` : "No active file")));
 }
 
 function hydrateData(nextData, options = {}) {
@@ -178,6 +185,7 @@ function hydrateData(nextData, options = {}) {
     };
   });
   nodeById = new Map(nodes.map(n => [n.id, n]));
+  const appliedDirectoryExpansionDefault = applyDirectoryExpansionDefaultIfNeeded();
   edges = data.edges
     .map(edge => ({ ...edge, sourceNode: nodeById.get(edge.source), targetNode: nodeById.get(edge.target) }))
     .filter(edge => edge.sourceNode && edge.targetNode);
@@ -192,6 +200,7 @@ function hydrateData(nextData, options = {}) {
   pruneExpandedDirs();
   ensureParentDirectoriesExpanded(selected);
   renderNavigator();
+  if (appliedDirectoryExpansionDefault) scheduleViewStateSave();
   clientMetrics.hydrate_count += 1;
   clientMetrics.last_hydrate_ms = Math.round((performance.now() - hydrateStarted) * 100) / 100;
   clientMetrics.payload_chars = JSON.stringify(data).length;
@@ -248,8 +257,46 @@ function applyViewStateControls() {
   if (typeof viewState.liveRefresh === "boolean") liveRefresh.checked = viewState.liveRefresh;
   if (typeof viewState.search === "string") searchInput.value = viewState.search;
 }
+function applyDirectoryExpansionDefaultIfNeeded() {
+  const savedVersion = Number(viewState.directoryExpansionDefaultVersion || 0);
+  const savedMode = viewState.directoryExpansionMode === "custom" ? "custom" : "all";
+  if (savedVersion >= DIRECTORY_EXPANSION_DEFAULT_VERSION && savedMode === "custom") {
+    return false;
+  }
+  const nextExpandedDirs = new Set(defaultExpandedDirectoryIds());
+  const changed = (
+    savedVersion < DIRECTORY_EXPANSION_DEFAULT_VERSION ||
+    savedMode !== "all" ||
+    !sameIdSet(expandedDirs, nextExpandedDirs)
+  );
+  if (!changed) return false;
+  expandedDirs = nextExpandedDirs;
+  viewState = {
+    ...viewState,
+    directoryExpansionDefaultVersion: DIRECTORY_EXPANSION_DEFAULT_VERSION,
+    directoryExpansionMode: "all",
+    expandedDirs: [...expandedDirs]
+  };
+  return true;
+}
+function sameIdSet(left, right) {
+  if (left.size !== right.size) return false;
+  for (const id of left) {
+    if (!right.has(id)) return false;
+  }
+  return true;
+}
+function setDirectoryExpansionMode(mode) {
+  viewState = {
+    ...viewState,
+    directoryExpansionDefaultVersion: DIRECTORY_EXPANSION_DEFAULT_VERSION,
+    directoryExpansionMode: mode === "custom" ? "custom" : "all"
+  };
+}
 function viewStatePayload() {
   return {
+    directoryExpansionDefaultVersion: DIRECTORY_EXPANSION_DEFAULT_VERSION,
+    directoryExpansionMode: viewState.directoryExpansionMode === "custom" ? "custom" : "all",
     selectedId: selected ? selected.id : null,
     transform,
     expandedDirs: [...expandedDirs],

@@ -71,6 +71,12 @@ function graphGetHeaders(extra = {}) {
   if (token) headers.Authorization = `Bearer ${token}`;
   return headers;
 }
+function graphNetworkErrorMessage() {
+  const oldPortHint = window.location.port === "8768"
+    ? " This repo now serves the graph on http://127.0.0.1:8767/repo-graph.html."
+    : "";
+  return `Graph server is unreachable from this page.${oldPortHint} Refresh the live graph page and try again.`;
+}
 async function establishGraphBrowserSession(token) {
   const response = await fetch("/api/auth/browser-session", {
     method: "POST",
@@ -81,45 +87,63 @@ async function establishGraphBrowserSession(token) {
   return response;
 }
 async function fetchGraphPost(url, payload) {
-  let response = await fetch(url, {
-    method: "POST",
-    headers: graphPostHeaders(),
-    credentials: "same-origin",
-    body: JSON.stringify(payload)
-  });
+  let response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: graphPostHeaders(),
+      credentials: "same-origin",
+      body: JSON.stringify(payload)
+    });
+  } catch (_err) {
+    throw new Error(graphNetworkErrorMessage());
+  }
   if (response.status !== 401) return response;
   const token = window.prompt("Graph server token");
   if (!token) return response;
   const trimmedToken = token.trim();
   await establishGraphBrowserSession(trimmedToken);
   localStorage.setItem(graphTokenKey, trimmedToken);
-  return fetch(url, {
-    method: "POST",
-    headers: graphPostHeaders(),
-    credentials: "same-origin",
-    body: JSON.stringify(payload)
-  });
+  try {
+    return await fetch(url, {
+      method: "POST",
+      headers: graphPostHeaders(),
+      credentials: "same-origin",
+      body: JSON.stringify(payload)
+    });
+  } catch (_err) {
+    throw new Error(graphNetworkErrorMessage());
+  }
 }
 async function fetchGraphGet(url, options = {}) {
   const headers = graphGetHeaders(options.headers || {});
-  let response = await fetch(url, {
-    ...options,
-    headers,
-    credentials: "same-origin",
-    cache: options.cache || "no-store"
-  });
+  let response;
+  try {
+    response = await fetch(url, {
+      ...options,
+      headers,
+      credentials: "same-origin",
+      cache: options.cache || "no-store"
+    });
+  } catch (_err) {
+    throw new Error(graphNetworkErrorMessage());
+  }
   if (response.status !== 401) return response;
   const token = window.prompt("Graph server token");
   if (!token) return response;
   const trimmedToken = token.trim();
   await establishGraphBrowserSession(trimmedToken);
   localStorage.setItem(graphTokenKey, trimmedToken);
-  return fetch(url, {
-    ...options,
-    headers: graphGetHeaders(options.headers || {}),
-    credentials: "same-origin",
-    cache: options.cache || "no-store"
-  });
+  try {
+    return await fetch(url, {
+      ...options,
+      headers: graphGetHeaders(options.headers || {}),
+      credentials: "same-origin",
+      cache: options.cache || "no-store"
+    });
+  } catch (_err) {
+    throw new Error(graphNetworkErrorMessage());
+  }
 }
 async function postNoteToServer(node, note) {
   if (!canPostToGraphServer()) return;
@@ -167,6 +191,7 @@ function agentTaskPayload(node, message, options = {}) {
     ? [node.path]
     : uniquePaths((node.metrics && ((node.metrics.active_files || []).concat(node.metrics.recent_files || []))) || []);
   const provider = String(options.provider ?? "codex").trim().toLowerCase();
+  const executionStrategy = String(options.executionStrategy || options.execution_strategy || "").trim().toLowerCase();
   const payload = {
     kind: "code_index_graph_agent_task",
     root: data.root,
@@ -188,6 +213,15 @@ function agentTaskPayload(node, message, options = {}) {
     }
   };
   if (provider) payload.provider = provider;
+  if (executionStrategy && executionStrategy !== "single_agent") {
+    payload.execution_strategy = executionStrategy;
+    if (executionStrategy === "agent_swarm") {
+      payload.swarm = {
+        enabled: true,
+        provider: provider || "kimi"
+      };
+    }
+  }
   return payload;
 }
 async function postAgentTaskToServer(payload) {
@@ -595,11 +629,11 @@ function applyAgentRunResponse(result) {
   const recentRuns = uniqueRuns((archived ? [] : [run]).concat(agent.recent_runs || []))
     .filter(item => !item.archived_at)
     .slice(0, 8);
-  const metadata = run.metadata || {};
   const activeFiles = uniquePaths(
-    (agent.active_files || [])
-      .concat(run.active_files || [])
-      .concat(metadata.selected_paths || [])
+    activeRuns.flatMap(item => {
+      const metadata = item.metadata || {};
+      return (item.active_files || []).concat(metadata.selected_paths || []);
+    }).concat(((agent.active_claims || []).map(claim => claim.file_path).filter(Boolean)))
   );
   const events = result.event
     ? [result.event].concat((data.activity && data.activity.agent_events) || [])
@@ -610,6 +644,7 @@ function applyAgentRunResponse(result) {
       active_runs: activeRuns,
       recent_runs: recentRuns,
       kanban: result.board || agent.kanban,
+      orchestrator: (result.board && result.board.orchestrator) || agent.orchestrator,
       active_files: activeFiles,
       active_agents: uniquePaths(activeRuns.map(item => item.agent_name || "Agent")),
       status: activeRuns.length ? "working" : "idle"
@@ -648,7 +683,7 @@ function handleAgentSnapshot(snapshot) {
   renderNavigator();
   const terminalOpen = !!document.getElementById("terminal-stream-body");
   if (selectedRunTranscript && terminalOpen) {
-    if (transcriptChanged) scheduleTerminalSync(true);
+    if (transcriptChanged) scheduleTerminalSync(false);
     return;
   }
   if (!isTypingTarget(document.activeElement)) {

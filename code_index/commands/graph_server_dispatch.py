@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 from code_index import agent_activity
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
+from code_index import run_lifecycle
 from code_index.agent_collaboration import (
     append_event_jsonl,
     build_collaboration_packet,
@@ -109,6 +110,48 @@ def _run_local_agent_task(
 ) -> None:
     from code_index.commands import agent_adapter_cmd
 
+    process_id: str | None = None
+    process_started = False
+
+    def register_started_process(pid: int, command_label: str) -> None:
+        nonlocal process_id, process_started
+        run_id = str(task.get("run_id") or "")
+        if not run_id:
+            return
+        with writer_lock(config):
+            conn = db_mod.connect(config.db_path)
+            try:
+                db_mod.apply_schema(conn)
+                process = run_lifecycle.register_process(
+                    conn,
+                    run_id=run_id,
+                    transport="local-command",
+                    provider=provider or None,
+                    pid=pid,
+                    command_label=command_label,
+                    metadata={"adapter": "command"},
+                )
+                process_id = str(process["process_id"])
+                process_started = True
+            finally:
+                db_mod.close(conn)
+
+    def finish_registered_process(status: str, exit_code: int | None) -> None:
+        if not process_id:
+            return
+        with writer_lock(config):
+            conn = db_mod.connect(config.db_path)
+            try:
+                db_mod.apply_schema(conn)
+                run_lifecycle.finish_process(
+                    conn,
+                    process_id=process_id,
+                    status=status,
+                    exit_code=exit_code,
+                )
+            finally:
+                db_mod.close(conn)
+
     try:
         exit_code, result = agent_adapter_cmd.run_task(
             task,
@@ -119,12 +162,29 @@ def _run_local_agent_task(
             command_timeout=_env_float("CODE_INDEX_AGENT_COMMAND_TIMEOUT"),
             max_output_events=_env_int("CODE_INDEX_AGENT_MAX_OUTPUT_EVENTS", 400),
             cancel_event=cancel_event,
+            process_started_callback=register_started_process,
+        )
+        result_status = str(result.get("status") or "").strip().lower()
+        process_status = (
+            result_status
+            if result_status in run_lifecycle.TERMINAL_PROCESS_STATUSES
+            else ("completed" if exit_code == 0 else "failed")
+        )
+        process_exit_code = result.get("process_exit_code")
+        finish_registered_process(
+            process_status,
+            int(process_exit_code) if process_exit_code is not None else exit_code,
         )
         if exit_code == 2:
             _record_local_adapter_failure(
                 config, task, RuntimeError(str(result.get("error") or "adapter error"))
             )
     except BaseException as exc:  # pragma: no cover - defensive background guard.
+        if process_started:
+            finish_registered_process(
+                "cancelled" if cancel_event.is_set() else "failed",
+                None,
+            )
         _record_local_adapter_failure(config, task, exc)
     finally:
         run_id = str(task.get("run_id") or "")

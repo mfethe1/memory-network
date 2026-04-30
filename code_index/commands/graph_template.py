@@ -64,6 +64,8 @@ HTML_BETWEEN_CSS_AND_SCRIPT = r"""  </style>
         <div class="nav-actions">
           <button id="nav-parent" type="button">Parent</button>
           <button id="nav-center" type="button">Center</button>
+          <button id="nav-expand-all" type="button">Expand</button>
+          <button id="nav-collapse-all" type="button">Collapse</button>
         </div>
       </div>
       <div class="navigator-body">
@@ -134,7 +136,10 @@ HTML_BETWEEN_CSS_AND_SCRIPT = r"""  </style>
     <aside class="inspector">
       <div class="inspector-head">
         <p class="eyebrow" id="node-kind">Repository</p>
-        <h2 id="node-title">Select a node</h2>
+        <div class="inspector-title-row">
+          <h2 id="node-title">Select a node</h2>
+          <button class="panel-expand" id="panel-expand" type="button" title="Expand side panel">Expand</button>
+        </div>
         <div class="meta" id="node-meta"></div>
       </div>
       <div class="tabs">

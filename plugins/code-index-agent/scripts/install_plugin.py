@@ -10,6 +10,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
+for _parent in Path(__file__).resolve().parents:
+    if (_parent / "code_index").is_dir():
+        if str(_parent) not in sys.path:
+            sys.path.insert(0, str(_parent))
+        break
+
+from code_index import agent_providers  # noqa: E402
+
 
 MCP_SERVER = {
     "command": "python",
@@ -23,10 +31,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--root", default=".", help="repo root to configure")
     parser.add_argument("--host", default="127.0.0.1", help="graph-server host")
-    parser.add_argument("--port", default="8768", help="graph-server port")
+    parser.add_argument("--port", default="8767", help="graph-server port")
     parser.add_argument(
         "--provider",
-        choices=["custom", "claude", "codex"],
+        choices=agent_providers.provider_choices(),
         default="custom",
         help="local agent provider preset for browser-submitted tasks",
     )
@@ -52,13 +60,15 @@ def install(
     root: Path,
     *,
     host: str = "127.0.0.1",
-    port: str = "8768",
+    port: str = "8767",
     provider: str = "custom",
     agent_command: str | None = None,
     write_claude_settings: bool = True,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     root = root.resolve()
+    provider = agent_providers.normalize_provider_id(provider)
+    agent_providers.require_provider(provider)
     plugin_script = _repo_relative(
         root,
         Path(__file__).resolve().parent / "start_graph_server.py",
@@ -118,7 +128,7 @@ def install(
         "message": "Review the repo graph, identify the main implementation files, and report affected tests before editing.",
         "selected_nodes": ["dir:."],
         "selected_paths": [],
-        "callback": {"agent_events_url": "http://127.0.0.1:8768/api/agent-events"},
+        "callback": {"agent_events_url": f"http://{host}:{port}/api/agent-events"},
     }
     _write_json(demo_task_path, demo_task, report, dry_run=dry_run)
 

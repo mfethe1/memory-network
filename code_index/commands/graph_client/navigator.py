@@ -52,6 +52,7 @@ GRAPH_SCRIPT_NAVIGATOR = r"""function renderNavigator() {
       const node = nodeById.get(button.dataset.navNode);
       if (!node || button.disabled) return;
       if (button.dataset.navTree === "true" && node.kind === "directory" && !searchInput.value.trim()) {
+        setDirectoryExpansionMode("custom");
         if (selected && selected.id === node.id && expandedDirs.has(node.id) && node.id !== "dir:.") {
           expandedDirs.delete(node.id);
         } else {
@@ -142,21 +143,42 @@ function renderFileClaims() {
 }
 function renderAgentRuns() {
   if (!agentRunsEl) return;
-  const runs = uniqueRuns(
+  const allRuns = uniqueRuns(
     ((data.agent && data.agent.active_runs) || []).concat(
       (data.agent && data.agent.recent_runs) || []
     )
-  ).slice(0, 8);
-  agentRunsEl.innerHTML = runs.length
-    ? runs.map(run => runRowHtml(run)).join("")
+  ).filter(run => !run.archived_at);
+  const runningRuns = allRuns.filter(run => !isTerminalStatus(run.status)).slice(0, 8);
+  const pastRuns = allRuns.filter(run => isTerminalStatus(run.status)).slice(0, 8);
+  const runningHtml = runningRuns.length
+    ? runningRuns.map(run => runRowHtml(run)).join("")
     : `<div class="empty">No queued or active runs.</div>`;
+  const pastHtml = pastRuns.length
+    ? `
+      <details class="past-runs">
+        <summary>Past runs (${pastRuns.length})</summary>
+        <div class="past-run-list">${pastRuns.map(run => runRowHtml(run)).join("")}</div>
+      </details>
+    `
+    : "";
+  agentRunsEl.innerHTML = runningHtml + pastHtml;
 }
 function renderTaskBoard() {
   if (!taskBoardEl) return;
   const board = data.agent && data.agent.kanban;
   const columns = board && board.columns ? board.columns : {};
+  const orchestrator = (data.agent && data.agent.orchestrator) || {};
+  const reviewRuns = orchestrator.review_runs || [];
+  const reviewBanner = reviewRuns.length
+    ? `
+      <button class="review-queue-card" data-run-details="${escapeHtml(reviewRuns[0].run_id)}" type="button" title="${escapeHtml(reviewRuns[0].prompt || reviewRuns[0].run_id)}">
+        <strong>${escapeHtml(reviewRuns.length)} awaiting review</strong>
+        <span>${escapeHtml((reviewRuns[0].agent_name || "Agent") + " · " + (reviewRuns[0].prompt || reviewRuns[0].run_id))}</span>
+      </button>
+    `
+    : "";
   const ordered = ["blocked", "ready", "active", "review", "done"];
-  taskBoardEl.innerHTML = ordered.map(name => {
+  taskBoardEl.innerHTML = reviewBanner + ordered.map(name => {
     const column = columns[name] || { title: name, runs: [] };
     const runs = (column.runs || []).slice(0, 4);
     const title = column.title || name;
@@ -176,12 +198,13 @@ function renderTaskBoard() {
 }
 function taskBoardRunHtml(run, column) {
   const blockers = (run.blocked_by || []).filter(item => String(item.status || "").toLowerCase() === "active");
+  const health = run.run_health || {};
   const label = run.prompt || run.run_id;
   const badge = blockers.length
     ? `${blockers.length} blocker${blockers.length === 1 ? "" : "s"}`
-    : `${run.agent_name || "Agent"} · ${run.status || column}`;
+    : `${run.agent_name || "Agent"} · ${health.health || run.status || column}`;
   return `
-    <button class="task-card" data-run-details="${escapeHtml(run.run_id)}" type="button" title="${escapeHtml(label)}">
+    <button class="task-card ${escapeHtml(health.health || "")}" data-run-details="${escapeHtml(run.run_id)}" type="button" title="${escapeHtml(label)}">
       <span>${escapeHtml(label)}</span>
       <em>${escapeHtml(badge)}</em>
     </button>

@@ -17,7 +17,7 @@ from pathlib import Path
 
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
-from code_index.pipeline import _is_test_path
+from code_index.test_edges import _is_test_path
 
 
 _KIND_BOOST = {"module": 5, "class": 3}

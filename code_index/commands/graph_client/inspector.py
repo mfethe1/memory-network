@@ -11,7 +11,7 @@ function renderInspector() {
     renderRunTranscriptInspector(selectedRunTranscript);
     return;
   }
-  panelBody.classList.remove("terminal-view");
+  panelBody.classList.remove("terminal-view", "chat-view");
   if (!selected) return;
   nodeKind.textContent = selected.kind === "directory" ? "Directory" : selected.role_label;
   nodeTitle.textContent = selected.path;
@@ -34,6 +34,7 @@ function renderInspector() {
     panelBody.innerHTML = renderDebug(selected);
     bindDebugPanel();
   } else if (activeTab === "chat") {
+    panelBody.classList.add("chat-view");
     panelBody.innerHTML = renderChat(selected);
     bindChatPanel(selected);
   } else if (activeTab === "edits") {
@@ -43,6 +44,7 @@ function renderInspector() {
     bindNotesPanel(selected);
   } else {
     panelBody.innerHTML = renderSummary(selected);
+    bindSummaryPanel();
   }
 }
 function renderRunTranscriptInspector(transcript) {
@@ -54,6 +56,7 @@ function renderRunTranscriptInspector(transcript) {
   tabNotes.classList.remove("active");
   tabCode.classList.remove("active");
   if (tabDebug) tabDebug.classList.remove("active");
+  panelBody.classList.remove("chat-view");
   panelBody.classList.add("terminal-view");
   panelBody.innerHTML = renderRunTranscript(transcript);
   bindRunTranscriptPanel(transcript);
@@ -137,6 +140,10 @@ function scrollTerminalToBottom() {
   if (!body) return;
   body.scrollTop = body.scrollHeight;
 }
+function terminalIsNearBottom(body) {
+  if (!body) return true;
+  return body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+}
 function scheduleTerminalSync(forceScroll = false) {
   terminalForceScroll = terminalForceScroll || forceScroll;
   if (terminalRenderFrame) return;
@@ -149,6 +156,7 @@ function scheduleTerminalSync(forceScroll = false) {
 function syncTerminalPanel(forceScroll = false) {
   const body = document.getElementById("terminal-stream-body");
   if (!body || !selectedRunTranscript) return false;
+  const shouldStayPinned = forceScroll || terminalIsNearBottom(body);
   const signature = terminalSignature(selectedRunTranscript);
   const previousSignature = terminalLastSignature;
   if (signature !== terminalLastSignature) {
@@ -156,7 +164,7 @@ function syncTerminalPanel(forceScroll = false) {
     terminalLastSignature = signature;
   }
   updateRunTranscriptHeader(selectedRunTranscript);
-  if (forceScroll || signature !== previousSignature) {
+  if (shouldStayPinned && (forceScroll || signature !== previousSignature)) {
     scrollTerminalToBottom();
   }
   return true;
@@ -217,7 +225,7 @@ function renderRunTranscript(transcript) {
         <span>${escapeHtml(defaultProviderForRun(run).toUpperCase())}</span>
         <span>${escapeHtml(runFacts)}</span>
       </div>
-      <details class="terminal-context">
+      <details class="terminal-context" open>
         <summary>${escapeHtml(run.run_id || "run")} · ${escapeHtml(run.started_at || "")}</summary>
         <div class="terminal-context-grid">
           <div><strong>Active Files</strong><ul class="compact">${fileRows}</ul></div>
@@ -231,9 +239,14 @@ function renderRunTranscript(transcript) {
           <label>
             <span>Target</span>
             <select id="run-followup-provider">
-              <option value="codex">Codex CLI</option>
-              <option value="claude">Claude CLI</option>
-              <option value="configured">Configured adapter</option>
+              ${providerOptionHtml("codex")}
+            </select>
+          </label>
+          <label>
+            <span>Strategy</span>
+            <select id="run-followup-execution-strategy">
+              <option value="single_agent">Single agent</option>
+              <option value="agent_swarm">Agent Swarm</option>
             </select>
           </label>
         </div>
@@ -246,40 +259,162 @@ function renderRunTranscript(transcript) {
     </div>
   `;
 }
+function compactNumber(value, fallback = "0") {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return number.toLocaleString();
+}
+function summaryStatusText(node) {
+  const metrics = node.metrics || {};
+  const parts = [];
+  if (node.kind === "file") {
+    parts.push(`${node.role_label || "File"} in ${node.language || "unknown language"}`);
+  } else {
+    parts.push("Directory layer");
+  }
+  if (metrics.line_count) parts.push(`${compactNumber(metrics.line_count)} lines`);
+  if (metrics.symbol_count) parts.push(`${compactNumber(metrics.symbol_count)} symbols`);
+  if ((node.imports || []).length) parts.push(`${compactNumber((node.imports || []).length)} imports`);
+  return parts.join(" · ");
+}
+function summaryInsightRows(node) {
+  const metrics = node.metrics || {};
+  const rows = [];
+  if (node.active_work) rows.push("An agent is currently reporting active work here.");
+  if (metrics.recent_edit_rank) rows.push(`Recently edited file ranked #${metrics.recent_edit_rank} in activity.`);
+  if (metrics.incoming_relations || metrics.outgoing_relations) {
+    rows.push(`${compactNumber(metrics.incoming_relations || 0)} inbound and ${compactNumber(metrics.outgoing_relations || 0)} outbound cross-file relation(s).`);
+  }
+  if ((metrics.incoming_files || []).length) {
+    rows.push(`${compactNumber((metrics.incoming_files || []).length)} file(s) depend on this node.`);
+  }
+  if ((metrics.outgoing_files || []).length) {
+    rows.push(`This node reaches ${compactNumber((metrics.outgoing_files || []).length)} other file(s).`);
+  }
+  if (metrics.test_count) rows.push(`${compactNumber(metrics.test_count)} affected test edge(s) are indexed.`);
+  if (metrics.diagnostic_count) rows.push(`${compactNumber(metrics.diagnostic_count)} diagnostic(s) are attached.`);
+  if (!rows.length) rows.push("No active work, relation pressure, diagnostics, or test edges are currently attached.");
+  return rows.map(row => `<li>${escapeHtml(row)}</li>`).join("");
+}
+function summaryStat(label, value, detail = "") {
+  return `
+    <div class="summary-stat">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+      ${detail ? `<small>${escapeHtml(detail)}</small>` : ""}
+    </div>
+  `;
+}
+function summaryFileReference(path, direction) {
+  const id = fileNodeId(path);
+  const indexed = nodeById.has(id);
+  const classes = ["summary-file-ref", indexed ? "" : "missing"].filter(Boolean).join(" ");
+  const attrs = indexed ? ` data-summary-node="${escapeHtml(id)}"` : " disabled aria-disabled=\"true\"";
+  return `
+    <button class="${classes}" type="button"${attrs} title="${escapeHtml(path)}">
+      <span>${escapeHtml(direction)}</span>
+      <strong>${escapeHtml(path)}</strong>
+    </button>
+  `;
+}
+function renderRelationshipSection(title, description, paths, direction, totalRelations) {
+  const unique = uniquePaths(paths || []);
+  if (!unique.length) return "";
+  const rows = unique.slice(0, 14).map(path => summaryFileReference(path, direction)).join("");
+  const overflow = unique.length > 14 ? `<p class="summary-note">Showing 14 of ${escapeHtml(compactNumber(unique.length))} files.</p>` : "";
+  const relationText = totalRelations
+    ? `${compactNumber(totalRelations)} relation(s) across ${compactNumber(unique.length)} file(s).`
+    : `${compactNumber(unique.length)} linked file(s).`;
+  return `
+    <div class="section summary-relationships">
+      <div class="summary-section-head">
+        <div>
+          <h3>${escapeHtml(title)}</h3>
+          <p>${escapeHtml(description)}</p>
+        </div>
+        <span>${escapeHtml(relationText)}</span>
+      </div>
+      <div class="summary-ref-list">${rows}</div>
+      ${overflow}
+    </div>
+  `;
+}
 function renderSummary(node) {
   const metrics = node.metrics || {};
+  const index = node.index || {};
   const reasons = (node.importance.reasons || []).map(r => `<li>${escapeHtml(r)}</li>`).join("");
-  const symbols = (node.symbols || []).slice(0, 12).map(s =>
-    `<li>${escapeHtml(s.kind)}: ${escapeHtml(s.canonical_name)}${s.line ? ` at line ${escapeHtml(s.line)}` : ""}</li>`
+  const symbols = (node.symbols || []).slice(0, 12).map(s => `
+    <li>
+      <strong>${escapeHtml(s.canonical_name)}</strong>
+      <span>${escapeHtml(s.kind)}${s.line ? ` · line ${escapeHtml(s.line)}` : ""}</span>
+    </li>`
   ).join("");
   const imports = (node.imports || []).slice(0, 12).map(i => `<li>${escapeHtml(i)}</li>`).join("");
-  const incoming = (metrics.incoming_files || []).slice(0, 10).map(i => `<li>${escapeHtml(i)}</li>`).join("");
-  const outgoing = (metrics.outgoing_files || []).slice(0, 10).map(i => `<li>${escapeHtml(i)}</li>`).join("");
+  const status = summaryStatusText(node);
+  const quickRead = node.kind === "file"
+    ? `${node.summary} ${node.freedom}`
+    : node.summary;
   return `
-    <p class="summary-text">${escapeHtml(node.summary)}</p>
+    <div class="summary-overview">
+      <div class="summary-copy">
+        <h3>Quick Read</h3>
+        <p>${escapeHtml(quickRead)}</p>
+        <span>${escapeHtml(status)}</span>
+      </div>
+      <div class="summary-stat-grid">
+        ${summaryStat("Care", node.care_level || "n/a", node.importance.rank ? `rank ${node.importance.rank}` : "")}
+        ${summaryStat("Size", metrics.line_count ? compactNumber(metrics.line_count) : "n/a", "lines")}
+        ${summaryStat("Symbols", compactNumber(metrics.symbol_count || 0), `${compactNumber(metrics.chunk_count || 0)} chunks`)}
+        ${summaryStat("Relations", `${compactNumber(metrics.incoming_relations || 0)} in / ${compactNumber(metrics.outgoing_relations || 0)} out`)}
+      </div>
+    </div>
+    <div class="section summary-scan">
+      <div>
+        <h3>What To Notice</h3>
+        <ul class="compact summary-insights">${summaryInsightRows(node)}</ul>
+      </div>
+      <div>
+        <h3>Index State</h3>
+        <dl class="kv compact-kv">
+          <dt>Parse</dt><dd>${escapeHtml(index.parse_status || "unknown")}</dd>
+          <dt>Source</dt><dd>${escapeHtml(index.semantic_source || "n/a")}</dd>
+          <dt>Confidence</dt><dd>${escapeHtml(index.parser_confidence || "n/a")}</dd>
+          <dt>Last Edit</dt><dd>${escapeHtml(metrics.last_edited_at || "not recorded")}</dd>
+          <dt>Edits</dt><dd>${escapeHtml(compactNumber(metrics.edit_count || 0))}</dd>
+          <dt>Tests</dt><dd>${escapeHtml(compactNumber(metrics.test_count || 0))}</dd>
+        </dl>
+      </div>
+    </div>
     <div class="section">
       <h3>Care Guidance</h3>
       <p class="summary-text">${escapeHtml(node.freedom)}</p>
       <ul class="compact">${reasons}</ul>
     </div>
-    <div class="section">
-      <h3>Metrics</h3>
-      <dl class="kv">
-        <dt>Rank</dt><dd>${escapeHtml(node.importance.rank || "n/a")}</dd>
-        <dt>Lines</dt><dd>${escapeHtml(metrics.line_count || "n/a")}</dd>
-        <dt>Symbols</dt><dd>${escapeHtml(metrics.symbol_count || 0)}</dd>
-        <dt>Chunks</dt><dd>${escapeHtml(metrics.chunk_count || 0)}</dd>
-        <dt>Inbound</dt><dd>${escapeHtml(metrics.incoming_relations || 0)}</dd>
-        <dt>Outbound</dt><dd>${escapeHtml(metrics.outgoing_relations || 0)}</dd>
-        <dt>Edits</dt><dd>${escapeHtml(metrics.edit_count || 0)}</dd>
-        <dt>Tests</dt><dd>${escapeHtml(metrics.test_count || 0)}</dd>
-      </dl>
-    </div>
-    ${symbols ? `<div class="section"><h3>Symbols</h3><ul class="compact">${symbols}</ul></div>` : ""}
+    ${symbols ? `<div class="section"><h3>Top Symbols</h3><ul class="compact summary-symbols">${symbols}</ul></div>` : ""}
     ${imports ? `<div class="section"><h3>Imports</h3><ul class="compact">${imports}</ul></div>` : ""}
-    ${incoming ? `<div class="section"><h3>Incoming Files</h3><ul class="compact">${incoming}</ul></div>` : ""}
-    ${outgoing ? `<div class="section"><h3>Outgoing Files</h3><ul class="compact">${outgoing}</ul></div>` : ""}
+    ${renderRelationshipSection(
+      "Incoming Files",
+      "Files with indexed relations pointing into this node.",
+      metrics.incoming_files || [],
+      "in",
+      metrics.incoming_relations || 0
+    )}
+    ${renderRelationshipSection(
+      "Outgoing Files",
+      "Files this node points to through indexed relations.",
+      metrics.outgoing_files || [],
+      "out",
+      metrics.outgoing_relations || 0
+    )}
   `;
+}
+function bindSummaryPanel() {
+  document.querySelectorAll("[data-summary-node]").forEach(button => {
+    button.addEventListener("click", () => {
+      const target = nodeById.get(button.dataset.summaryNode);
+      if (target) selectNode(target, { center: true });
+    });
+  });
 }
 function editsForNode(node) {
   if (node.kind === "file") return node.recent_edits || [];
@@ -656,71 +791,343 @@ async function fetchDebugSnapshot() {
     status.textContent = debugFetchError;
   }
 }
-function renderChat(node) {
-  const canSubmit = canPostToGraphServer();
-  const disabled = canSubmit ? "" : " disabled aria-disabled=\"true\"";
-  const selectedPaths = node.kind === "file"
-    ? [node.path]
-    : uniquePaths((node.metrics && ((node.metrics.active_files || []).concat(node.metrics.recent_files || []))) || []);
-  const recentEvents = ((data.activity && data.activity.agent_events) || []).slice(0, 8);
-  const eventRows = recentEvents.length
-    ? recentEvents.map(event => {
-        const target = event.file_path ? ` · ${event.file_path}` : "";
-        return `
-          <div class="edit-item compact-event">
-            <strong>${escapeHtml(event.agent_name || "Agent")} · ${escapeHtml(event.event_type || "event")}${escapeHtml(target)}</strong>
-            <span>${escapeHtml(event.timestamp || "")}</span>
-            <div>${escapeHtml(event.message || "")}</div>
-          </div>
-        `;
-      }).join("")
-    : `<p class="empty">No agent messages recorded yet.</p>`;
+function shortRunId(runId) {
+  return String(runId || "").slice(0, 8) || "run";
+}
+function runFiles(run) {
+  const metadata = (run && run.metadata) || {};
+  return uniquePaths(
+    ((run && run.active_files) || [])
+      .concat(metadata.selected_paths || [])
+      .concat(
+        Array.isArray(run && run.selected_nodes)
+          ? run.selected_nodes
+              .filter(id => String(id || "").startsWith("file:"))
+              .map(id => String(id).slice(5))
+          : []
+      )
+  );
+}
+function selectedFilesForNode(node) {
+  if (!node) return [];
+  if (node.kind === "file") return [node.path];
+  return uniquePaths((node.metrics && ((node.metrics.active_files || []).concat(node.metrics.recent_files || []))) || []);
+}
+function cleanAgentMessage(message) {
+  const raw = String(message || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("CODE_INDEX_EVENT ")) {
+    try {
+      const payload = JSON.parse(raw.slice("CODE_INDEX_EVENT ".length));
+      return [
+        payload.message || payload.event || payload.type || "agent event",
+        payload.path ? `file: ${payload.path}` : "",
+        payload.payload && payload.payload.phase ? `phase: ${payload.payload.phase}` : ""
+      ].filter(Boolean).join("\n");
+    } catch (_err) {
+      return raw;
+    }
+  }
+  if (raw.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(raw);
+      const item = parsed.item || {};
+      if (item.type === "agent_message" && item.text) return String(item.text).trim();
+      if (item.type === "todo_list" && Array.isArray(item.items)) {
+        return item.items.map(todo => `${todo.completed ? "[x]" : "[ ]"} ${todo.text || ""}`).join("\n");
+      }
+      if (item.type === "command_execution") {
+        const command = item.command ? `$ ${item.command}` : "";
+        const output = item.aggregated_output ? String(item.aggregated_output).trim() : "";
+        const status = item.status ? `status: ${item.status}` : "";
+        return [command, output, status].filter(Boolean).join("\n");
+      }
+      if (parsed.type) return parsed.type;
+    } catch (_err) {
+      return raw;
+    }
+  }
+  return raw;
+}
+function truncateText(text, limit = 900) {
+  const value = String(text || "");
+  if (value.length <= limit) return value;
+  return `${value.slice(0, limit - 1)}...`;
+}
+function eventPhase(event) {
+  const type = String((event && event.event_type) || "").toLowerCase();
+  if (type === "edit") return "editing";
+  if (type === "test") return "testing";
+  if (type === "read" || type === "navigate") return "reading";
+  if (type === "decision") return "planning";
+  if (type === "suggestion") return "review";
+  if (type === "status") {
+    const message = String((event && event.message) || "").toLowerCase();
+    if (message.includes("complete")) return "done";
+    if (message.includes("cancel")) return "blocked";
+  }
+  return type || "activity";
+}
+function eventToneClass(event) {
+  const phase = eventPhase(event);
+  if (phase === "editing") return "is-editing";
+  if (phase === "testing") return "is-testing";
+  if (phase === "blocked") return "is-blocked";
+  if (phase === "review") return "is-review";
+  return "";
+}
+function fileChip(path, options = {}) {
+  const id = fileNodeId(path);
+  const indexed = nodeById.has(id);
+  const classes = ["chat-file-chip", options.active ? "active" : "", indexed ? "" : "missing"].filter(Boolean).join(" ");
+  const attrs = indexed ? ` data-chat-node="${escapeHtml(id)}"` : " disabled aria-disabled=\"true\"";
+  const title = options.title || path;
+  return `<button class="${classes}" type="button"${attrs} title="${escapeHtml(title)}">${escapeHtml(path)}</button>`;
+}
+function collectSuggestionRows(events, limit = 6) {
+  const rows = [];
+  (events || []).forEach(event => {
+    if (!event) return;
+    const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+    const payloadSuggestions = Array.isArray(payload.suggestions) ? payload.suggestions : [];
+    if (String(event.event_type || "").toLowerCase() === "suggestion" && !payloadSuggestions.length) {
+      rows.push({
+        message: event.message || "Agent suggestion",
+        command: "",
+        run_id: event.run_id || ""
+      });
+    }
+    payloadSuggestions.forEach(item => {
+      rows.push({
+        message: item.message || item.kind || event.message || "Agent suggestion",
+        command: item.command || "",
+        run_id: event.run_id || ""
+      });
+    });
+  });
+  return rows.slice(0, limit);
+}
+function timelineEventsForFocus(focus) {
+  const events = (focus && focus.scopedEvents && focus.scopedEvents.length)
+    ? focus.scopedEvents
+    : ((focus && focus.events) || []);
+  return [...events].sort((a, b) => {
+    const at = Date.parse(a.timestamp || "") || 0;
+    const bt = Date.parse(b.timestamp || "") || 0;
+    if (at !== bt) return at - bt;
+    return Number(a.event_pk || 0) - Number(b.event_pk || 0);
+  });
+}
+function agentFocusForNode(node) {
+  const agent = data.agent || {};
+  const activity = data.activity || {};
+  const activeRuns = uniqueRuns(agent.active_runs || []).filter(run => !isTerminalStatus(run.status));
+  const recentRuns = uniqueRuns(agent.recent_runs || []);
+  const allRuns = uniqueRuns(activeRuns.concat(recentRuns));
+  const selectedPaths = selectedFilesForNode(node);
+  const relatedRun = allRuns.find(run => runFiles(run).some(path => selectedPaths.includes(path)));
+  const currentRun = relatedRun || activeRuns[0] || recentRuns[0] || null;
+  const events = activity.agent_events || [];
+  const scopedEvents = currentRun ? events.filter(event => event.run_id === currentRun.run_id) : events;
+  const latestEvent = scopedEvents[0] || events[0] || null;
+  const claims = agent.active_claims || [];
+  const activeFiles = uniquePaths(
+    (agent.active_files || [])
+      .concat(currentRun ? runFiles(currentRun) : [])
+      .concat(claims.map(claim => claim.file_path).filter(Boolean))
+  );
+  const files = activeFiles.length ? activeFiles : selectedPaths;
+  const scopedSuggestions = collectSuggestionRows(scopedEvents);
+  const seenSuggestions = new Set(scopedSuggestions.map(item => `${item.message}|${item.command}`));
+  const fallbackSuggestions = collectSuggestionRows(events)
+    .filter(item => !seenSuggestions.has(`${item.message}|${item.command}`));
+  return {
+    activeRuns,
+    currentRun,
+    latestEvent,
+    phase: latestEvent ? eventPhase(latestEvent) : (activeRuns.length ? "working" : "idle"),
+    files,
+    claims,
+    suggestions: scopedSuggestions.concat(fallbackSuggestions).slice(0, 6),
+    scopedEvents,
+    events
+  };
+}
+function renderFocusList(title, rows, emptyText) {
   return `
-    <div class="agent-chat">
-      <div class="chat-controls">
-        <label>
-          <span>Target</span>
-          <select id="agent-provider">
-            <option value="codex">Codex CLI</option>
-            <option value="claude">Claude CLI</option>
-            <option value="configured">Configured adapter</option>
-          </select>
-        </label>
-      </div>
-      <textarea class="note-box chat-box" id="agent-chat-message" placeholder="Send a task or question about this selected node to the coding agent."></textarea>
-      <div class="actions">
-        <button class="small-button primary-action" id="send-agent-message" type="button"${disabled}>Send to agent</button>
-        <button class="small-button" id="copy-agent-message-json" type="button">Copy JSON</button>
-        <span class="inline-status" id="agent-chat-status">${canSubmit ? "Ready" : "Graph server required"}</span>
-      </div>
-    </div>
-    <div class="section">
-      <h3>Selected Context</h3>
-      <dl class="kv">
-        <dt>Node</dt><dd>${escapeHtml(node.path)}</dd>
-        <dt>Care</dt><dd>${escapeHtml(node.care_level || "")}</dd>
-        <dt>Files</dt><dd>${escapeHtml(selectedPaths.length ? selectedPaths.join(", ") : "No file targets")}</dd>
-      </dl>
-      <p class="summary-text">${escapeHtml(node.summary)}</p>
-    </div>
-    <div class="section">
-      <h3>Agent Timeline</h3>
-      <div class="edit-list">${eventRows}</div>
+    <div class="focus-block">
+      <h4>${escapeHtml(title)}</h4>
+      ${rows.length ? `<div class="focus-list">${rows.join("")}</div>` : `<p class="empty">${escapeHtml(emptyText)}</p>`}
     </div>
   `;
 }
+function renderTimelineEvent(event) {
+  const target = event.file_path || event.symbol_path || "";
+  const phase = eventPhase(event);
+  const message = truncateText(cleanAgentMessage(event.message), 6000);
+  const meta = [
+    event.timestamp || "",
+    event.agent_name || "Agent",
+    event.event_type || "event",
+    target
+  ].filter(Boolean).join(" · ");
+  return `
+    <div class="edit-item compact-event agent-event-card ${escapeHtml(eventToneClass(event))}">
+      <div class="event-card-head">
+        <strong>${escapeHtml(phase)}</strong>
+        <span>${escapeHtml(shortRunId(event.run_id))}</span>
+      </div>
+      <span>${escapeHtml(meta)}</span>
+      <div class="agent-message-text">${escapeHtml(message || "No message recorded.")}</div>
+    </div>
+  `;
+}
+function renderChat(node) {
+  const canSubmit = canPostToGraphServer();
+  const disabled = canSubmit ? "" : " disabled aria-disabled=\"true\"";
+  const selectedPaths = selectedFilesForNode(node);
+  const focus = agentFocusForNode(node);
+  const currentRun = focus.currentRun;
+  const timelineEvents = timelineEventsForFocus(focus);
+  const activeFileRows = focus.files.slice(0, 10).map(path => fileChip(path, {
+    active: ((data.agent && data.agent.active_files) || []).includes(path),
+    title: "Open file in graph"
+  }));
+  const claimRows = focus.claims.slice(0, 8).map(claim => `
+    <div class="focus-row">
+      <span>${escapeHtml(claim.file_path || "claim")}</span>
+      <strong>${escapeHtml([claim.agent_name || "Agent", claim.mode || "claim", claim.run_status || claim.status || ""].filter(Boolean).join(" · "))}</strong>
+    </div>
+  `);
+  const suggestionRows = focus.suggestions.map(item => {
+    const command = item.command ? `<code>${escapeHtml(item.command)}</code>` : "";
+    return `
+      <div class="focus-row suggestion-row">
+        <span>${escapeHtml(item.message || "Suggestion")}</span>
+        ${command}
+      </div>
+    `;
+  });
+  const eventRows = timelineEvents.length
+    ? timelineEvents.map(renderTimelineEvent).join("")
+    : `<p class="empty">No agent messages recorded yet.</p>`;
+  const runLabel = currentRun
+    ? `${currentRun.agent_name || "Agent"} · ${currentRun.status || "working"} · ${shortRunId(currentRun.run_id)}`
+    : "No active run";
+  const latestText = focus.latestEvent
+    ? truncateText(cleanAgentMessage(focus.latestEvent.message), 260)
+    : "Live activity will appear here when an agent emits events.";
+  return `
+    <div class="chat-workspace">
+      <section class="agent-focus">
+        <div class="agent-focus-head">
+          <div>
+            <h3>Agent Focus</h3>
+            <p>${escapeHtml(runLabel)}</p>
+          </div>
+          <span class="phase-pill">${escapeHtml(focus.phase)}</span>
+        </div>
+        <p class="focus-current">${escapeHtml(latestText)}</p>
+        <div class="focus-grid">
+          ${renderFocusList("Active Files", activeFileRows, "No active files reported.")}
+          ${renderFocusList("File Claims", claimRows, "No active file claims.")}
+          ${renderFocusList("Suggestions", suggestionRows, "No suggestions yet.")}
+        </div>
+      </section>
+      <div class="agent-chat">
+        <div class="chat-controls">
+          <label>
+            <span>Target</span>
+            <select id="agent-provider">
+              ${providerOptionHtml("codex")}
+            </select>
+          </label>
+          <label>
+            <span>Strategy</span>
+            <select id="agent-execution-strategy">
+              <option value="single_agent">Single agent</option>
+              <option value="agent_swarm">Agent Swarm</option>
+            </select>
+          </label>
+        </div>
+        <textarea class="note-box chat-box" id="agent-chat-message" placeholder="Send a focused task or follow-up about the selected node."></textarea>
+        <div class="actions">
+          <button class="small-button primary-action" id="send-agent-message" type="button"${disabled}>Send to agent</button>
+          <button class="small-button" id="copy-agent-message-json" type="button">Copy JSON</button>
+          <span class="inline-status" id="agent-chat-status">${canSubmit ? "Ready" : "Graph server required"}</span>
+        </div>
+      </div>
+      <div class="section selected-context-section">
+        <h3>Selected Context</h3>
+        <dl class="kv">
+          <dt>Node</dt><dd>${escapeHtml(node.path)}</dd>
+          <dt>Care</dt><dd>${escapeHtml(node.care_level || "")}</dd>
+          <dt>Files</dt><dd>${escapeHtml(selectedPaths.length ? selectedPaths.join(", ") : "No file targets")}</dd>
+        </dl>
+        <p class="summary-text">${escapeHtml(node.summary)}</p>
+      </div>
+      <div class="section chat-timeline-section">
+        <div class="timeline-head">
+          <h3>Agent Timeline</h3>
+          <span>${escapeHtml(timelineEvents.length ? `${timelineEvents.length} events · oldest first` : "No events")}</span>
+        </div>
+        <div class="timeline-scroll" tabindex="0" role="region" aria-label="Agent timeline">
+          <div class="edit-list chat-event-list">${eventRows}</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+function agentProviderRegistry() {
+  const live = (data && data.live) || (typeof graph !== "undefined" && graph && graph.live) || {};
+  const providers = Array.isArray(live.agent_providers) ? live.agent_providers : [];
+  if (providers.length) return providers;
+  return [
+    { id: "configured", display_name: "Configured adapter" }
+  ];
+}
+function providerOptionHtml(selected) {
+  const selectedValue = String(selected || "codex");
+  const providers = agentProviderRegistry().slice();
+  if (!providers.some(provider => String(provider.id || "") === "configured")) {
+    providers.push({ id: "configured", display_name: "Configured adapter" });
+  }
+  return providers.map(provider => {
+    const id = String(provider.id || "");
+    if (!id) return "";
+    const label = provider.display_name || id;
+    const selectedAttr = id === selectedValue ? " selected" : "";
+    return `<option value="${escapeHtml(id)}"${selectedAttr}>${escapeHtml(label)}</option>`;
+  }).join("");
+}
 function agentNameForProvider(provider) {
-  if (provider === "codex") return "Codex";
-  if (provider === "claude") return "Claude";
+  const providerId = String(provider || "").toLowerCase();
+  const registryProvider = agentProviderRegistry().find(item =>
+    String(item.id || "").toLowerCase() === providerId
+  );
+  if (registryProvider && registryProvider.display_name) {
+    return String(registryProvider.display_name);
+  }
   return (data.agent && data.agent.name) || "Agent";
 }
 function providerFromChatControl(selectEl) {
   const value = selectEl ? String(selectEl.value || "codex") : "codex";
   return value === "configured" ? "" : value;
 }
+function executionStrategyFromControl(selectEl) {
+  return selectEl ? String(selectEl.value || "single_agent") : "single_agent";
+}
+function syncProviderForExecutionStrategy(providerSelect, strategySelect) {
+  if (!providerSelect || !strategySelect) return;
+  const hasKimi = agentProviderRegistry().some(provider => String(provider.id || "") === "kimi");
+  if (hasKimi && strategySelect.value === "agent_swarm" && providerSelect.value === "codex") {
+    providerSelect.value = "kimi";
+  }
+}
 function defaultProviderForRun(run) {
   const metadata = (run && run.metadata) || {};
   const provider = String(metadata.provider || "").toLowerCase();
+  if (provider === "kimi" || String((run && run.agent_name) || "").toLowerCase().includes("kimi")) return "kimi";
   if (provider === "claude" || String((run && run.agent_name) || "").toLowerCase().includes("claude")) return "claude";
   return "codex";
 }
@@ -752,10 +1159,16 @@ function agentTaskPayloadFromRun(transcript, message, options = {}) {
 }
 function bindRunTranscriptPanel(transcript) {
   const providerSelect = document.getElementById("run-followup-provider");
+  const strategySelect = document.getElementById("run-followup-execution-strategy");
   const messageBox = document.getElementById("run-followup-message");
   const sendButton = document.getElementById("send-run-followup");
   const status = document.getElementById("run-followup-status");
   if (providerSelect) providerSelect.value = defaultProviderForRun((transcript && transcript.run) || {});
+  if (strategySelect) {
+    strategySelect.addEventListener("change", () => {
+      syncProviderForExecutionStrategy(providerSelect, strategySelect);
+    });
+  }
   terminalLastSignature = "";
   scheduleTerminalSync(true);
   if (!sendButton || !messageBox || !status) return;
@@ -767,12 +1180,14 @@ function bindRunTranscriptPanel(transcript) {
       return;
     }
     const provider = providerFromChatControl(providerSelect);
+    const executionStrategy = executionStrategyFromControl(strategySelect);
     sendButton.disabled = true;
     status.textContent = "Sending";
     try {
       const payload = applyPreflightConfirmation(agentTaskPayloadFromRun(transcript, message, {
         provider,
-        agentName: agentNameForProvider(provider)
+        agentName: agentNameForProvider(provider),
+        executionStrategy
       }), sendButton);
       const result = await postAgentTaskToServer(payload);
       if (handlePreflightResult(result, sendButton, status, "Send anyway")) return;
@@ -794,16 +1209,30 @@ function bindRunTranscriptPanel(transcript) {
 }
 function bindChatPanel(node) {
   const providerSelect = document.getElementById("agent-provider");
+  const strategySelect = document.getElementById("agent-execution-strategy");
   const messageBox = document.getElementById("agent-chat-message");
   const sendButton = document.getElementById("send-agent-message");
   const copyButton = document.getElementById("copy-agent-message-json");
   const status = document.getElementById("agent-chat-status");
+  document.querySelectorAll("[data-chat-node]").forEach(button => {
+    button.addEventListener("click", () => {
+      const target = nodeById.get(button.dataset.chatNode);
+      if (target) selectNode(target, { center: true });
+    });
+  });
   if (copyButton && messageBox) {
+    if (strategySelect) {
+      strategySelect.addEventListener("change", () => {
+        syncProviderForExecutionStrategy(providerSelect, strategySelect);
+      });
+    }
     copyButton.addEventListener("click", async () => {
       const provider = providerFromChatControl(providerSelect);
+      const executionStrategy = executionStrategyFromControl(strategySelect);
       await copyJson(agentTaskPayload(node, messageBox.value.trim(), {
         provider,
-        agentName: agentNameForProvider(provider)
+        agentName: agentNameForProvider(provider),
+        executionStrategy
       }));
       copyButton.textContent = "Copied";
       setTimeout(() => { copyButton.textContent = "Copy JSON"; }, 900);
@@ -818,12 +1247,14 @@ function bindChatPanel(node) {
         return;
       }
       const provider = providerFromChatControl(providerSelect);
+      const executionStrategy = executionStrategyFromControl(strategySelect);
       sendButton.disabled = true;
       status.textContent = "Sending";
       try {
         const payload = applyPreflightConfirmation(agentTaskPayload(node, message, {
           provider,
-          agentName: agentNameForProvider(provider)
+          agentName: agentNameForProvider(provider),
+          executionStrategy
         }), sendButton);
         const result = await postAgentTaskToServer(payload);
         if (handlePreflightResult(result, sendButton, status, "Send anyway")) return;

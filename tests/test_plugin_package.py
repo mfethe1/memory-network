@@ -150,6 +150,19 @@ def test_code_index_agent_installer_writes_repo_local_config(tmp_path: Path):
     config = _load_json(tmp_path / ".code_index" / "agent-plugin.json")
     assert config["graph_server"]["provider"] == "codex"
     assert "--provider codex" in config["commands"]["start_graph"]
+    demo_task = _load_json(tmp_path / ".code_index" / "demo-agent-task.json")
+    assert (
+        demo_task["callback"]["agent_events_url"]
+        == "http://127.0.0.1:8899/api/agent-events"
+    )
+
+
+def test_code_index_agent_installer_default_port_matches_graph_server(tmp_path: Path):
+    module = _load_installer_module()
+
+    report = module.install(tmp_path, provider="custom", dry_run=True)
+
+    assert report["graph_url"] == "http://127.0.0.1:8767/repo-graph.html"
 
 
 def test_code_index_agent_installer_refuses_invalid_existing_json(tmp_path: Path):

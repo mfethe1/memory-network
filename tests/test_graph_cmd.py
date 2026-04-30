@@ -200,7 +200,20 @@ def test_graph_html_writes_standalone_view(
     assert "related-files" in html
     assert "nav-parent" in html
     assert "nav-center" in html
+    assert "nav-expand-all" in html
+    assert "nav-collapse-all" in html
     assert "expandedDirs" in html
+    assert "DIRECTORY_EXPANSION_DEFAULT_VERSION" in html
+    assert "directoryExpansionDefaultVersion" in html
+    assert "directoryExpansionMode" in html
+    assert "function setDirectoryExpansionMode" in html
+    assert "function allDirectoryIds()" in html
+    assert "function defaultExpandedDirectoryIds()" in html
+    assert "function expandAllDirectories()" in html
+    assert "expandedDirs = new Set(defaultExpandedDirectoryIds())" in html
+    reset_section = html[html.index('resetView.addEventListener("click"') :]
+    assert "directoryExpansionMode: \"all\"" in reset_section
+    assert "expandedDirs = new Set(defaultExpandedDirectoryIds())" in reset_section
     assert "data-nav-tree" in html
     assert "--nav-indent" in html
     assert "zoom-in" in html
@@ -211,6 +224,24 @@ def test_graph_html_writes_standalone_view(
     assert "agent-chat-message" in html
     assert "send-agent-message" in html
     assert "agent-provider" in html
+    assert "agent_providers" in html
+    assert "agentProviderRegistry()" in html
+    assert 'providerOptionHtml("codex")' in html
+    registry_fallback = html[
+        html.index("function agentProviderRegistry()"):
+        html.index("function providerOptionHtml")
+    ]
+    assert '{ id: "configured", display_name: "Configured adapter" }' in registry_fallback
+    assert '{ id: "codex", display_name: "Codex" }' not in registry_fallback
+    assert '{ id: "claude", display_name: "Claude" }' not in registry_fallback
+    assert '{ id: "kimi", display_name: "Kimi" }' not in registry_fallback
+    assert '<option value="codex">Codex CLI</option>' not in html
+    assert '<option value="claude">Claude CLI</option>' not in html
+    assert '<option value="kimi">Kimi Code CLI</option>' not in html
+    assert "agent-execution-strategy" in html
+    assert "run-followup-execution-strategy" in html
+    assert "agent_swarm" in html
+    assert "execution_strategy" in html
     assert "agent_runs_path" in html
     assert "agent_preflight_path" in html
     assert "search_path" in html

@@ -254,10 +254,13 @@ function workspaceWidths() {
 function setWorkspaceWidths(navWidthPx, panelWidthPx) {
   if (!workspace || window.matchMedia("(max-width: 900px)").matches) return;
   const navWidth = Math.max(220, Math.min(560, Number(navWidthPx) || 280));
-  const panelWidth = Math.max(320, Math.min(760, Number(panelWidthPx) || 430));
+  const workspaceWidth = workspace.getBoundingClientRect().width || window.innerWidth || 1440;
+  const panelMax = Math.max(520, Math.min(1120, workspaceWidth - navWidth - 220));
+  const panelWidth = Math.max(320, Math.min(panelMax, Number(panelWidthPx) || 430));
   workspace.style.gridTemplateColumns = `${navWidth}px 7px minmax(0, 1fr) 7px ${panelWidth}px`;
   localStorage.setItem(navWidthKey, String(navWidth));
   localStorage.setItem(panelWidthKey, String(panelWidth));
+  updatePanelExpandButton(panelWidth, panelMax);
 }
 function setNavWidth(widthPx) {
   const widths = workspaceWidths();
@@ -267,6 +270,19 @@ function setPanelWidth(widthPx) {
   const widths = workspaceWidths();
   setWorkspaceWidths(widths.nav, widthPx);
 }
+function expandAllDirectories() {
+  setDirectoryExpansionMode("all");
+  expandedDirs = new Set(defaultExpandedDirectoryIds());
+  renderNavigator();
+  scheduleViewStateSave();
+}
+function collapseAllDirectories() {
+  setDirectoryExpansionMode("custom");
+  expandedDirs = new Set(["dir:."]);
+  ensureParentDirectoriesExpanded(selected);
+  renderNavigator();
+  scheduleViewStateSave();
+}
 function restorePanelWidth() {
   const savedNav = localStorage.getItem(navWidthKey);
   const savedPanel = localStorage.getItem(panelWidthKey);
@@ -275,7 +291,30 @@ function restorePanelWidth() {
       savedNav ? Number(savedNav) : workspaceWidths().nav,
       savedPanel ? Number(savedPanel) : workspaceWidths().panel
     );
+  } else {
+    updatePanelExpandButton(workspaceWidths().panel);
   }
+}
+function updatePanelExpandButton(panelWidth = null, panelMax = null) {
+  if (!panelExpandButton) return;
+  const widths = workspaceWidths();
+  const currentPanel = panelWidth == null ? widths.panel : Number(panelWidth);
+  const currentNav = widths.nav;
+  const workspaceWidth = workspace ? workspace.getBoundingClientRect().width : window.innerWidth;
+  const maxPanel = panelMax == null
+    ? Math.max(520, Math.min(1120, (workspaceWidth || 1440) - currentNav - 220))
+    : Number(panelMax);
+  const expanded = currentPanel >= maxPanel - 24;
+  panelExpandButton.textContent = expanded ? "Restore" : "Expand";
+  panelExpandButton.setAttribute("aria-pressed", expanded ? "true" : "false");
+}
+function togglePanelExpanded() {
+  if (!workspace) return;
+  const widths = workspaceWidths();
+  const workspaceWidth = workspace.getBoundingClientRect().width || window.innerWidth || 1440;
+  const maxPanel = Math.max(520, Math.min(1120, workspaceWidth - widths.nav - 220));
+  const expanded = widths.panel >= maxPanel - 24;
+  setPanelWidth(expanded ? 430 : maxPanel);
 }
 function bindNavResizer() {
   if (!navResizer || !workspace) return;
@@ -320,6 +359,9 @@ function bindPanelResizer() {
     window.addEventListener("pointerup", onUp);
   });
 }
+if (panelExpandButton) panelExpandButton.addEventListener("click", togglePanelExpanded);
+if (navExpandAll) navExpandAll.addEventListener("click", expandAllDirectories);
+if (navCollapseAll) navCollapseAll.addEventListener("click", collapseAllDirectories);
 function sidecarUrl() {
   const current = new URL(window.location.href);
   if (current.pathname.endsWith(".html")) {
@@ -527,7 +569,12 @@ resetView.addEventListener("click", () => {
   careFilter.value = "all";
   showDirs.checked = true;
   showRelations.checked = true;
-  expandedDirs = new Set(["dir:."]);
+  viewState = {
+    ...viewState,
+    directoryExpansionDefaultVersion: DIRECTORY_EXPANSION_DEFAULT_VERSION,
+    directoryExpansionMode: "all"
+  };
+  expandedDirs = new Set(defaultExpandedDirectoryIds());
   ensureParentDirectoriesExpanded(selected);
   resetTransform();
   renderGraph();
