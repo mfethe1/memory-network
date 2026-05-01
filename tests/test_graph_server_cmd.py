@@ -620,6 +620,46 @@ def test_preflight_returns_context_preview_for_selected_path(
     assert preview.get("selected_file") == "pkg/demo.py"
 
 
+def test_symbols_endpoint_returns_function_hit(
+    tmp_path: Path, capsys, monkeypatch
+):
+    (tmp_path / "mymod.py").write_text(
+        "def build_context_packet(x):\n    return x\n",
+        encoding="utf-8",
+    )
+
+    with _make_server(tmp_path, capsys, monkeypatch) as server:
+        server.reindex()
+        resp = server.get_json(
+            "/api/symbols?q=build_context_packet&kind=function&limit=5"
+        )
+
+    assert resp["kind"] == "symbol_results"
+    hits = resp["results"]
+    assert any(
+        hit["canonical_name"].endswith("build_context_packet")
+        for hit in hits
+    )
+    first = hits[0]
+    assert "symbol_uid" in first
+    assert "def_file" in first
+    assert "def_line" in first
+
+
+def test_symbols_endpoint_requires_q_param(
+    tmp_path: Path, capsys, monkeypatch
+):
+    (tmp_path / "mymod.py").write_text(
+        "def value():\n    return 1\n",
+        encoding="utf-8",
+    )
+
+    with _make_server(tmp_path, capsys, monkeypatch) as server:
+        resp = server.get_json("/api/symbols", expect_status=400)
+
+    assert resp["error"]
+
+
 def test_graph_server_serves_graph_and_records_notes_and_events(
     tmp_path: Path, capsys, monkeypatch
 ):

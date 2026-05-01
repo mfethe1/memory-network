@@ -143,6 +143,59 @@ def _make_routes_class(
             )
             self._send_bytes(HTTPStatus.OK, _json_bytes(result))
 
+        def _send_symbols(self, query_string: str) -> None:
+            params = parse_qs(query_string, keep_blank_values=False)
+            query = str((params.get("q") or params.get("query") or [""])[0]).strip()
+            if not query:
+                self._send_bytes(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": "q parameter is required"}),
+                )
+                return
+            kind = str((params.get("kind") or [""])[0]).strip() or None
+            try:
+                limit = int((params.get("limit") or ["20"])[0])
+            except ValueError:
+                limit = 20
+            limit = max(1, min(100, limit))
+            conn = db_mod.connect(config.db_path)
+            try:
+                db_mod.ensure_schema(conn, config)
+                from code_index.search import symbol_search
+
+                raw_results = symbol_search.lookup(
+                    conn,
+                    query,
+                    kind=kind,
+                    limit=limit,
+                )
+            finally:
+                db_mod.close(conn)
+            results = [
+                {
+                    "kind": "symbol_definition",
+                    "symbol_uid": row.get("symbol_uid", ""),
+                    "canonical_name": row.get("canonical_name", ""),
+                    "display_name": row.get("display_name", ""),
+                    "symbol_kind": row.get("kind", ""),
+                    "def_file": row.get("def_file", ""),
+                    "def_line": row.get("def_line"),
+                    "signature": row.get("signature_norm", ""),
+                    "confidence": row.get("confidence"),
+                }
+                for row in raw_results
+            ]
+            self._send_bytes(
+                HTTPStatus.OK,
+                _json_bytes(
+                    {
+                        "kind": "symbol_results",
+                        "query": query,
+                        "results": results,
+                    }
+                ),
+            )
+
         def _send_events(self, query_string: str) -> None:
             params = parse_qs(query_string, keep_blank_values=False)
             run_id = str((params.get("run_id") or [""])[0]).strip()

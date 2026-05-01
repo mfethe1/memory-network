@@ -215,6 +215,7 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             router.get("/api/agent-board", cls._route_agent_board)
             router.get("/api/file-claims", cls._route_file_claims)
             router.get("/api/search", cls._route_search)
+            router.get("/api/symbols", cls._route_symbols)
             router.get("/api/events", cls._route_events)
             router.get("/api/events/summary", cls._route_events_summary)
             router.get("/api/agent-runs/{run_id}", cls._route_agent_run_get)
@@ -324,6 +325,10 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
         def _route_search(self, _params: dict[str, str]) -> None:
             parsed = urlparse(self.path)
             self._send_search(parsed.query)
+
+        def _route_symbols(self, _params: dict[str, str]) -> None:
+            parsed = urlparse(self.path)
+            self._send_symbols(parsed.query)
 
         def _route_events(self, _params: dict[str, str]) -> None:
             parsed = urlparse(self.path)
