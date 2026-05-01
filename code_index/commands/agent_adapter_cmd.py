@@ -240,6 +240,12 @@ def _build_provider_prompt(
     selected_paths = _string_list(task.get("selected_paths"))
     message = str(task.get("message") or "")
     run_id = str(task.get("run_id") or "")
+    edit_policy = str(task.get("edit_policy") or "review_before_edit").strip()
+    selected_symbols = (
+        task.get("selected_symbols")
+        if isinstance(task.get("selected_symbols"), list)
+        else []
+    )
     graph_context = (
         task.get("graph_context") if isinstance(task.get("graph_context"), dict) else {}
     )
@@ -301,6 +307,24 @@ def _build_provider_prompt(
         f"overlapping file events: {len(overlapping_events)}; "
         f"overlapping file claims: {len(overlapping_claims)}"
     )
+    symbol_names = [
+        str(symbol.get("canonical_name") or "").strip()
+        for symbol in selected_symbols[:5]
+        if isinstance(symbol, dict) and str(symbol.get("canonical_name") or "").strip()
+    ]
+    symbol_instruction = (
+        "\nSelected symbols: "
+        f"{', '.join(symbol_names)}. "
+        "Call the find_symbol MCP tool for these exact symbols before broad scanning."
+        if symbol_names
+        else ""
+    )
+    edit_policy_instruction = (
+        "\nEdit policy: review_before_edit. Read the context fully and propose edits "
+        "with a short rationale before making file changes."
+        if edit_policy == "review_before_edit"
+        else ""
+    )
     return (
         "You are running from the code_index repo graph UI.\n"
         f"{graph_hint}\n"
@@ -329,6 +353,8 @@ def _build_provider_prompt(
         "If the request asks for a code change, make the edit in the workspace, "
         "run the most relevant verification you can, and end with changed files, "
         "tests run, and any risk or blocker."
+        + symbol_instruction
+        + edit_policy_instruction
         + continuation
     )
 

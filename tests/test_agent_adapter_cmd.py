@@ -13,6 +13,7 @@ import pytest
 from code_index import agent_providers
 from code_index.commands import agent_adapter_cmd
 from code_index.commands.agent_adapter_cmd import (
+    _build_provider_prompt,
     _format_command,
     _parse_output_event,
     resolve_agent_command,
@@ -265,6 +266,69 @@ def test_format_command_provider_prompt_mentions_graph_context(tmp_path: Path):
     assert ".code_index/agent-runs/events.jsonl" in formatted
     assert "Active peer runs: 1" in formatted
     assert "last-message.txt" in formatted
+
+
+def _task_for_provider_prompt(
+    *,
+    edit_policy: str = "review_before_edit",
+    selected_symbols: list[dict] | None = None,
+) -> dict:
+    return {
+        "run_id": "run-123",
+        "message": "review this",
+        "selected_paths": ["mod.py"],
+        "edit_policy": edit_policy,
+        "selected_symbols": selected_symbols or [],
+        "graph_context": {},
+        "collaboration": {},
+    }
+
+
+def test_provider_prompt_review_before_edit_policy_adds_instruction(
+    tmp_path: Path,
+):
+    prompt = _build_provider_prompt(
+        _task_for_provider_prompt(edit_policy="review_before_edit"),
+        root=tmp_path,
+        task_json_path=tmp_path / "task.json",
+    )
+
+    assert "propose edits" in prompt.lower()
+
+
+def test_provider_prompt_direct_edit_policy_does_not_add_review_instruction(
+    tmp_path: Path,
+):
+    prompt = _build_provider_prompt(
+        _task_for_provider_prompt(edit_policy="direct_edit"),
+        root=tmp_path,
+        task_json_path=tmp_path / "task.json",
+    )
+
+    assert "propose edits" not in prompt.lower()
+
+
+def test_provider_prompt_selected_symbols_adds_find_symbol_instruction(
+    tmp_path: Path,
+):
+    prompt = _build_provider_prompt(
+        _task_for_provider_prompt(
+            selected_symbols=[
+                {
+                    "symbol_uid": "u1",
+                    "canonical_name": "mod.fn",
+                    "kind": "function",
+                    "def_file": "mod.py",
+                    "def_line": 5,
+                }
+            ]
+        ),
+        root=tmp_path,
+        task_json_path=tmp_path / "task.json",
+    )
+
+    assert "find_symbol" in prompt
+    assert "mod.fn" in prompt
 
 
 def test_format_command_codex_pipes_prompt_file(tmp_path: Path):
