@@ -53,6 +53,14 @@ def _agent_activity_signature(conn: sqlite3.Connection, event_pk: int) -> str:
             """,
             (datetime.now(timezone.utc).isoformat(timespec="milliseconds"),),
         ).fetchone()
+        process_row = conn.execute(
+            """
+            SELECT COUNT(*) AS process_count,
+                   COALESCE(MAX(heartbeat_at), '') AS heartbeat_at,
+                   COALESCE(MAX(ended_at), '') AS ended_at
+              FROM agent_run_processes
+            """
+        ).fetchone()
     except sqlite3.OperationalError:
         return str(event_pk)
     return ":".join(
@@ -62,6 +70,9 @@ def _agent_activity_signature(conn: sqlite3.Connection, event_pk: int) -> str:
             str(run_row["updated_at"] if run_row else ""),
             str(claim_row["claim_count"] if claim_row else 0),
             str(claim_row["updated_at"] if claim_row else ""),
+            str(process_row["process_count"] if process_row else 0),
+            str(process_row["heartbeat_at"] if process_row else ""),
+            str(process_row["ended_at"] if process_row else ""),
         ]
     )
 
@@ -132,6 +143,7 @@ def _state_signature(config: cfg_mod.Config, *, conn=None) -> dict[str, Any]:
 
 
 def _agent_stream_payload(config: cfg_mod.Config) -> dict[str, Any]:
+    _reconcile_agent_runs(config)
     conn = db_mod.connect(config.db_path)
     try:
         db_mod.ensure_schema(conn, config)
@@ -206,6 +218,18 @@ def _agent_runtime_payload() -> dict[str, Any]:
     }
 
 
+def _reconcile_agent_runs(config: cfg_mod.Config) -> dict[str, Any]:
+    """Apply deterministic Agent Run lifecycle updates before live snapshots."""
+
+    with writer_lock(config, timeout_s=5.0):
+        conn = db_mod.connect(config.db_path)
+        try:
+            db_mod.apply_schema(conn)
+            return run_orchestrator.apply(conn)
+        finally:
+            db_mod.close(conn)
+
+
 def _record_user_note_event(
     config: cfg_mod.Config, note: dict[str, Any], saved: dict[str, Any]
 ) -> None:
@@ -240,6 +264,7 @@ def _record_user_note_event(
 
 
 def _build_payload(config: cfg_mod.Config, args: argparse.Namespace) -> dict[str, Any]:
+    _reconcile_agent_runs(config)
     conn = db_mod.connect(config.db_path)
     try:
         db_mod.ensure_schema(conn, config)

@@ -57,6 +57,7 @@ from code_index.commands.graph_server_state import (
     _build_payload,
     _dynamic_edge_signature,
     _record_user_note_event,
+    _reconcile_agent_runs,
     _state_signature,
 )
 from code_index.commands.graph_server_utils import _json_bytes, _now_iso, _string_list
@@ -96,6 +97,7 @@ def _make_routes_class(
             )
 
         def _send_agent_board(self) -> None:
+            _reconcile_agent_runs(config)
             conn = db_mod.connect(config.db_path)
             try:
                 db_mod.ensure_schema(conn, config)
@@ -459,6 +461,7 @@ def _make_routes_class(
             )
 
         def _send_agent_run(self, run_id: str) -> None:
+            _reconcile_agent_runs(config)
             conn = db_mod.connect(config.db_path)
             try:
                 db_mod.ensure_schema(conn, config)
@@ -842,6 +845,82 @@ def _make_routes_class(
             self._send_bytes(
                 HTTPStatus.OK,
                 _json_bytes({"ok": True, "run": updated, "event": event}),
+            )
+
+        def _accept_agent_run_review(
+            self, run_id: str, payload: dict[str, Any]
+        ) -> None:
+            decision = str(
+                payload.get("decision") or "Accepted reviewed agent work."
+            ).strip()
+            if not decision:
+                decision = "Accepted reviewed agent work."
+            with writer_lock(config):
+                conn = db_mod.connect(config.db_path)
+                try:
+                    db_mod.apply_schema(conn)
+                    run = agent_activity.get_run(conn, run_id)
+                    if run is None:
+                        self._send_bytes(
+                            HTTPStatus.NOT_FOUND,
+                            _json_bytes({"error": f"unknown run_id: {run_id}"}),
+                        )
+                        return
+                    if run.get("archived_at"):
+                        self._send_bytes(
+                            HTTPStatus.CONFLICT,
+                            _json_bytes({"error": "run is archived", "run": run}),
+                        )
+                        return
+                    status = str(run.get("status") or "").lower()
+                    if status not in agent_activity.REVIEW_STATUSES:
+                        self._send_bytes(
+                            HTTPStatus.CONFLICT,
+                            _json_bytes(
+                                {
+                                    "error": "run is not awaiting review",
+                                    "run": run,
+                                }
+                            ),
+                        )
+                        return
+                    decision_payload = dict(payload.get("payload") or {})
+                    decision_payload["review_action"] = "accepted"
+                    event = agent_activity.record_decision(
+                        conn,
+                        run_id=run_id,
+                        decision=decision,
+                        status="accepted",
+                        payload=decision_payload,
+                    )
+                    updated = agent_activity.end_run(
+                        conn, run_id=run_id, status="completed"
+                    )
+                    suggestions_event = agent_activity.record_run_suggestions(
+                        conn, run_id=run_id
+                    )
+                    suggestions = agent_activity.build_run_suggestions(conn, run_id)
+                    activity = run_orchestrator.snapshot(conn, limit=80)
+                    board = activity.get("kanban") or agent_activity.kanban_board(
+                        conn, limit=25
+                    )
+                    board["orchestrator"] = activity.get("orchestrator")
+                finally:
+                    db_mod.close(conn)
+            append_event_jsonl(config.root, event)
+            append_event_jsonl(config.root, suggestions_event)
+            self._send_bytes(
+                HTTPStatus.OK,
+                _json_bytes(
+                    {
+                        "ok": True,
+                        "run": updated,
+                        "event": event,
+                        "suggestions_event": suggestions_event,
+                        "suggestions": suggestions,
+                        "board": board,
+                    }
+                ),
             )
 
         def _start_agent_run(self, payload: dict[str, Any]) -> None:

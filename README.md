@@ -23,6 +23,14 @@ Requires Python **3.10+**. No external Python deps are required for the core
 CLI; optional deps unlock additional features (see below).
 
 ```bash
+# Install the command wrappers once. This adds `index`, `code_index`, and
+# `code-index` to the active Python environment's Scripts/bin directory.
+python -m pip install -e .
+
+# From any repo or subdirectory, launch Graph Agent Companion in the background.
+# The shell returns immediately; logs and the PID file live under .code_index/.
+index
+
 # Index the current repo (creates .code_index/ with index.db)
 python -m code_index init
 
@@ -113,6 +121,9 @@ python -m code_index workspace graph --limit 50
 
 Every subcommand accepts `--json` for machine-readable output. The JSON shape
 is the stable interface for agents; human output is unstable across versions.
+If `index` is not found after installation, add the active Python
+`Scripts`/`bin` directory to your `PATH` or run it as
+`python -m code_index.index_launcher`.
 
 ## Live code graph
 
@@ -122,14 +133,26 @@ embedded source where allowed, a Chat tab for graph-scoped agent tasks, and a
 notes tab that exports agent-task JSON.
 
 `code_index graph-server` is the interactive local mode. It serves
-`/repo-graph.html`, `/repo-graph.json`, `/notes.json`, `/api/search`, and
-`/events`. The browser receives Server-Sent Events when agent activity or notes change. Agent
-events update the active/recent files, run list, and inspector in place; full
-graph JSON refreshes are reserved for graph or note data changes. Saved node
-notes are durable in
+`/repo-graph.html`, `/mobile.html`, `/repo-graph.json`, `/notes.json`,
+`/api/search`, and `/events`. The browser receives Server-Sent Events when
+agent activity or notes change. Agent events update the active/recent files,
+run list, and inspector in place; full graph JSON refreshes are reserved for
+graph or note data changes. Saved node notes are durable in
 `.code_index/graph-notes.json`, and note saves are also recorded as
 `agent_events` so the recent activity panel can show user guidance next to
 agent work.
+
+`/mobile.html` is the phone-first control surface. It keeps the full graph off
+the first screen and focuses on the Agent Task board, search, preflighted task
+submission, Agent Run transcripts, run actions, and debug/live-event status.
+For Tailscale or another private overlay network, bind the graph server to the
+private interface and keep token auth enabled:
+
+```powershell
+$env:CODE_INDEX_GRAPH_TOKEN="<strong-token>"
+$env:CODE_INDEX_AGENT_PROVIDER="codex"
+python -m code_index graph-server --host <tailscale-ip> --port 8768 --quiet
+```
 
 Agents can write activity through the CLI, MCP mutating tools when explicitly
 enabled, or `POST /api/agent-events` on the graph server. The current graph

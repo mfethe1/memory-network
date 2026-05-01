@@ -359,6 +359,48 @@ async function archiveAgentRun(runId, button) {
     }
   }
 }
+async function acceptAgentRunReview(runId, button) {
+  if (!runId || !canPostToGraphServer()) return;
+  const original = button ? button.textContent : "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Approving";
+  }
+  try {
+    const response = await fetchGraphPost(`/api/agent-runs/${encodeURIComponent(runId)}/accept-review`, {
+      decision: "Reviewed the changed files and accepted the work."
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error || `HTTP ${response.status}`);
+    }
+    if (selectedRunTranscript && selectedRunTranscript.run && selectedRunTranscript.run.run_id === runId) {
+      selectedRunTranscript.run = {
+        ...selectedRunTranscript.run,
+        ...result.run
+      };
+      if (result.event) {
+        const byIdentity = new Map((selectedRunTranscript.events || []).map(event => [eventIdentity(event), event]));
+        byIdentity.set(eventIdentity(result.event), result.event);
+        selectedRunTranscript.events = sortTranscriptEvents([...byIdentity.values()]);
+        selectedRunTranscript.decisions = selectedRunTranscript.events.filter(event => event.event_type === "decision");
+        selectedRunTranscript.summary = recomputeTranscriptSummary(selectedRunTranscript);
+        selectedRunTranscript.summaries = selectedRunTranscript.summary;
+      }
+      if (result.suggestions) selectedRunTranscript.suggestions = result.suggestions;
+    }
+    applyAgentRunResponse(result);
+    if (selectedRunTranscript && selectedRunTranscript.run && selectedRunTranscript.run.run_id === runId) {
+      renderInspector();
+    }
+  } catch (err) {
+    if (button) {
+      button.disabled = false;
+      button.textContent = err.message || original || "Approve";
+      setTimeout(() => { button.textContent = original || "Approve"; }, 1600);
+    }
+  }
+}
 async function showRunTranscript(runId, button, options = {}) {
   if (!runId || !canPostToGraphServer()) return;
   const original = button ? button.textContent : "";
@@ -578,10 +620,79 @@ function transcriptFiles(run, events, existing = []) {
       .concat((events || []).map(event => event.file_path).filter(Boolean))
   );
 }
+function commandFromEvent(event) {
+  const payload = (event && event.payload) || {};
+  const raw = payload.command || payload.cmd || payload.invocation || "";
+  if (Array.isArray(raw)) {
+    return raw.filter(Boolean).map(part => String(part)).join(" ").trim();
+  }
+  const command = String(raw || "").trim();
+  if (command) return command;
+  const type = String((event && event.event_type) || "").toLowerCase();
+  if (type === "tool" || type === "test") return String(event.message || "").trim();
+  return "";
+}
+function transcriptCommands(events) {
+  const rows = [];
+  const seen = new Set();
+  (events || []).forEach(event => {
+    const type = String((event && event.event_type) || "").toLowerCase();
+    if (!["tool", "test", "status"].includes(type)) return;
+    const command = commandFromEvent(event);
+    if (!command) return;
+    const payload = event.payload || {};
+    const key = `${type}|${event.timestamp || ""}|${command}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    rows.push({
+      event_pk: event.event_pk,
+      event_type: type,
+      timestamp: event.timestamp || "",
+      file_path: event.file_path || null,
+      command,
+      message: event.message || "",
+      status: payload.status || event.run_status || "",
+      exit_code: payload.exit_code
+    });
+  });
+  return rows;
+}
+function transcriptEdits(events) {
+  return (events || [])
+    .filter(event => event && event.event_type === "edit" && event.file_path)
+    .map(event => ({
+      event_pk: event.event_pk,
+      timestamp: event.timestamp || "",
+      file_path: event.file_path,
+      symbol_path: event.symbol_path || null,
+      message: event.message || "",
+      payload: event.payload || {}
+    }));
+}
+function transcriptChangedFiles(events, existing = []) {
+  const changed = [];
+  function add(path) {
+    if (path && !changed.includes(path)) changed.push(path);
+  }
+  (existing || []).forEach(add);
+  (events || []).forEach(event => {
+    if (!event) return;
+    if (event.event_type === "edit") add(event.file_path);
+    const payload = event.payload || {};
+    const payloadFiles = []
+      .concat(payload.changed_files || [])
+      .concat(payload.changed_file ? [payload.changed_file] : []);
+    payloadFiles.forEach(add);
+  });
+  return uniquePaths(changed);
+}
 function recomputeTranscriptSummary(transcript) {
   const previous = transcript.summary || {};
   const events = transcript.events || [];
   const decisions = events.filter(event => event.event_type === "decision");
+  const edits = transcriptEdits(events);
+  const commands = transcriptCommands(events);
+  const changedFiles = transcriptChangedFiles(events, previous.changed_files || transcript.changed_files || []);
   const eventTypes = {};
   const filesTouched = [];
   events.forEach(event => {
@@ -600,7 +711,10 @@ function recomputeTranscriptSummary(transcript) {
     first_event_at: events.length ? events[0].timestamp : (previous.first_event_at || null),
     last_event_at: events.length ? events[events.length - 1].timestamp : (previous.last_event_at || null),
     event_types: eventTypes,
-    files_touched: filesTouched
+    files_touched: filesTouched,
+    changed_files: changedFiles,
+    edit_count: edits.length,
+    command_count: commands.length
   };
 }
 function openRunTranscriptFromResponse(result) {
@@ -618,6 +732,9 @@ function openRunTranscriptFromResponse(result) {
     events,
     decisions: events.filter(event => event.event_type === "decision"),
     active_files: transcriptFiles(result.run, events),
+    changed_files: transcriptChangedFiles(events),
+    commands: transcriptCommands(events),
+    edits: transcriptEdits(events),
     suggestions: result.suggestions || null,
     summary: {}
   };
@@ -652,6 +769,12 @@ function updateSelectedTranscriptFromSnapshot(snapshot) {
       selectedRunTranscript.events,
       selectedRunTranscript.active_files || []
     );
+    selectedRunTranscript.changed_files = transcriptChangedFiles(
+      selectedRunTranscript.events,
+      selectedRunTranscript.changed_files || []
+    );
+    selectedRunTranscript.commands = transcriptCommands(selectedRunTranscript.events);
+    selectedRunTranscript.edits = transcriptEdits(selectedRunTranscript.events);
     selectedRunTranscript.summary = recomputeTranscriptSummary(selectedRunTranscript);
     selectedRunTranscript.summaries = selectedRunTranscript.summary;
     changed = true;

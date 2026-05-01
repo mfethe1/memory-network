@@ -82,7 +82,7 @@ const communityColors = [
   "#79a7a8",
   "#b49ad8"
 ];
-const terminalRunStatuses = new Set(["completed", "failed", "cancelled", "canceled"]);
+const terminalRunStatuses = new Set(["completed", "failed", "cancelled", "canceled", "review", "needs_review", "needs-review"]);
 const streamEventTypes = new Set(["task", "status", "tool", "read", "edit", "test", "navigate", "decision"]);
 let nodes = [];
 let nodeById = new Map();

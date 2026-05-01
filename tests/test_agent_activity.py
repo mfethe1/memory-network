@@ -553,6 +553,61 @@ def test_run_transcript_orders_events_and_includes_decisions(tmp_path: Path):
         db_mod.close(conn)
 
 
+def test_run_transcript_promotes_review_files_commands_and_edits(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(
+            conn,
+            agent_name="Kimi",
+            prompt="Prepare review details",
+            metadata={"selected_paths": ["pkg/api.py"]},
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="tool",
+            message="pytest tests/test_api.py",
+            payload={"command": "pytest tests/test_api.py", "exit_code": 0},
+            timestamp="2026-01-01T00:00:01+00:00",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="edit",
+            file_path="pkg/api.py",
+            message="Updated API review behavior.",
+            timestamp="2026-01-01T00:00:02+00:00",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="status",
+            message="Ready for review.",
+            payload={
+                "status": "review",
+                "command": "python -m pytest tests/test_api.py",
+                "changed_files": ["pkg/api.py"],
+                "exit_code": 0,
+            },
+            timestamp="2026-01-01T00:00:03+00:00",
+        )
+
+        transcript = agent_activity.run_transcript(conn, run["run_id"])
+
+        assert transcript is not None
+        assert transcript["changed_files"] == ["pkg/api.py"]
+        assert transcript["summary"]["changed_files"] == ["pkg/api.py"]
+        assert transcript["summary"]["edit_count"] == 1
+        assert transcript["edits"][0]["file_path"] == "pkg/api.py"
+        assert transcript["edits"][0]["message"] == "Updated API review behavior."
+        assert [item["command"] for item in transcript["commands"]] == [
+            "pytest tests/test_api.py",
+            "python -m pytest tests/test_api.py",
+        ]
+    finally:
+        db_mod.close(conn)
+
+
 def test_agent_cli_records_event_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):

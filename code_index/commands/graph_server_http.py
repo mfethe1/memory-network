@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from code_index import agent_providers
 from code_index import config as cfg_mod
 from code_index.commands.graph_html import render_html
+from code_index.commands.graph_mobile import render_mobile_html
 from code_index.commands.graph_notes import graph_notes_block, upsert_note
 from code_index.commands.graph_server_perf import (
     _inc_counter,
@@ -34,6 +35,7 @@ from code_index.commands.graph_server_utils import (
     GRAPH_TOKEN_ENV_VAR,
     _auth_page_html,
     _json_bytes,
+    _now_iso,
     _session_cookie_value,
     _validate_bearer,
 )
@@ -202,6 +204,8 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             # HTML / JSON assets
             router.get("/", cls._route_repo_graph_html)
             router.get("/repo-graph.html", cls._route_repo_graph_html)
+            router.get("/mobile.html", cls._route_mobile_html)
+            router.get("/m", cls._route_mobile_html)
             router.get("/repo-graph.json", cls._route_repo_graph_json)
             router.get("/notes.json", cls._route_notes_json)
             # Debug / meta
@@ -222,6 +226,7 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             router.post("/api/agent-task-preflight", cls._route_preflight_post)
             router.post("/api/agent-runs/{run_id}/messages", cls._route_agent_run_message)
             router.post("/api/agent-runs/{run_id}/cancel", cls._route_agent_run_cancel)
+            router.post("/api/agent-runs/{run_id}/accept-review", cls._route_agent_run_accept_review)
             router.post("/api/agent-runs/{run_id}/archive", cls._route_agent_run_archive)
             router.post("/api/agent-events", cls._route_agent_events_post)
             router.post("/api/file-claims/{claim_id}/renew", cls._route_claim_renew)
@@ -238,6 +243,40 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             self._send_bytes(
                 HTTPStatus.OK,
                 render_html(payload).encode("utf-8"),
+                "text/html",
+            )
+
+        def _route_mobile_html(self, _params: dict[str, str]) -> None:
+            payload = {
+                "kind": "code_index_graph_mobile",
+                "root": str(config.root),
+                "generated_at": _now_iso(),
+                "agent": _agent_runtime_payload(),
+                "live": {
+                    "server": True,
+                    "desktop_graph_path": "/repo-graph.html",
+                    "graph_path": "/repo-graph.json",
+                    "mobile_path": "/mobile.html",
+                    "events_path": "/events",
+                    "debug_path": "/api/debug",
+                    "debug_perf_path": "/api/debug/perf",
+                    "search_path": "/api/search",
+                    "agent_board_path": "/api/agent-board",
+                    "agent_preflight_path": "/api/agent-task-preflight",
+                    "agent_runs_path": "/api/agent-runs",
+                    "agent_run_detail_path": "/api/agent-runs/{run_id}",
+                    "agent_run_messages_path": "/api/agent-runs/{run_id}/messages",
+                    "agent_run_cancel_path": "/api/agent-runs/{run_id}/cancel",
+                    "agent_run_accept_review_path": "/api/agent-runs/{run_id}/accept-review",
+                    "agent_run_archive_path": "/api/agent-runs/{run_id}/archive",
+                    "agent_providers_path": "/api/agent-providers",
+                    "file_claims_path": "/api/file-claims",
+                    "events_summary_path": "/api/events/summary",
+                },
+            }
+            self._send_bytes(
+                HTTPStatus.OK,
+                render_mobile_html(payload).encode("utf-8"),
                 "text/html",
             )
 
@@ -348,6 +387,12 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                 return
             self._cancel_agent_run(params["run_id"])
 
+        def _route_agent_run_accept_review(self, params: dict[str, str]) -> None:
+            payload = self._read_json_payload()
+            if payload is None:
+                return
+            self._accept_agent_run_review(params["run_id"], payload)
+
         def _route_agent_run_archive(self, params: dict[str, str]) -> None:
             payload = self._read_json_payload()
             if payload is None:
@@ -390,7 +435,7 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                 self._create_browser_session()
                 return
             if not self._is_authorized():
-                if route in {"/", "/repo-graph.html"} and os.environ.get(
+                if route in {"/", "/repo-graph.html", "/mobile.html", "/m"} and os.environ.get(
                     GRAPH_TOKEN_ENV_VAR, ""
                 ).strip():
                     self._send_auth_page()

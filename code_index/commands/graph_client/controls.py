@@ -464,7 +464,81 @@ function bindEventStream() {
     // The static HTML still works through manual refresh.
   }
 }
+const touchPointers = new Map();
+let pinchState = null;
+function touchPoint(event) {
+  return { clientX: event.clientX, clientY: event.clientY };
+}
+function pinchPair() {
+  return [...touchPointers.values()].slice(0, 2);
+}
+function midpoint(points) {
+  return {
+    clientX: (points[0].clientX + points[1].clientX) / 2,
+    clientY: (points[0].clientY + points[1].clientY) / 2
+  };
+}
+function pointDistance(points) {
+  return Math.hypot(points[0].clientX - points[1].clientX, points[0].clientY - points[1].clientY);
+}
+function startPinch() {
+  const points = pinchPair();
+  if (points.length < 2) return;
+  const center = midpoint(points);
+  const rect = svg.getBoundingClientRect();
+  pinchState = {
+    distance: Math.max(1, pointDistance(points)),
+    graphX: (center.clientX - rect.left - transform.x) / transform.k,
+    graphY: (center.clientY - rect.top - transform.y) / transform.k,
+    k: transform.k
+  };
+  panState = null;
+  document.body.classList.remove("panning");
+}
+function updatePinch() {
+  if (!pinchState) return false;
+  const points = pinchPair();
+  if (points.length < 2) return false;
+  const center = midpoint(points);
+  const rect = svg.getBoundingClientRect();
+  const nextK = clampZoom(pinchState.k * (pointDistance(points) / pinchState.distance));
+  transform.x = center.clientX - rect.left - pinchState.graphX * nextK;
+  transform.y = center.clientY - rect.top - pinchState.graphY * nextK;
+  transform.k = nextK;
+  setViewportTransform();
+  return true;
+}
+function trackTouchPointer(event) {
+  if (event.pointerType !== "touch") return false;
+  touchPointers.set(event.pointerId, touchPoint(event));
+  try {
+    svg.setPointerCapture(event.pointerId);
+  } catch (_err) {
+    // Pointer capture can fail if the browser has already cancelled the touch.
+  }
+  if (touchPointers.size >= 2) {
+    event.preventDefault();
+    startPinch();
+  }
+  return true;
+}
+function clearTouchPointer(event) {
+  if (event.pointerType !== "touch") return;
+  touchPointers.delete(event.pointerId);
+  try {
+    svg.releasePointerCapture(event.pointerId);
+  } catch (_err) {
+    // Pointer capture may already be released by the browser.
+  }
+  if (touchPointers.size >= 2) {
+    startPinch();
+  } else {
+    pinchState = null;
+  }
+}
 svg.addEventListener("pointerdown", event => {
+  trackTouchPointer(event);
+  if (pinchState) return;
   if (event.button !== 0) return;
   if (event.target.closest && event.target.closest(".node")) return;
   panState = {
@@ -478,6 +552,13 @@ svg.addEventListener("pointerdown", event => {
   document.body.classList.add("panning");
 });
 svg.addEventListener("pointermove", event => {
+  if (event.pointerType === "touch" && touchPointers.has(event.pointerId)) {
+    touchPointers.set(event.pointerId, touchPoint(event));
+    if (updatePinch()) {
+      event.preventDefault();
+      return;
+    }
+  }
   if (!panState || panState.pointerId !== event.pointerId) return;
   transform.x = panState.transformX + event.clientX - panState.startX;
   transform.y = panState.transformY + event.clientY - panState.startY;
@@ -493,8 +574,12 @@ function endPan(event) {
     // Pointer capture may already be released by the browser.
   }
 }
-svg.addEventListener("pointerup", endPan);
-svg.addEventListener("pointercancel", endPan);
+function endGraphPointer(event) {
+  clearTouchPointer(event);
+  endPan(event);
+}
+svg.addEventListener("pointerup", endGraphPointer);
+svg.addEventListener("pointercancel", endGraphPointer);
 svg.addEventListener("wheel", event => {
   event.preventDefault();
   const factor = event.deltaY < 0 ? 1.08 : 0.92;

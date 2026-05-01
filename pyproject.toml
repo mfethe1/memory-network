@@ -35,6 +35,7 @@ dev = [
 ]
 
 [project.scripts]
+index = "code_index.index_launcher:main"
 code_index = "code_index.cli:main"
 code-index = "code_index.cli:main"
 

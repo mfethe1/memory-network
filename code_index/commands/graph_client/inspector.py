@@ -284,21 +284,75 @@ function bindSubmitOnEnter(messageBox, sendButton) {
     if (!sendButton.disabled) sendButton.click();
   });
 }
+function runFileButtons(paths, emptyText) {
+  const unique = uniquePaths(paths || []);
+  if (!unique.length) return `<p class="empty">${escapeHtml(emptyText)}</p>`;
+  return `
+    <div class="run-file-list">
+      ${unique.slice(0, 12).map(path => {
+        const id = fileNodeId(path);
+        const indexed = nodeById.has(id);
+        const disabled = indexed ? "" : " disabled aria-disabled=\"true\"";
+        return `
+          <button class="run-file-button${indexed ? "" : " missing"}" data-run-file-node="${escapeHtml(id)}" type="button"${disabled} title="${escapeHtml(path)}">
+            <span>${indexed ? "open" : "missing"}</span>
+            <strong>${escapeHtml(path)}</strong>
+          </button>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+function renderRunCommandRows(commands) {
+  const items = commands || [];
+  if (!items.length) return `<p class="empty">No commands recorded.</p>`;
+  return `
+    <div class="run-command-list">
+      ${items.slice(0, 8).map(item => `
+        <div class="run-command-row">
+          <code>${escapeHtml(item.command || item.message || "command")}</code>
+          <span>${escapeHtml([item.event_type || "tool", item.status || "", item.exit_code == null ? "" : `exit ${item.exit_code}`, item.timestamp || ""].filter(Boolean).join(" · "))}</span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+function renderRunEditRows(edits) {
+  const items = edits || [];
+  if (!items.length) return `<p class="empty">No edit events recorded.</p>`;
+  return `
+    <div class="run-command-list">
+      ${items.slice(0, 8).map(item => `
+        <div class="run-command-row">
+          <code>${escapeHtml(item.file_path || "edit")}</code>
+          <span>${escapeHtml([item.symbol_path || "", item.message || "", item.timestamp || ""].filter(Boolean).join(" · "))}</span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
 function renderRunTranscript(transcript) {
   const run = transcript.run || {};
   const events = transcript.events || [];
   const decisions = transcript.decisions || [];
   const files = transcript.active_files || [];
-  const suggestionItems = ((transcript.suggestions && transcript.suggestions.suggestions) || []);
   const summary = transcript.summary || {};
+  const changedFiles = uniquePaths((transcript.changed_files || []).concat(summary.changed_files || []));
+  const commands = transcript.commands || transcriptCommands(events);
+  const edits = transcript.edits || transcriptEdits(events);
+  const suggestionItems = ((transcript.suggestions && transcript.suggestions.suggestions) || []);
   const decisionRows = decisions.length
     ? decisions.slice(0, 8).map(event => `
         <li>${escapeHtml((event.payload && event.payload.decision) || event.message || "decision")}</li>
       `).join("")
     : `<li>No decisions recorded.</li>`;
-  const fileRows = files.length
-    ? files.slice(0, 12).map(path => `<li>${escapeHtml(path)}</li>`).join("")
-    : `<li>No active files reported.</li>`;
+  const fileRows = runFileButtons(files, "No active files reported.");
+  const changedFileRows = runFileButtons(changedFiles, "No edited files recorded.");
+  const commandRows = renderRunCommandRows(commands);
+  const editRows = renderRunEditRows(edits);
+  const reviewAction = isReviewStatus(run.status)
+    ? `<button class="small-button primary-action" id="accept-run-review" type="button">Approve reviewed work</button>`
+    : "";
   const suggestionRows = suggestionItems.length
     ? suggestionItems.slice(0, 8).map(item => {
         const command = item.command ? ` <code>${escapeHtml(item.command)}</code>` : "";
@@ -309,6 +363,8 @@ function renderRunTranscript(transcript) {
     `status ${run.status || "working"}`,
     `${summary.included_event_count || 0}/${summary.event_count || 0} events`,
     files.length ? `${files.length} file(s)` : "no files",
+    changedFiles.length ? `${changedFiles.length} edited` : null,
+    commands.length ? `${commands.length} command(s)` : null,
     decisions.length ? `${decisions.length} decision(s)` : null
   ].filter(Boolean).join(" · ");
   const activity = runActivitySummary(transcript);
@@ -338,7 +394,10 @@ function renderRunTranscript(transcript) {
       <details class="terminal-context" open>
         <summary>${escapeHtml(run.run_id || "run")} · ${escapeHtml(run.started_at || "")}</summary>
         <div class="terminal-context-grid">
-          <div><strong>Active Files</strong><ul class="compact">${fileRows}</ul></div>
+          <div><strong>Active Files</strong>${fileRows}</div>
+          <div><strong>Edited Files</strong>${changedFileRows}</div>
+          <div><strong>Commands</strong>${commandRows}</div>
+          <div><strong>Edits</strong>${editRows}</div>
           <div><strong>Suggestions</strong><ul class="compact">${suggestionRows}</ul></div>
           <div><strong>Decisions</strong><ul class="compact">${decisionRows}</ul></div>
         </div>
@@ -364,6 +423,7 @@ function renderRunTranscript(transcript) {
         <textarea class="note-box chat-box terminal-input" id="run-followup-message" placeholder="$ Send another message to this run."></textarea>
         <div class="actions">
           <button class="small-button primary-action" id="send-run-followup" type="button"${canPostToGraphServer() ? "" : " disabled aria-disabled=\"true\""}>Send message</button>
+          ${reviewAction}
           <span class="inline-status" id="run-followup-status">${canPostToGraphServer() ? "Ready" : "Graph server required"}</span>
           <span class="inline-status runtime-status" id="run-runtime-status">${escapeHtml(renderAgentRuntimeStatus())}</span>
         </div>
@@ -1429,12 +1489,25 @@ function bindRunTranscriptPanel(transcript) {
   const strategySelect = document.getElementById("run-followup-execution-strategy");
   const messageBox = document.getElementById("run-followup-message");
   const sendButton = document.getElementById("send-run-followup");
+  const acceptButton = document.getElementById("accept-run-review");
   const status = document.getElementById("run-followup-status");
+  document.querySelectorAll("[data-run-file-node]").forEach(button => {
+    button.addEventListener("click", () => {
+      const target = nodeById.get(button.dataset.runFileNode);
+      if (target) selectNode(target, { center: true });
+    });
+  });
   if (providerSelect) providerSelect.value = defaultProviderForRun((transcript && transcript.run) || {});
   refreshAgentProviders();
   if (strategySelect) {
     strategySelect.addEventListener("change", () => {
       syncProviderForExecutionStrategy(providerSelect, strategySelect);
+    });
+  }
+  if (acceptButton) {
+    acceptButton.addEventListener("click", () => {
+      const runId = ((transcript && transcript.run) || {}).run_id || "";
+      acceptAgentRunReview(runId, acceptButton);
     });
   }
   terminalLastSignature = "";

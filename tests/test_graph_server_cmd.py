@@ -18,6 +18,7 @@ from code_index import config as cfg_mod
 from code_index import db_router as db_mod
 from code_index import agent_activity
 from code_index import lease_manager
+from code_index import run_lifecycle
 from code_index.cli import main
 from code_index.commands import agent_adapter_cmd
 from code_index.commands import graph_server_cmd
@@ -749,6 +750,150 @@ def test_graph_server_exposes_review_queue_in_all_agent_board_payloads(
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_graph_server_accepts_review_run_and_clears_review_queue(
+    tmp_path: Path, capsys, monkeypatch
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    conn = db_mod.connect(config.db_path)
+    try:
+        review_run = agent_activity.start_run(
+            conn,
+            agent_name="Kimi",
+            prompt="Implementation ready for user review.",
+            status="working",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=review_run["run_id"],
+            event_type="edit",
+            file_path="pkg/a.py",
+            message="Updated value implementation.",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=review_run["run_id"],
+            event_type="status",
+            file_path="pkg/a.py",
+            message="Ready for review.",
+            payload={"status": "review", "changed_files": ["pkg/a.py"]},
+        )
+    finally:
+        db_mod.close(conn)
+
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        board = _request_json(f"{base_url}/api/agent-board")
+        assert [run["run_id"] for run in board["orchestrator"]["review_runs"]] == [
+            review_run["run_id"]
+        ]
+
+        accepted = _request_json(
+            f"{base_url}/api/agent-runs/{review_run['run_id']}/accept-review",
+            {"decision": "Reviewed the changed files and accepted the work."},
+        )
+
+        assert accepted["ok"] is True
+        assert accepted["run"]["status"] == "completed"
+        assert accepted["event"]["event_type"] == "decision"
+        assert accepted["event"]["payload"]["status"] == "accepted"
+        assert accepted["event"]["payload"]["review_action"] == "accepted"
+        assert [
+            run["run_id"]
+            for run in accepted["board"]["orchestrator"]["review_runs"]
+        ] == []
+
+        transcript = _request_json(
+            f"{base_url}/api/agent-runs/{review_run['run_id']}"
+        )
+        assert transcript["run"]["status"] == "completed"
+        assert transcript["changed_files"] == ["pkg/a.py"]
+        assert transcript["decisions"][-1]["payload"]["status"] == "accepted"
+
+        board_after = _request_json(f"{base_url}/api/agent-board")
+        assert [
+            run["run_id"]
+            for run in board_after["orchestrator"]["review_runs"]
+        ] == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_agent_stream_reconciles_dead_local_process_before_payload(
+    tmp_path: Path, capsys
+):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    conn = db_mod.connect(config.db_path)
+    try:
+        run = agent_activity.start_run(
+            conn,
+            agent_name="Kimi",
+            prompt="Local command already exited.",
+            status="working",
+        )
+        process = run_lifecycle.register_process(
+            conn,
+            run_id=run["run_id"],
+            transport="local-command",
+            provider="kimi",
+            pid=123456,
+            command_label="kimi --quiet",
+        )
+        run_lifecycle.finish_process(
+            conn,
+            process_id=process["process_id"],
+            status="completed",
+            exit_code=0,
+        )
+    finally:
+        db_mod.close(conn)
+
+    stream = _agent_stream_payload(config)
+
+    assert all(
+        item["run_id"] != run["run_id"]
+        for item in stream["agent"]["active_runs"]
+    )
+    assert [item["run_id"] for item in stream["agent"]["orchestrator"]["review_runs"]] == [
+        run["run_id"]
+    ]
+    conn = db_mod.connect(config.db_path)
+    try:
+        updated = agent_activity.get_run(conn, run["run_id"])
+    finally:
+        db_mod.close(conn)
+    assert updated is not None
+    assert updated["status"] == "review"
 
 
 def test_graph_server_starts_agent_swarm_as_child_runs(tmp_path: Path, capsys, monkeypatch):

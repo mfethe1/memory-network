@@ -126,7 +126,10 @@ def test_graph_json_exposes_files_relations_care_and_code(
         "high",
         "critical",
     }
-    assert nodes["file:pkg/mid.py"]["summary"]
+    mid_summary = nodes["file:pkg/mid.py"]["summary"]
+    assert mid_summary
+    assert "In Graph Agent Companion" in mid_summary
+    assert "depends on 1 other indexed file" in mid_summary
     assert nodes["file:pkg/mid.py"]["code"]["included"] is True
     assert "def wrapper" in nodes["file:pkg/mid.py"]["code"]["content"]
     assert isinstance(payload["summary"]["recent_edits"], list)
@@ -286,6 +289,10 @@ def test_graph_html_writes_standalone_view(
     assert "execution_strategy" in html
     assert "agent_runs_path" in html
     assert "agent_preflight_path" in html
+    assert "acceptAgentRunReview" in html
+    assert "/accept-review" in html
+    assert "data-accept-review-run" in html
+    assert "Approve reviewed work" in html
     assert "search_path" in html
     assert "graphTokenKey" in html
     assert "fetchGraphGet" in html

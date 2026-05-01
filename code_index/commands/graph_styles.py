@@ -242,7 +242,7 @@ GRAPH_CSS = r"""
     }
     .run-row {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto auto;
+      grid-template-columns: minmax(0, 1fr) auto auto auto auto;
       align-items: center;
       gap: 4px;
       border-radius: 5px;
@@ -296,6 +296,7 @@ GRAPH_CSS = r"""
       grid-column: 2;
     }
     .run-detail,
+    .run-accept,
     .run-cancel,
     .run-archive {
       height: 24px;
@@ -309,12 +310,14 @@ GRAPH_CSS = r"""
       cursor: pointer;
     }
     .run-detail:hover:not(:disabled),
+    .run-accept:hover:not(:disabled),
     .run-cancel:hover:not(:disabled),
     .run-archive:hover:not(:disabled) {
       color: var(--ink);
       border-color: var(--line-strong);
     }
     .run-detail:disabled,
+    .run-accept:disabled,
     .run-cancel:disabled,
     .run-archive:disabled,
     .run-select:disabled {
@@ -393,6 +396,32 @@ GRAPH_CSS = r"""
     }
     .task-card + .task-card {
       margin-top: 4px;
+    }
+    .task-card-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 4px;
+      align-items: stretch;
+    }
+    .task-card-row + .task-card-row,
+    .task-card + .task-card-row,
+    .task-card-row + .task-card {
+      margin-top: 4px;
+    }
+    .task-card-action {
+      min-height: 32px;
+      border: 1px solid rgba(255, 209, 102, 0.55);
+      border-radius: 5px;
+      background: rgba(255, 209, 102, 0.08);
+      color: var(--ink);
+      font: inherit;
+      font-size: 10px;
+      padding: 0 7px;
+      cursor: pointer;
+    }
+    .task-card-action:hover:not(:disabled) {
+      border-color: rgba(255, 209, 102, 0.85);
+      background: rgba(255, 209, 102, 0.14);
     }
     .task-card span,
     .task-card em {
@@ -1449,6 +1478,58 @@ GRAPH_CSS = r"""
       font-size: 11px;
       text-transform: uppercase;
       letter-spacing: 0.08em;
+    }
+    .run-file-list,
+    .run-command-list {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+    .run-file-button,
+    .run-command-row {
+      min-width: 0;
+      display: grid;
+      gap: 3px;
+      width: 100%;
+      border: 1px solid #202934;
+      border-radius: 6px;
+      padding: 6px 7px;
+      background: #0a0f16;
+      color: var(--ink);
+      text-align: left;
+      font: inherit;
+    }
+    .run-file-button {
+      cursor: pointer;
+    }
+    .run-file-button:hover {
+      border-color: var(--focus);
+      background: rgba(88, 166, 255, 0.09);
+    }
+    .run-file-button.missing {
+      cursor: not-allowed;
+      color: var(--muted);
+      opacity: 0.75;
+    }
+    .run-file-button span,
+    .run-command-row span {
+      color: var(--muted);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+    .run-file-button strong,
+    .run-command-row code {
+      min-width: 0;
+      color: var(--ink);
+      font-size: 12px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+    .run-command-row code {
+      background: transparent;
+      padding: 0;
+      border: 0;
     }
     .terminal-body {
       max-height: min(52vh, 560px);
