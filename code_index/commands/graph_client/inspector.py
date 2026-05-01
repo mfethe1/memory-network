@@ -157,6 +157,44 @@ function terminalCursorHtml(transcript) {
 function terminalEmptyHtml(transcript) {
   return `<p class="empty">No terminal output recorded for this run yet.</p>${terminalCursorHtml(transcript)}`;
 }
+function runMessageHistoryKey(runId) {
+  return `code_index_graph_run_history:${data.root}:${runId || "unknown"}`;
+}
+function loadRunMessageHistory(runId) {
+  try {
+    const raw = localStorage.getItem(runMessageHistoryKey(runId));
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.slice(-3) : [];
+  } catch (_err) {
+    return [];
+  }
+}
+function saveRunMessageHistory(runId, message) {
+  try {
+    const history = loadRunMessageHistory(runId);
+    history.push({ text: message, timestamp: new Date().toISOString() });
+    const trimmed = history.slice(-3);
+    localStorage.setItem(runMessageHistoryKey(runId), JSON.stringify(trimmed));
+  } catch (_err) {
+    // Storage may be full or private browsing.
+  }
+}
+function renderRunMessageHistory(runId) {
+  const history = loadRunMessageHistory(runId);
+  if (!history.length) return "";
+  const items = history.map(item => `
+    <div class="thread-history-item">
+      <span class="thread-history-time">${escapeHtml(new Date(item.timestamp).toLocaleTimeString())}</span>
+      <span class="thread-history-text">${escapeHtml(item.text)}</span>
+    </div>
+  `).join("");
+  return `
+    <div class="thread-history" id="run-thread-history">
+      <strong>Recent messages</strong>
+      ${items}
+    </div>
+  `;
+}
 function appendTerminalRows(body, transcript) {
   const run = (transcript && transcript.run) || {};
   const events = transcriptStreamEvents(transcript);
@@ -307,6 +345,7 @@ function renderRunTranscript(transcript) {
       </details>
       <div class="stream-list terminal-body" id="terminal-stream-body" data-run-id="${escapeHtml(run.run_id || "")}">${renderTerminalRows(transcript)}</div>
       <div class="terminal-composer">
+        ${renderRunMessageHistory(run.run_id)}
         <div class="chat-controls terminal-target">
           <label>
             <span>Target</span>
@@ -328,6 +367,7 @@ function renderRunTranscript(transcript) {
           <span class="inline-status" id="run-followup-status">${canPostToGraphServer() ? "Ready" : "Graph server required"}</span>
           <span class="inline-status runtime-status" id="run-runtime-status">${escapeHtml(renderAgentRuntimeStatus())}</span>
         </div>
+        <span class="keyboard-hint">Press Enter to send · Shift+Enter for newline</span>
       </div>
     </div>
   `;
@@ -1112,7 +1152,7 @@ function renderChat(node) {
           <label>
             <span>Target</span>
             <select id="agent-provider">
-              ${providerOptionHtml("codex")}
+              ${providerOptionHtml(defaultChatProvider({ run: currentRun }))}
             </select>
           </label>
           <label>
@@ -1179,8 +1219,61 @@ function agentProviderRegistry() {
     { id: "configured", display_name: "Configured adapter" }
   ];
 }
+function providerExists(providerId) {
+  const target = String(providerId || "").toLowerCase();
+  if (!target) return false;
+  return agentProviderRegistry().some(provider =>
+    String(provider.id || "").toLowerCase() === target
+  );
+}
+function providerHintForRun(run) {
+  const metadata = (run && run.metadata) || {};
+  const provider = String(metadata.provider || "").toLowerCase();
+  if (provider) return provider;
+  const agent = String((run && run.agent_name) || "").toLowerCase();
+  if (agent.includes("kimi")) return "kimi";
+  if (agent.includes("claude")) return "claude";
+  if (agent.includes("codex")) return "codex";
+  if (agent.includes("opencode")) return "opencode";
+  return "";
+}
+function configuredProviderHint() {
+  const dispatch = (agentRuntimeConfig().dispatch) || {};
+  const provider = String(dispatch.provider || "").toLowerCase();
+  if (provider) return provider;
+  if (dispatch.custom_command_configured || dispatch.local_command_configured || dispatch.webhook_configured) {
+    return "configured";
+  }
+  return "";
+}
+function activeProviderHint() {
+  const agent = (data && data.agent) || {};
+  const runs = ((agent.active_runs || []).concat(agent.recent_runs || []))
+    .filter(run => run && !isTerminalStatus(run.status));
+  for (const run of runs) {
+    const provider = providerHintForRun(run);
+    if (provider) return provider;
+  }
+  return "";
+}
+function defaultChatProvider(options = {}) {
+  const runHint = options.run ? providerHintForRun(options.run) : "";
+  if (runHint) return runHint;
+  if (options.includeFocus !== false && selected) {
+    const focus = agentFocusForNode(selected);
+    const focusHint = providerHintForRun(focus.currentRun);
+    if (focusHint) return focusHint;
+  }
+  const activeHint = activeProviderHint();
+  if (activeHint) return activeHint;
+  const configuredHint = configuredProviderHint();
+  if (configuredHint) return configuredHint;
+  if (providerExists("codex")) return "codex";
+  const preset = agentProviderRegistry().find(provider => provider && provider.command_preset && provider.id);
+  return preset ? String(preset.id || "configured").toLowerCase() : "configured";
+}
 function providerOptionHtml(selected) {
-  const selectedValue = String(selected || "codex");
+  const selectedValue = String(selected || defaultChatProvider());
   const providers = agentProviderRegistry().slice();
   if (selectedValue && !providers.some(provider => String(provider.id || "") === selectedValue)) {
     const label = selectedValue === "opencode"
@@ -1289,7 +1382,7 @@ function agentNameForProvider(provider) {
   return (data.agent && data.agent.name) || "Agent";
 }
 function providerFromChatControl(selectEl) {
-  const value = selectEl ? String(selectEl.value || "codex") : "codex";
+  const value = selectEl ? String(selectEl.value || defaultChatProvider()) : defaultChatProvider();
   return value === "configured" ? "" : value;
 }
 function executionStrategyFromControl(selectEl) {
@@ -1303,12 +1396,7 @@ function syncProviderForExecutionStrategy(providerSelect, strategySelect) {
   }
 }
 function defaultProviderForRun(run) {
-  const metadata = (run && run.metadata) || {};
-  const provider = String(metadata.provider || "").toLowerCase();
-  if (provider) return provider;
-  if (provider === "kimi" || String((run && run.agent_name) || "").toLowerCase().includes("kimi")) return "kimi";
-  if (provider === "claude" || String((run && run.agent_name) || "").toLowerCase().includes("claude")) return "claude";
-  return "codex";
+  return providerHintForRun(run) || defaultChatProvider({ includeFocus: false });
 }
 function agentTaskPayloadFromRun(transcript, message, options = {}) {
   const run = transcript.run || {};
@@ -1378,6 +1466,7 @@ function bindRunTranscriptPanel(transcript) {
       const result = await postAgentMessageToRun(runId, payload);
       if (handlePreflightResult(result, sendButton, status, "Send anyway")) return;
       if (result.ok) {
+        saveRunMessageHistory(runId, message);
         status.textContent = result.same_run
           ? `Sent ${result.run.run_id.slice(0, 8)}`
           : (result.dispatch && result.dispatch.configured

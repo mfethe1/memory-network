@@ -47,17 +47,17 @@ function agentWorkRunPaths(run) {
   return uniquePaths(
     ((run && run.active_files) || [])
       .concat(metadata.selected_paths || [])
-      .concat((((data.activity || {}).agent_events) || [])
-        .filter(event => event && event.run_id === run.run_id)
-        .map(event => event.file_path)
-        .filter(Boolean))
   );
 }
 function agentWorkRunTouchesNode(run, node) {
   if (!run || !node) return false;
   const selectedNodes = run.selected_nodes || [];
   if (selectedNodes.includes(node.id)) return true;
-  return agentWorkRunPaths(run).some(path => agentWorkPathTouchesNode(path, node));
+  const metadata = (run && run.metadata) || {};
+  const paths = uniquePaths(
+    ((run && run.active_files) || []).concat(metadata.selected_paths || [])
+  );
+  return paths.some(path => agentWorkPathTouchesNode(path, node));
 }
 function agentWorkClaimTouchesNode(claim, node) {
   return claim && agentWorkPathTouchesNode(claim.file_path, node);
@@ -128,37 +128,39 @@ function renderAgentWorkBubble(group, node, work, r) {
   bubble.dataset.agentName = work.agent_name || "Agent";
   if (work.provider) bubble.dataset.agentProvider = work.provider;
   if (work.run_id) bubble.dataset.runDetails = work.run_id;
-  const x = r + 10;
-  const y = -52;
-  const width = 164;
-  const height = 42;
-  bubble.setAttribute("transform", `translate(${x} ${y})`);
-  const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-  rect.setAttribute("width", width);
-  rect.setAttribute("height", height);
-  rect.setAttribute("rx", 6);
-  bubble.appendChild(rect);
+  const size = 18;
+  const offset = Math.max(r * 0.65, 6);
+  const x = offset;
+  const y = -offset;
+  bubble.setAttribute("transform", `translate(${x.toFixed(1)} ${y.toFixed(1)})`);
   const pulse = document.createElementNS("http://www.w3.org/2000/svg", "circle");
   pulse.setAttribute("class", "agent-work-pulse");
-  pulse.setAttribute("cx", 10);
-  pulse.setAttribute("cy", 11);
-  pulse.setAttribute("r", 3);
+  pulse.setAttribute("r", size / 2 + 1);
+  pulse.setAttribute("cx", 0);
+  pulse.setAttribute("cy", 0);
   bubble.appendChild(pulse);
-  const name = document.createElementNS("http://www.w3.org/2000/svg", "text");
-  name.setAttribute("x", 18);
-  name.setAttribute("y", 15);
-  name.setAttribute("class", "agent-work-name");
-  name.textContent = agentWorkText(`${action} · ${work.agent_name || "Agent"}${work.count > 1 ? ` +${work.count - 1}` : ""}`, 28);
-  bubble.appendChild(name);
-  const message = document.createElementNS("http://www.w3.org/2000/svg", "text");
-  message.setAttribute("x", 10);
-  message.setAttribute("y", 31);
-  message.setAttribute("class", "agent-work-message");
-  message.textContent = agentWorkText(work.message || work.event_type || work.status, 30);
-  bubble.appendChild(message);
+  const bg = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  bg.setAttribute("class", "agent-work-bg");
+  bg.setAttribute("r", size / 2 - 1);
+  bg.setAttribute("cx", 0);
+  bg.setAttribute("cy", 0);
+  bubble.appendChild(bg);
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "text");
+  icon.setAttribute("text-anchor", "middle");
+  icon.setAttribute("dominant-baseline", "central");
+  icon.setAttribute("y", "0.5");
+  icon.setAttribute("font-size", "9");
+  icon.setAttribute("font-weight", "700");
+  icon.setAttribute("fill", "var(--ink)");
+  icon.textContent = "</>";
+  bubble.appendChild(icon);
   const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
-  title.textContent = `${action} · ${work.agent_name || "Agent"}: ${work.message || work.status || "working"}`;
+  title.textContent = `${action} · ${work.agent_name || "Agent"}${work.count > 1 ? ` +${work.count - 1}` : ""}: ${work.message || work.status || "working"}`;
   bubble.appendChild(title);
+  const hit = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  hit.setAttribute("r", size / 2 + 4);
+  hit.setAttribute("fill", "transparent");
+  bubble.appendChild(hit);
   const openRun = event => {
     event.stopPropagation();
     if (work.run_id) {
@@ -192,9 +194,12 @@ function renderGraph() {
     const mx = (sx + tx) / 2;
     const my = (sy + ty) / 2 - (edge.kind === "contains" ? 0 : 18);
     path.setAttribute("d", `M ${sx.toFixed(1)} ${sy.toFixed(1)} Q ${mx.toFixed(1)} ${my.toFixed(1)} ${tx.toFixed(1)} ${ty.toFixed(1)}`);
-    path.setAttribute("class", `edge ${edge.kind === "contains" ? "contains" : "relation"}`);
+    path.setAttribute("class", `edge ${edge.kind === "contains" ? "contains" : `relation ${edge.kind}`}`);
     path.setAttribute("stroke", edgeColors[edge.kind] || "#555f69");
     path.setAttribute("stroke-width", edgeWidth(edge));
+    if (edge.kind === "agent_derived") {
+      path.setAttribute("stroke-dasharray", "5 5");
+    }
     path.dataset.source = edge.source;
     path.dataset.target = edge.target;
     path.dataset.kind = edge.kind;

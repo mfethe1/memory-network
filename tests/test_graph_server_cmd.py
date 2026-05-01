@@ -243,6 +243,8 @@ def test_graph_server_agent_providers_endpoint_returns_registry(
     tmp_path: Path, capsys, monkeypatch
 ):
     monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / "pkg" / "a.py").write_text("def value() -> int:\n    return 1\n", encoding="utf-8")
@@ -284,6 +286,8 @@ def test_graph_server_serves_graph_and_records_notes_and_events(
     tmp_path: Path, capsys, monkeypatch
 ):
     monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / "pkg" / "a.py").write_text(

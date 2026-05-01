@@ -445,6 +445,13 @@ function bindEventStream() {
     eventSource.addEventListener("graph", () => {
       if (document.visibilityState === "visible") refreshGraphData({ silent: true });
     });
+    eventSource.addEventListener("connection", event => {
+      try {
+        handleConnectionSnapshot(JSON.parse(event.data || "{}"));
+      } catch (_err) {
+        if (document.visibilityState === "visible") refreshGraphData({ silent: true });
+      }
+    });
     eventSource.addEventListener("perf:tick", event => {
       try {
         handlePerfTick(JSON.parse(event.data || "{}"));

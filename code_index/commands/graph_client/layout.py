@@ -159,6 +159,9 @@ function isRecentNode(node) {
   return Number(recentRank(node) || 0) > 0 && Number(recentRank(node) || 0) <= 5;
 }
 function edgeWidth(edge) {
+  if (edge.kind === "agent_derived") {
+    return Math.max(1, Math.min(3.2, 0.8 + Math.log2((edge.weight || 1) + 1)));
+  }
   return Math.max(0.7, Math.min(5, 0.7 + Math.log2((edge.weight || 1) + 1)));
 }
 function searchableText(node) {
@@ -634,6 +637,18 @@ function renderActivityTrailEdges() {
     path.dataset.target = `file:${step.to}`;
     path.dataset.kind = "activity";
     edgesLayer.appendChild(path);
+  });
+}
+function scheduleAgentGraphRefresh() {
+  if (agentGraphRenderFrame) return;
+  const scheduler = typeof requestAnimationFrame === "function"
+    ? requestAnimationFrame
+    : callback => setTimeout(callback, 16);
+  agentGraphRenderFrame = scheduler(() => {
+    agentGraphRenderFrame = null;
+    seedMissingPositions();
+    tickSimulation(8);
+    renderGraph();
   });
 }
 """

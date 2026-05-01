@@ -210,6 +210,36 @@ def annotate_activity_snapshot(
     return out
 
 
+def _swarm_summary(
+    conn: sqlite3.Connection,
+    active_runs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for run in active_runs:
+        if not agent_swarm.is_swarm_parent(run):
+            continue
+        children = agent_activity.child_runs(conn, parent_run_id=str(run["run_id"]))
+        summaries.append(
+            {
+                "run_id": run["run_id"],
+                "agent_name": run.get("agent_name"),
+                "child_count": len(children),
+                "children": [
+                    {
+                        "run_id": child.get("run_id"),
+                        "agent_name": child.get("agent_name"),
+                        "status": child.get("status"),
+                        "role": (
+                            (child.get("metadata") or {}).get("swarm") or {}
+                        ).get("role"),
+                    }
+                    for child in children
+                ],
+            }
+        )
+    return summaries
+
+
 def snapshot(
     conn: sqlite3.Connection,
     *,
@@ -225,7 +255,11 @@ def snapshot(
         active_run_max_age_seconds=None,
     )
     activity["kanban"] = agent_activity.kanban_board(conn, limit=row_limit)
-    return annotate_activity_snapshot(activity, policy=policy, now=now)
+    result = annotate_activity_snapshot(activity, policy=policy, now=now)
+    result["orchestrator"]["swarm_parents"] = _swarm_summary(
+        conn, result.get("active_runs", [])
+    )
+    return result
 
 
 def apply(

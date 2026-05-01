@@ -798,6 +798,65 @@ def build_graph(
             active_files_from_claims.append(path)
     active_paths = set(focus) | set(active_files_from_runs) | set(active_files_from_claims)
 
+    # Build per-file agent presence from the activity snapshot.
+    presence_by_path: dict[str, list[dict[str, Any]]] = {}
+    for run in activity_snapshot.get("active_runs", []):
+        run_id = run.get("run_id")
+        agent_name = run.get("agent_name") or "Agent"
+        status = run.get("status") or "working"
+        for path in run.get("active_files", []):
+            if not path:
+                continue
+            presence_by_path.setdefault(path, [])
+            if not any(
+                p.get("run_id") == run_id and p.get("presence_type") == "active_file"
+                for p in presence_by_path[path]
+            ):
+                presence_by_path[path].append(
+                    {
+                        "run_id": run_id,
+                        "agent_name": agent_name,
+                        "status": status,
+                        "presence_type": "active_file",
+                    }
+                )
+        metadata = run.get("metadata") or {}
+        for path in metadata.get("selected_paths", []):
+            if not path:
+                continue
+            presence_by_path.setdefault(path, [])
+            if not any(
+                p.get("run_id") == run_id and p.get("presence_type") == "selected"
+                for p in presence_by_path[path]
+            ):
+                presence_by_path[path].append(
+                    {
+                        "run_id": run_id,
+                        "agent_name": agent_name,
+                        "status": status,
+                        "presence_type": "selected",
+                    }
+                )
+    for claim in active_claims:
+        path = claim.get("file_path")
+        if not path:
+            continue
+        presence_by_path.setdefault(path, [])
+        if not any(
+            p.get("claim_id") == claim.get("claim_id")
+            for p in presence_by_path[path]
+        ):
+            presence_by_path[path].append(
+                {
+                    "claim_id": claim.get("claim_id"),
+                    "run_id": claim.get("run_id"),
+                    "agent_name": claim.get("agent_name") or "Agent",
+                    "mode": claim.get("mode"),
+                    "status": claim.get("status"),
+                    "presence_type": "claim",
+                }
+            )
+
     incoming_by_file: dict[str, int] = defaultdict(int)
     outgoing_by_file: dict[str, int] = defaultdict(int)
     relation_neighbors_in: dict[str, set[str]] = defaultdict(set)
@@ -877,6 +936,7 @@ def build_graph(
             "care_level": care,
             "freedom": CARE_GUIDANCE[care],
             "active_work": path in active_paths,
+            "agent_presence": presence_by_path.get(path, []),
             "importance": {"score": score, "rank": None, "reasons": reasons},
             "metrics": {
                 "size_bytes": int(row["size_bytes"] or 0),

@@ -39,7 +39,8 @@ def test_resolve_agent_command_uses_provider_presets(monkeypatch):
     assert resolve_agent_command(provider="kimi") == (
         "kimi --work-dir {root} --mcp-config-file {mcp_config_file} "
         "--print --output-format stream-json --thinking "
-        "--max-ralph-iterations 1 < {provider_prompt_file}",
+        "--max-ralph-iterations -1 --max-steps-per-turn 200 "
+        "< {provider_prompt_file}",
         "kimi",
     )
 

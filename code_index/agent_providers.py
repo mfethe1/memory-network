@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 
@@ -27,6 +28,39 @@ class AgentProvider:
 
 
 _PROVIDER_ORDER = ("custom", "claude", "codex", "kimi")
+
+
+def _bounded_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _kimi_command_preset() -> str:
+    max_ralph_iterations = _bounded_int_env(
+        "CODE_INDEX_KIMI_MAX_RALPH_ITERATIONS",
+        -1,
+        minimum=-1,
+        maximum=100_000,
+    )
+    max_steps_per_turn = _bounded_int_env(
+        "CODE_INDEX_KIMI_MAX_STEPS_PER_TURN",
+        200,
+        minimum=1,
+        maximum=10_000,
+    )
+    return (
+        "kimi --work-dir {root} --mcp-config-file {mcp_config_file} "
+        "--print --output-format stream-json --thinking "
+        f"--max-ralph-iterations {max_ralph_iterations} "
+        f"--max-steps-per-turn {max_steps_per_turn} "
+        "< {provider_prompt_file}"
+    )
 
 _PROVIDERS: dict[str, AgentProvider] = {
     "custom": AgentProvider(
@@ -65,11 +99,7 @@ _PROVIDERS: dict[str, AgentProvider] = {
     "kimi": AgentProvider(
         id="kimi",
         display_name="Kimi",
-        command_preset=(
-            "kimi --work-dir {root} --mcp-config-file {mcp_config_file} "
-            "--print --output-format stream-json --thinking "
-            "--max-ralph-iterations 1 < {provider_prompt_file}"
-        ),
+        command_preset=_kimi_command_preset(),
         capabilities=frozenset(
             {
                 CAPABILITY_COMMAND_PRESET,

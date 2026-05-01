@@ -176,6 +176,8 @@ def _agent_stream_payload(config: cfg_mod.Config) -> dict[str, Any]:
             "agent_events": snapshot["recent_events"],
             "agent_recent_files": snapshot["recent_files"],
             "active_claims": snapshot.get("active_claims", []),
+            "file_presence": snapshot.get("file_presence", {}),
+            "overlapping_runs": snapshot.get("overlapping_runs", []),
         },
     }
 

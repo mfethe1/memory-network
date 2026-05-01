@@ -495,6 +495,10 @@ GRAPH_CSS = r"""
       stroke-opacity: 0.75;
       stroke-dasharray: 5 5;
     }
+    .edge.agent_derived {
+      stroke-opacity: 0.62;
+      stroke-linecap: round;
+    }
     .community-label {
       pointer-events: none;
     }
@@ -550,18 +554,27 @@ GRAPH_CSS = r"""
     .node .agent-work-bubble {
       cursor: pointer;
     }
-    .node .agent-work-bubble rect,
-    .node.active .agent-work-bubble rect {
+    .node .agent-work-bubble .agent-work-bg {
       fill: rgba(13, 17, 23, 0.94);
       stroke: var(--focus);
-      stroke-width: 1px;
-      filter: drop-shadow(0 3px 10px rgba(0,0,0,0.36));
+      stroke-width: 1.5px;
+      filter: drop-shadow(0 2px 4px rgba(0,0,0,0.4));
+    }
+    .node .agent-work-bubble.is-edit .agent-work-bg {
+      stroke: #ffd166;
+    }
+    .node .agent-work-bubble.is-test .agent-work-bg {
+      stroke: #9fd07f;
+    }
+    .node .agent-work-bubble.is-tool .agent-work-bg,
+    .node .agent-work-bubble.is-navigate .agent-work-bg {
+      stroke: #5dd4c6;
     }
     .node .agent-work-bubble text {
       pointer-events: none;
       paint-order: normal;
       stroke: none;
-      dominant-baseline: auto;
+      dominant-baseline: central;
     }
     .node .agent-work-pulse {
       fill: var(--focus);
@@ -580,28 +593,14 @@ GRAPH_CSS = r"""
     .node .agent-work-bubble.is-navigate .agent-work-pulse {
       fill: #5dd4c6;
     }
-    .node .agent-work-name {
-      fill: var(--ink);
-      font-size: 11px;
-      font-weight: 700;
-      animation: agent-work-word 1.35s ease-in-out infinite;
-    }
-    .node .agent-work-message {
-      fill: var(--muted);
-      font-size: 10px;
-    }
-    .node .agent-work-bubble:hover rect,
-    .node .agent-work-bubble:focus rect {
+    .node .agent-work-bubble:hover .agent-work-bg,
+    .node .agent-work-bubble:focus .agent-work-bg {
       stroke: #f0f6fc;
       fill: #111827;
     }
     @keyframes agent-work-pulse {
       0%, 100% { opacity: 0.45; transform: scale(0.85); }
       45% { opacity: 1; transform: scale(1.25); }
-    }
-    @keyframes agent-work-word {
-      0%, 100% { fill: var(--ink); }
-      50% { fill: #58a6ff; }
     }
     .node.dim,
     .edge.dim {
@@ -1473,9 +1472,44 @@ GRAPH_CSS = r"""
       border-top: 1px solid #202934;
       background: #0a0f16;
     }
+    .thread-history {
+      display: grid;
+      gap: 5px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 7px 8px;
+      background: rgba(88, 166, 255, 0.06);
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .thread-history strong {
+      color: var(--ink);
+      font-size: 11px;
+    }
+    .thread-history-item {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 7px;
+      min-width: 0;
+    }
+    .thread-history-time {
+      color: var(--focus);
+      white-space: nowrap;
+    }
+    .thread-history-text {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .terminal-composer .actions {
       margin-top: 0;
       align-items: center;
+    }
+    .keyboard-hint {
+      color: var(--muted);
+      font-size: 11px;
     }
     .terminal-target {
       grid-template-columns: minmax(0, 1fr);

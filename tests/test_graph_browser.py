@@ -50,6 +50,7 @@ def test_graph_ui_submits_agent_task_and_streams_output(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / "pkg" / "a.py").write_text(
@@ -163,9 +164,23 @@ def test_graph_ui_submits_agent_task_and_streams_output(
             )
             page.locator("#layer-mode").select_option("communities")
             page.locator(".community-label").first.wait_for(timeout=10000)
+            page.evaluate(
+                """() => handleConnectionSnapshot({
+                    derived_relationships: [
+                        {
+                            source: "pkg/a.py",
+                            target: "pkg/b.py",
+                            observations: 2,
+                            confidence: 1,
+                            rationale: "browser test"
+                        }
+                    ]
+                })"""
+            )
+            page.locator(".edge.agent_derived").first.wait_for(timeout=10000)
             page.locator('[data-nav-node="file:pkg/a.py"]').first.click()
             page.get_by_role("button", name="Chat").click()
-            assert page.locator("#agent-provider").input_value() == "codex"
+            assert page.locator("#agent-provider").input_value() == "configured"
             page.locator("#agent-chat-message").fill("browser stream check")
             page.locator("#agent-chat-message").press("Enter")
 
@@ -289,10 +304,14 @@ def test_graph_ui_shows_provider_neutral_agent_work_bubbles(
             ).first
             bubble.wait_for(timeout=10000)
             bubble.locator(".agent-work-pulse").wait_for(timeout=10000)
-            assert "OpenCode" in (bubble.text_content() or "")
-            assert "Editing" in (bubble.text_content() or "")
-            assert "Updating helper contract" in (bubble.text_content() or "")
-            bubble.click()
+            title_text = bubble.locator("title").text_content() or ""
+            assert "OpenCode" in title_text
+            assert "Editing" in title_text
+            assert "Updating helper contract" in title_text
+            page.evaluate(
+                '(runId) => document.querySelector(\'.agent-work-bubble[data-run-details="\' + runId + \'"]\')?.dispatchEvent(new MouseEvent("click", { bubbles: true }))',
+                run["run_id"],
+            )
             page.locator("#terminal-stream-body").wait_for(timeout=10000)
             page.locator("#run-followup-message").wait_for(timeout=10000)
             assert page.locator("#run-followup-provider").input_value() == "opencode"
@@ -314,6 +333,8 @@ def test_graph_ui_refreshes_provider_registry_without_touching_runs(
     (tmp_path / "pkg" / "a.py").write_text("def value():\n    return 1\n", encoding="utf-8")
     assert main(["init", "--root", str(tmp_path), "--json"]) == 0
     capsys.readouterr()
+
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
 
     config = cfg_mod.load(tmp_path)
     args = argparse.Namespace(
@@ -342,6 +363,7 @@ def test_graph_ui_refreshes_provider_registry_without_touching_runs(
             page = browser.new_page(viewport={"width": 1280, "height": 760})
             page.goto(f"{base_url}/repo-graph.html", wait_until="domcontentloaded")
             page.get_by_role("button", name="Chat").click()
+            assert page.locator("#agent-provider").input_value() == "codex"
             assert page.locator('#agent-provider option[value="opencode"]').count() == 0
 
             original_payload = agent_providers.provider_registry_payload

@@ -190,7 +190,7 @@ function agentTaskPayload(node, message, options = {}) {
   const selectedPaths = node.kind === "file"
     ? [node.path]
     : uniquePaths((node.metrics && ((node.metrics.active_files || []).concat(node.metrics.recent_files || []))) || []);
-  const provider = String(options.provider ?? "codex").trim().toLowerCase();
+  const provider = String(options.provider ?? defaultChatProvider()).trim().toLowerCase();
   const executionStrategy = String(options.executionStrategy || options.execution_strategy || "").trim().toLowerCase();
   const payload = {
     kind: "code_index_graph_agent_task",
@@ -697,6 +697,70 @@ function applyAgentRunResponse(result) {
     }
   });
 }
+function dynamicEdgeFromRelationship(relationship, index) {
+  const sourcePath = String((relationship && relationship.source) || "");
+  const targetPath = String((relationship && relationship.target) || "");
+  if (!sourcePath || !targetPath || sourcePath === targetPath) return null;
+  const source = fileNodeId(sourcePath);
+  const target = fileNodeId(targetPath);
+  const sourceNode = nodeById.get(source);
+  const targetNode = nodeById.get(target);
+  if (!sourceNode || !targetNode) return null;
+  return {
+    id: `edge:agent-live:${index}:${source}:${target}`,
+    source,
+    target,
+    kind: "agent_derived",
+    weight: Math.max(1, Number(relationship.observations || 1)),
+    label: "agent_derived",
+    detail: {
+      confidence: relationship.confidence,
+      observations: relationship.observations,
+      rationale: relationship.rationale || "Agents navigated between these files."
+    },
+    sourceNode,
+    targetNode
+  };
+}
+function mergeDynamicEdges(relationships) {
+  if (!Array.isArray(relationships)) return false;
+  const nextDynamicEdges = relationships
+    .map(dynamicEdgeFromRelationship)
+    .filter(Boolean);
+  const nextSignature = nextDynamicEdges
+    .map(edge => `${edge.source}:${edge.target}:${edge.weight}`)
+    .sort()
+    .join("|");
+  const currentSignature = edges
+    .filter(edge => edge.kind === "agent_derived")
+    .map(edge => `${edge.source}:${edge.target}:${edge.weight}`)
+    .sort()
+    .join("|");
+  if (nextSignature === currentSignature) return false;
+  const serialDynamicEdges = nextDynamicEdges.map(edge => ({
+    id: edge.id,
+    source: edge.source,
+    target: edge.target,
+    kind: edge.kind,
+    weight: edge.weight,
+    label: edge.label,
+    detail: edge.detail
+  }));
+  edges = edges.filter(edge => edge.kind !== "agent_derived").concat(nextDynamicEdges);
+  data.edges = ((data.edges || []).filter(edge => edge.kind !== "agent_derived")).concat(serialDynamicEdges);
+  data.summary = data.summary || {};
+  data.summary.edge_count = data.edges.length;
+  data.summary.relation_edge_count = data.edges.filter(edge => edge.kind !== "contains").length;
+  graphAdjacencyCache = null;
+  neighborhoodCache = null;
+  return true;
+}
+function handleConnectionSnapshot(payload) {
+  if (!payload || typeof payload !== "object") return;
+  if (mergeDynamicEdges(payload.derived_relationships || [])) {
+    scheduleAgentGraphRefresh();
+  }
+}
 function handleAgentSnapshot(snapshot) {
   if (!snapshot || !snapshot.agent) return;
   data.agent = {
@@ -720,8 +784,7 @@ function handleAgentSnapshot(snapshot) {
   const transcriptChanged = updateSelectedTranscriptFromSnapshot(snapshot);
   updateActivityTrail();
   updateNodeActivityFromData();
-  renderActivityTrailEdges();
-  updateVisibility();
+  scheduleAgentGraphRefresh();
   renderNavigator();
   const terminalOpen = !!document.getElementById("terminal-stream-body");
   if (selectedRunTranscript && terminalOpen) {

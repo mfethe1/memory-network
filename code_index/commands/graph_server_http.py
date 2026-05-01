@@ -1754,7 +1754,15 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             last_agent_signature: str | None = None
             last_notes_mtime: int | None = None
             last_edge_signature: str | None = None
-            interval = max(0.25, float(getattr(args, "event_interval", 1.0) or 1.0))
+            base_interval = max(0.05, float(getattr(args, "event_interval", 1.0) or 1.0))
+            env_interval = os.environ.get("CODE_INDEX_EVENT_INTERVAL")
+            if env_interval:
+                try:
+                    base_interval = max(0.05, float(env_interval))
+                except ValueError:
+                    pass
+            fast_interval = min(base_interval, 0.05)
+            burst_ticks = 0
             stream_conn = db_mod.connect(config.db_path)
             try:
                 while True:
@@ -1792,12 +1800,16 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                             self.wfile.flush()
                             sent_something = True
                         if sent_something:
+                            burst_ticks = 5
                             data = json.dumps(_perf_tick_payload(perf_state))
                             self.wfile.write(f"event: perf:tick\ndata: {data}\n\n".encode())
                             self.wfile.flush()
                         else:
                             self.wfile.write(b": heartbeat\n\n")
                             self.wfile.flush()
+                        interval = fast_interval if burst_ticks > 0 else base_interval
+                        if burst_ticks > 0:
+                            burst_ticks -= 1
                         time.sleep(interval)
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         _inc_counter(perf_state, "sse_dropped_events")

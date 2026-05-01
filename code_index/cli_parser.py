@@ -439,7 +439,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--event-interval",
         type=float,
         default=1.0,
-        help="seconds between live event checks (default 1.0)",
+        help=(
+            "seconds between live event checks when idle (default 1.0, min 0.05). "
+            "Automatically bursts to 0.05s during active work. "
+            "Override with CODE_INDEX_EVENT_INTERVAL env var."
+        ),
     )
     p_graph_server.add_argument(
         "--quiet",

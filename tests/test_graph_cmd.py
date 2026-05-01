@@ -229,7 +229,10 @@ def test_graph_html_writes_standalone_view(
     assert "agentProviderRegistry()" in html
     assert "refreshAgentProviders" in html
     assert "renderAgentRuntimeStatus" in html
-    assert 'providerOptionHtml("codex")' in html
+    assert "defaultChatProvider" in html
+    assert 'addEventListener("connection"' in html
+    assert "mergeDynamicEdges" in html
+    assert "agent_derived" in html
     registry_fallback = html[
         html.index("function agentProviderRegistry()"):
         html.index("function providerOptionHtml")
