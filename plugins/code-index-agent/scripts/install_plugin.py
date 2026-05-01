@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shlex
 import sys
 from pathlib import Path
@@ -17,24 +16,15 @@ for _parent in Path(__file__).resolve().parents:
         break
 
 from code_index import agent_providers  # noqa: E402
+from code_index import agent_sessions  # noqa: E402
 
 
 def _source_root() -> Path:
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "code_index").is_dir():
-            return parent
-    return Path(__file__).resolve().parents[3]
+    return agent_sessions.find_source_root(Path(__file__).resolve())
 
 
 def _mcp_server(root: Path | None = None) -> dict[str, Any]:
-    server: dict[str, Any] = {
-        "command": "python",
-        "args": ["-m", "code_index", "mcp-serve", "--root", "."],
-    }
-    source_root = _source_root()
-    if root is None or source_root != root.resolve():
-        server["env"] = {"PYTHONPATH": str(source_root)}
-    return server
+    return agent_sessions.mcp_server_config(root=root, source_root=_source_root())
 
 
 MCP_SERVER = _mcp_server()
@@ -81,9 +71,13 @@ def install(
     write_claude_settings: bool = True,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    root = root.resolve()
-    provider = agent_providers.normalize_provider_id(provider)
-    agent_providers.require_provider(provider)
+    session = agent_sessions.create_target_session(root, require_exists=False)
+    root = session.root
+    provider_selection = agent_sessions.create_provider_selection(
+        provider,
+        agent_command=agent_command,
+    )
+    graph = agent_sessions.GraphDefaults(host=host, port=str(port))
     plugin_script = _repo_relative(
         root,
         Path(__file__).resolve().parent / "start_graph_server.py",
@@ -93,7 +87,7 @@ def install(
         "dry_run": bool(dry_run),
         "written": [],
         "would_write": [],
-        "graph_url": f"http://{host}:{port}/repo-graph.html",
+        "graph_url": graph.url,
     }
 
     mcp_path = root / ".mcp.json"
@@ -107,30 +101,22 @@ def install(
         _write_json(claude_path, claude_payload, report, dry_run=dry_run)
 
     plugin_config_path = root / ".code_index" / "agent-plugin.json"
-    launcher_args = [
-        "python",
+    launcher_args = agent_sessions.launcher_args(
         plugin_script,
-        "--root",
-        ".",
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--ensure-index",
-    ]
-    if agent_command:
-        launcher_args.extend(["--agent-command", agent_command])
-    elif provider != "custom":
-        launcher_args.extend(["--provider", provider])
+        graph=graph,
+        provider=provider_selection,
+        index_policy=agent_sessions.IndexPolicy.ENSURE,
+        root_arg=".",
+    )
     plugin_config = {
         "name": "code-index-agent",
         "mcp_server": mcp_server,
         "graph_server": {
-            "host": host,
-            "port": str(port),
-            "provider": provider,
+            "host": graph.host,
+            "port": str(graph.port),
+            "provider": provider_selection.provider,
             "agent_command": agent_command,
-            "url": f"http://{host}:{port}/repo-graph.html",
+            "url": graph.url,
         },
         "commands": {
             "start_graph": " ".join(shlex.quote(part) for part in launcher_args),
@@ -142,10 +128,15 @@ def install(
     demo_task_path = root / ".code_index" / "demo-agent-task.json"
     demo_task = {
         "kind": "code_index_graph_agent_task",
-        "message": "Review the repo graph, identify the main implementation files, and report affected tests before editing.",
+        "message": (
+            "Review the repo graph, identify the main implementation files, "
+            "and report affected tests before editing."
+        ),
         "selected_nodes": ["dir:."],
         "selected_paths": [],
-        "callback": {"agent_events_url": f"http://{host}:{port}/api/agent-events"},
+        "callback": {
+            "agent_events_url": f"http://{graph.host}:{graph.port}/api/agent-events"
+        },
     }
     _write_json(demo_task_path, demo_task, report, dry_run=dry_run)
 

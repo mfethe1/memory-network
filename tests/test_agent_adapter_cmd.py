@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 import time
 from pathlib import Path
@@ -64,6 +65,13 @@ def test_resolve_agent_command_rejects_unknown_provider(monkeypatch):
 
 def test_agent_provider_registry_exposes_commands_and_capabilities():
     assert agent_providers.provider_choices() == ["custom", "claude", "codex", "kimi"]
+    assert agent_providers.provider_choices(include_custom=False) == [
+        "claude",
+        "codex",
+        "kimi",
+    ]
+    assert agent_providers.is_known_provider(" CLAUDE ")
+    assert agent_providers.require_provider("codex").display_name == "Codex"
     assert agent_providers.provider_display_name("kimi") == "Kimi"
     assert (
         agent_providers.provider_command_template("codex")
@@ -82,6 +90,7 @@ def test_agent_provider_registry_exposes_commands_and_capabilities():
     }
     assert payload["claude"]["display_name"] == "Claude"
     assert payload["custom"]["command_preset"] is None
+    assert payload["kimi"]["command_preset"].startswith("kimi --work-dir")
 
 
 def test_agent_provider_registry_loads_optional_json_specs(tmp_path, monkeypatch):
@@ -104,6 +113,7 @@ def test_agent_provider_registry_loads_optional_json_specs(tmp_path, monkeypatch
 
     monkeypatch.setenv(agent_providers.PROVIDER_SPECS_ENV_VAR, str(spec_path))
     importlib.reload(agent_providers)
+    agent_adapter_cmd.PROVIDER_COMMANDS = agent_providers.PROVIDER_COMMANDS
     try:
         assert agent_providers.provider_choices() == [
             "custom",
@@ -116,6 +126,10 @@ def test_agent_provider_registry_loads_optional_json_specs(tmp_path, monkeypatch
         assert (
             agent_providers.provider_command_template("opencode")
             == "opencode run --print < {provider_prompt_file}"
+        )
+        assert resolve_agent_command(provider="opencode") == (
+            "opencode run --print < {provider_prompt_file}",
+            "opencode",
         )
         assert agent_providers.provider_has_capability(
             "opencode", agent_providers.CAPABILITY_PROVIDER_PROMPT_FILE
@@ -402,3 +416,115 @@ def test_run_command_sets_utf8_stdio_for_python_backed_providers(
         and "unicode minus: -" in event["message"].replace("\u2212", "-")
         for event in events
     )
+
+
+def test_run_command_compacts_loguru_handler_tracebacks(tmp_path: Path, monkeypatch):
+    events: list[dict] = []
+
+    def fake_post_json(_callback: str, payload: dict) -> dict:
+        events.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(agent_adapter_cmd, "_post_json", fake_post_json)
+    script_path = tmp_path / "noisy_agent.py"
+    script_path.write_text(
+        (
+            "import sys\n"
+            "lines = [\n"
+            "    '--- Logging error in Loguru Handler #1 ---',\n"
+            "    \"Record was: {'message': 'Created new session'}\",\n"
+            "    'Traceback (most recent call last):',\n"
+            "    '  File \"loguru/_handler.py\", line 206, in emit',\n"
+            "    '  File \"loguru/_file_sink.py\", line 276, in _terminate_file',\n"
+            "    \"PermissionError: [WinError 32] The process cannot access the file because it is being used by another process: 'C:\\\\Users\\\\mfeth\\\\.kimi\\\\logs\\\\kimi.log' -> 'C:\\\\Users\\\\mfeth\\\\.kimi\\\\logs\\\\kimi.2026-04-30.log'\",\n"
+            "    '--- End of logging error ---',\n"
+            "]\n"
+            "for line in lines:\n"
+            "    print(line, file=sys.stderr, flush=True)\n"
+        ),
+        encoding="utf-8",
+    )
+    task_json_path = tmp_path / "task.json"
+    task_json_path.write_text("{}", encoding="utf-8")
+
+    exit_code, result = agent_adapter_cmd._run_command(
+        {"run_id": "run-noisy", "message": "noise"},
+        callback="http://callback.invalid/events",
+        command=f'"{sys.executable}" "{script_path}"',
+        root=tmp_path,
+        task_json_path=task_json_path,
+    )
+
+    assert exit_code == 0
+    assert result["status"] == "completed"
+    noise_events = [
+        event
+        for event in events
+        if event["payload"].get("provider_noise") == "loguru_handler_error"
+    ]
+    assert len(noise_events) == 1
+    assert "Loguru" in noise_events[0]["message"]
+    assert noise_events[0]["payload"]["suppressed_lines"] == 7
+    assert not any(
+        "Record was:" in event["message"] or "loguru/_handler.py" in event["message"]
+        for event in events
+    )
+
+
+def test_kimi_provider_uses_isolated_share_dir_seeded_from_existing_config(
+    tmp_path: Path, monkeypatch
+):
+    events: list[dict] = []
+
+    def fake_post_json(_callback: str, payload: dict) -> dict:
+        events.append(payload)
+        return {"ok": True}
+
+    source_share = tmp_path / "source-kimi"
+    (source_share / "credentials").mkdir(parents=True)
+    (source_share / "config.toml").write_text("model = 'kimi-k2.6'\n", encoding="utf-8")
+    (source_share / "device_id").write_text("device-id", encoding="utf-8")
+    (source_share / "credentials" / "tokens.json").write_text(
+        '{"access_token":"token"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("KIMI_SHARE_DIR", str(source_share))
+    monkeypatch.setattr(agent_adapter_cmd, "_post_json", fake_post_json)
+
+    script_path = tmp_path / "inspect_env.py"
+    script_path.write_text(
+        (
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "share = Path(os.environ['KIMI_SHARE_DIR'])\n"
+            "print(json.dumps({\n"
+            "    'event_type': 'note',\n"
+            "    'message': json.dumps({\n"
+            "        'share': str(share),\n"
+            "        'has_config': (share / 'config.toml').exists(),\n"
+            "        'has_credentials': (share / 'credentials' / 'tokens.json').exists(),\n"
+            "    }),\n"
+            "}))\n"
+        ),
+        encoding="utf-8",
+    )
+    task_json_path = tmp_path / "task.json"
+    task_json_path.write_text("{}", encoding="utf-8")
+
+    exit_code, result = agent_adapter_cmd._run_command(
+        {"run_id": "run-kimi-env", "message": "env"},
+        callback="http://callback.invalid/events",
+        command=f'"{sys.executable}" "{script_path}"',
+        root=tmp_path,
+        task_json_path=task_json_path,
+        provider="kimi",
+    )
+
+    assert exit_code == 0
+    assert result["status"] == "completed"
+    note = next(event for event in events if event["event_type"] == "note")
+    observed = json.loads(note["message"])
+    assert Path(observed["share"]) != source_share
+    assert observed["has_config"] is True
+    assert observed["has_credentials"] is True
+    assert not Path(observed["share"]).exists()

@@ -9,6 +9,7 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -24,6 +25,8 @@ from code_index import agent_providers
 
 AGENT_COMMAND_ENV_VAR = "CODE_INDEX_AGENT_COMMAND"
 AGENT_PROVIDER_ENV_VAR = "CODE_INDEX_AGENT_PROVIDER"
+KIMI_ISOLATE_SHARE_ENV_VAR = "CODE_INDEX_KIMI_ISOLATE_SHARE_DIR"
+KIMI_SHARE_DIR_ENV_VAR = "KIMI_SHARE_DIR"
 PROVIDER_COMMANDS = agent_providers.PROVIDER_COMMANDS
 STRUCTURED_EVENT_TYPES = {
     "read",
@@ -41,6 +44,13 @@ STRUCTURED_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 JSON_PREFIX_RE = re.compile(r"^(?:CODE_INDEX_EVENT|code_index_event)\s*[: ]\s*(\{.*\})$")
+LOGURU_HANDLER_ERROR_START_RE = re.compile(
+    r"^--- Logging error in Loguru Handler #\d+ ---$"
+)
+LOGURU_HANDLER_ERROR_END = "--- End of logging error ---"
+WINDOWS_SHELL_METACHARS = ("<", ">", "|", "&")
+KIMI_SHARE_SEED_FILES = ("config.toml", "device_id", "mcp.json")
+KIMI_SHARE_SEED_DIRS = ("credentials", "plugins", "bin")
 
 
 def _read_task(raw: str | None) -> dict[str, Any]:
@@ -131,6 +141,24 @@ def _shell_quote(value: object) -> str:
 
 def _shell_join(values: list[str]) -> str:
     return " ".join(_shell_quote(value) for value in values)
+
+
+def _strip_outer_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _popen_command(formatted: str) -> tuple[str | list[str], bool]:
+    if os.name != "nt" or any(marker in formatted for marker in WINDOWS_SHELL_METACHARS):
+        return formatted, True
+    try:
+        parts = shlex.split(formatted, posix=False)
+    except ValueError:
+        return formatted, True
+    if not parts:
+        return formatted, True
+    return [_strip_outer_quotes(part) for part in parts], False
 
 
 class _FormatValues(dict[str, str]):
@@ -848,6 +876,73 @@ def _parse_output_event(
     }
 
 
+def _compact_loguru_handler_event(
+    lines: list[str],
+    *,
+    stream_name: str,
+    command_label: str,
+) -> dict[str, Any]:
+    text = "\n".join(lines)
+    if "PermissionError: [WinError 32]" in text and "kimi.log" in text:
+        reason = "windows_kimi_log_rotation_lock"
+        message = (
+            "Suppressed Loguru handler noise: Windows file locking blocked "
+            "Kimi log rotation."
+        )
+    else:
+        reason = "loguru_handler_error"
+        message = "Suppressed Loguru handler noise from provider stderr."
+    return {
+        "event_type": "tool",
+        "message": message,
+        "file_path": None,
+        "symbol_path": None,
+        "status": None,
+        "payload": {
+            "adapter": "command",
+            "stream": stream_name,
+            "command": command_label,
+            "structured": False,
+            "provider_noise": "loguru_handler_error",
+            "noise_reason": reason,
+            "suppressed_lines": len(lines),
+        },
+    }
+
+
+def _consume_loguru_handler_line(
+    state: dict[str, Any],
+    *,
+    line: str,
+    stream_name: str,
+    command_label: str,
+) -> tuple[bool, dict[str, Any] | None]:
+    pending = state.get("_pending_loguru_handler_error")
+    if isinstance(pending, dict):
+        lines = pending.setdefault("lines", [])
+        if isinstance(lines, list):
+            lines.append(line)
+        else:
+            lines = [line]
+            pending["lines"] = lines
+        if line.strip() == LOGURU_HANDLER_ERROR_END or len(lines) >= 200:
+            state.pop("_pending_loguru_handler_error", None)
+            return True, _compact_loguru_handler_event(
+                [str(item) for item in lines],
+                stream_name=str(pending.get("stream_name") or stream_name),
+                command_label=command_label,
+            )
+        return True, None
+
+    if LOGURU_HANDLER_ERROR_START_RE.match(line.strip()):
+        state["_pending_loguru_handler_error"] = {
+            "stream_name": stream_name,
+            "lines": [line],
+        }
+        return True, None
+    return False, None
+
+
 def _drain_output_events(
     output: "queue.Queue[tuple[str, str]]",
     *,
@@ -866,6 +961,34 @@ def _drain_output_events(
             break
         if not line:
             continue
+        if state is not None:
+            consumed, compact_event = _consume_loguru_handler_line(
+                state,
+                line=line,
+                stream_name=stream_name,
+                command_label=command_label,
+            )
+            if consumed:
+                if compact_event is not None:
+                    if events_sent >= max_events:
+                        omitted += int(
+                            compact_event["payload"].get("suppressed_lines") or 1
+                        )
+                    else:
+                        _post_json(
+                            callback,
+                            _event_payload(
+                                task,
+                                event_type=compact_event["event_type"],
+                                message=compact_event["message"],
+                                file_path=compact_event.get("file_path"),
+                                symbol_path=compact_event.get("symbol_path"),
+                                status=compact_event.get("status"),
+                                payload=compact_event["payload"],
+                            ),
+                        )
+                        events_sent += 1
+                continue
         if events_sent >= max_events:
             omitted += 1
             continue
@@ -898,14 +1021,15 @@ def _terminate_process_tree(process: subprocess.Popen[str], *, force: bool) -> N
     if os.name == "nt":
         command = ["taskkill", "/PID", str(process.pid), "/T", "/F"]
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 command,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=5,
                 check=False,
             )
-            return
+            if completed.returncode == 0:
+                return
         except (OSError, subprocess.TimeoutExpired):
             pass
     else:
@@ -1039,12 +1163,75 @@ def _read_text_if_present(path: Path, *, max_chars: int = 12000) -> str:
     return text[:max_chars].rstrip() + "\n...[truncated]"
 
 
-def _agent_command_env() -> dict[str, str]:
+def _env_flag_enabled(
+    env: dict[str, str],
+    name: str,
+    *,
+    default: bool = True,
+) -> bool:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _copy_kimi_share_seed(source: Path, target: Path) -> None:
+    if not source.exists():
+        return
+    for filename in KIMI_SHARE_SEED_FILES:
+        source_path = source / filename
+        if source_path.is_file():
+            try:
+                shutil.copy2(source_path, target / filename)
+            except OSError:
+                pass
+    for dirname in KIMI_SHARE_SEED_DIRS:
+        source_path = source / dirname
+        if source_path.is_dir():
+            try:
+                shutil.copytree(source_path, target / dirname)
+            except OSError:
+                pass
+
+
+def _prepare_isolated_kimi_share_dir(
+    env: dict[str, str],
+    *,
+    task: dict[str, Any] | None,
+) -> Path:
+    run_id = _safe_run_id(task or {})
+    target = Path(tempfile.mkdtemp(prefix=f"code-index-kimi-{run_id}-"))
+    source = Path(env.get(KIMI_SHARE_DIR_ENV_VAR) or (Path.home() / ".kimi")).expanduser()
+    _copy_kimi_share_seed(source, target)
+    env[KIMI_SHARE_DIR_ENV_VAR] = str(target)
+    return target
+
+
+def _cleanup_agent_command_env(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        pass
+
+
+def _agent_command_env(
+    *,
+    provider: str = "custom",
+    task: dict[str, Any] | None = None,
+) -> tuple[dict[str, str], Path | None]:
     env = os.environ.copy()
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUNBUFFERED", "1")
-    return env
+    cleanup_dir = None
+    if (
+        agent_providers.normalize_provider_id(provider) == "kimi"
+        and _env_flag_enabled(env, KIMI_ISOLATE_SHARE_ENV_VAR, default=True)
+    ):
+        cleanup_dir = _prepare_isolated_kimi_share_dir(env, task=task)
+    return env, cleanup_dir
 
 
 def _run_command(
@@ -1054,6 +1241,7 @@ def _run_command(
     command: str,
     root: Path,
     task_json_path: Path,
+    provider: str = "custom",
     command_timeout: float | None = None,
     max_output_events: int = 400,
     cancel_event: threading.Event | None = None,
@@ -1145,25 +1333,28 @@ def _run_command(
             "cancelled": True,
         }
 
+    command_env, env_cleanup_dir = _agent_command_env(provider=provider, task=task)
     try:
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs["start_new_session"] = True
-        process = subprocess.Popen(  # noqa: S602 - configured local adapter command.
-            formatted,
+        popen_command, use_shell = _popen_command(formatted)
+        process = subprocess.Popen(  # noqa: S603,S602 - configured local adapter command.
+            popen_command,
             cwd=str(root),
-            shell=True,
+            shell=use_shell,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=_agent_command_env(),
+            env=command_env,
             **popen_kwargs,
         )
     except OSError as exc:
+        _cleanup_agent_command_env(env_cleanup_dir)
         responses.append(
             _post_status(
                 callback,
@@ -1210,6 +1401,7 @@ def _run_command(
                 events_sent += 1
             except OSError:
                 pass
+            _cleanup_agent_command_env(env_cleanup_dir)
             return 1, {
                 "ok": False,
                 "status": "failed",
@@ -1270,11 +1462,11 @@ def _run_command(
                 state=stream_state,
             )
             omitted_output_events += omitted
-            if process.poll() is not None:
-                break
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
                 _terminate_process_tree(process, force=False)
+                break
+            if process.poll() is not None:
                 break
             if deadline is not None and time.monotonic() >= deadline:
                 timed_out = True
@@ -1396,6 +1588,7 @@ def _run_command(
         )
     )
     events_sent += 1
+    _cleanup_agent_command_env(env_cleanup_dir)
     return exit_code, {
         "ok": status == "completed",
         "status": status,
@@ -1467,6 +1660,7 @@ def run_task(
             command=command_value,
             root=root,
             task_json_path=materialized_path,
+            provider=command_provider,
             command_timeout=command_timeout,
             max_output_events=max_output_events,
             cancel_event=cancel_event,

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import threading
+import time
 from typing import Any
 from urllib import error as urllib_error
 from urllib.request import Request, urlopen
@@ -22,6 +25,7 @@ from code_index.locking import writer_lock
 
 
 _LOCAL_AGENT_CANCEL_EVENTS: dict[str, threading.Event] = {}
+_LOCAL_AGENT_PROCESS_PIDS: dict[str, int] = {}
 _LOCAL_AGENT_CANCEL_LOCK = threading.Lock()
 GRAPH_CONTEXT_WHY_INCLUDED = (
     "selected_node",
@@ -90,15 +94,65 @@ def _unregister_local_agent_task(run_id: str, cancel_event: threading.Event) -> 
     with _LOCAL_AGENT_CANCEL_LOCK:
         if _LOCAL_AGENT_CANCEL_EVENTS.get(run_id) is cancel_event:
             _LOCAL_AGENT_CANCEL_EVENTS.pop(run_id, None)
+            _LOCAL_AGENT_PROCESS_PIDS.pop(run_id, None)
 
 
 def _cancel_local_agent_task(run_id: str) -> bool:
     with _LOCAL_AGENT_CANCEL_LOCK:
         cancel_event = _LOCAL_AGENT_CANCEL_EVENTS.get(run_id)
+        pid = _LOCAL_AGENT_PROCESS_PIDS.get(run_id)
     if cancel_event is None:
         return False
     cancel_event.set()
+    if pid is None:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with _LOCAL_AGENT_CANCEL_LOCK:
+                pid = _LOCAL_AGENT_PROCESS_PIDS.get(run_id)
+            if pid is not None:
+                break
+            time.sleep(0.05)
+    if pid is not None:
+        _terminate_process_tree(pid)
     return True
+
+
+def _terminate_process_tree(pid: int) -> None:
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            process_terminate = 0x0001
+            handle = ctypes.windll.kernel32.OpenProcess(
+                process_terminate,
+                False,
+                int(pid),
+            )
+            if handle:
+                try:
+                    ctypes.windll.kernel32.TerminateProcess(handle, 1)
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1,
+                check=False,
+            )
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
 
 
 def _run_local_agent_task(
@@ -118,6 +172,9 @@ def _run_local_agent_task(
         run_id = str(task.get("run_id") or "")
         if not run_id:
             return
+        with _LOCAL_AGENT_CANCEL_LOCK:
+            if run_id in _LOCAL_AGENT_CANCEL_EVENTS:
+                _LOCAL_AGENT_PROCESS_PIDS[run_id] = int(pid)
         with writer_lock(config):
             conn = db_mod.connect(config.db_path)
             try:

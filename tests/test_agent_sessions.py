@@ -19,6 +19,30 @@ def test_target_session_resolves_index_root_and_scope(tmp_path: Path):
     assert session.scope == Path("packages/api")
 
 
+def test_target_session_separates_explicit_root_and_scope(tmp_path: Path):
+    from code_index.agent_sessions import create_target_session, graph_server_command
+
+    repo = tmp_path / "repo"
+    scope = repo / "packages" / "api"
+    (repo / ".code_index").mkdir(parents=True)
+    scope.mkdir(parents=True)
+
+    session = create_target_session(repo, scope="packages/api")
+
+    assert session.root == repo.resolve()
+    assert session.scope == Path("packages/api")
+    command = graph_server_command(session, python_executable="python-test")
+    assert command[:5] == [
+        "python-test",
+        "-m",
+        "code_index",
+        "graph-server",
+        "--root",
+    ]
+    assert "--scope" in command
+    assert command[command.index("--scope") + 1] == "packages/api"
+
+
 def test_target_session_uses_unindexed_directory_as_root(tmp_path: Path):
     from code_index.agent_sessions import create_target_session
 

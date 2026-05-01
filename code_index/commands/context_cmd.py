@@ -17,6 +17,7 @@ from typing import Any
 from code_index import agent_activity
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
+from code_index import scopes
 from code_index.commands.graph_notes import graph_notes_block
 from code_index.commands.repo_map_cmd import build_repo_map
 from code_index.search import fts
@@ -34,6 +35,7 @@ def build_context_packet(
     budget_tokens: int = DEFAULT_BUDGET_TOKENS,
     selected_nodes: list[str] | None = None,
     selected_paths: list[str] | None = None,
+    scope: str | Path | None = None,
     limit: int = DEFAULT_LIMIT,
 ) -> dict[str, Any]:
     """Build a compact, JSON-serializable context packet for `task`.
@@ -50,6 +52,7 @@ def build_context_packet(
 
     selected_nodes = _as_list(selected_nodes)
     selected_paths = _as_list(selected_paths)
+    scope_selection = scopes.resolve_scope(config.root, scope)
     limit = max(0, int(limit))
     budget_tokens = int(budget_tokens or 0)
 
@@ -57,23 +60,40 @@ def build_context_packet(
     try:
         db_mod.ensure_schema(conn, config)
         notes = _compact_notes(graph_notes_block(config.root), limit=limit)
+        selected_path_inputs = selected_paths
+        if scope_selection.explicit and not selected_path_inputs:
+            selected_path_inputs = scopes.indexed_file_paths_for_scope(
+                conn, scope_selection
+            )
+        normalized_selected_paths = _normalize_paths(config, selected_path_inputs)
+        scopes.validate_paths_in_scope(
+            normalized_selected_paths,
+            scope_selection,
+            label="selected path",
+        )
         event_limit = max(limit * 4, 12) if limit > 0 else 0
         file_limit = min(max(limit, 1), 8) if limit > 0 else 0
         packet: dict[str, Any] = {
             "kind": "code_index_context_packet",
             "task": task_text,
             "root": str(config.root),
+            "scope": scope_selection.to_dict(),
             "repo_map": _repo_map(conn, limit=limit),
             "selected_paths": [
                 _path_summary(conn, config, path, notes)
-                for path in _normalize_paths(config, selected_paths)
+                for path in normalized_selected_paths
             ],
             "selected_nodes": [
                 _node_summary(conn, config, node, notes)
                 for node in selected_nodes
                 if str(node).strip()
             ],
-            "matching_chunks": _matching_chunks(conn, task_text, limit=limit),
+            "matching_chunks": _matching_chunks(
+                conn,
+                task_text,
+                limit=limit,
+                scope=scope_selection.path if scope_selection.explicit else None,
+            ),
             "agent_activity": _compact_activity(
                 agent_activity.activity_snapshot(
                     conn,
@@ -123,9 +143,10 @@ def run(args: argparse.Namespace) -> int:
             ),
             selected_nodes=_as_list(getattr(args, "selected_node", None)),
             selected_paths=_as_list(getattr(args, "path", None)),
+            scope=getattr(args, "scope", None),
             limit=int(getattr(args, "limit", DEFAULT_LIMIT) or DEFAULT_LIMIT),
         )
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}")
         return 2
 
@@ -475,20 +496,31 @@ def _compact_chunk(
 
 
 def _matching_chunks(
-    conn: sqlite3.Connection, task: str, *, limit: int
+    conn: sqlite3.Connection,
+    task: str,
+    *,
+    limit: int,
+    scope: str | None = None,
 ) -> list[dict[str, Any]]:
     if not task.strip() or limit <= 0:
         return []
+    search_limit = limit if not scope else max(limit * 8, limit + 40)
     try:
-        rows = fts.search(conn, task, limit=limit)
+        rows = fts.search(conn, task, limit=search_limit)
     except sqlite3.OperationalError:
         fallback = " ".join(re.findall(r"[A-Za-z0-9_.]+", task.replace("-", " ")))
         if not fallback:
             return []
         try:
-            rows = fts.search(conn, fallback, limit=limit)
+            rows = fts.search(conn, fallback, limit=search_limit)
         except sqlite3.OperationalError:
             return []
+    if scope:
+        rows = [
+            row
+            for row in rows
+            if scopes.path_in_scope(str(row.get("file_path") or ""), scope)
+        ]
     rows = sorted(
         rows,
         key=lambda row: (
@@ -497,7 +529,7 @@ def _matching_chunks(
             int(row.get("start_line") or 0),
             row.get("chunk_uid") or "",
         ),
-    )
+    )[:limit]
     return [
         {
             "chunk_uid": row.get("chunk_uid"),

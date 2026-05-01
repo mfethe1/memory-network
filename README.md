@@ -74,13 +74,13 @@ python -m code_index agent-adapter --mode command \
 
 # Start the repo-local plugin launcher for Claude/Codex/other command adapters
 python plugins/code-index-agent/scripts/install_plugin.py --root . --provider codex --json
-python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 8767 \
+python -m code_index agent-plugin start --root . --port 8767 \
   --provider codex
 
-# Point the same launcher at any local codebase. If the target has no
-# .code_index/index.db yet, the launcher initializes it before serving the graph.
-python E:/Projects/hackathon/memory-claude/plugins/code-index-agent/scripts/start_graph_server.py \
-  --root E:/Projects/other-repo --port 8767 --provider codex
+# Point the same launcher at any local codebase and start in a scoped subtree.
+# --root owns the repo/index; --scope is the starting directory inside it.
+python -m code_index agent-plugin start \
+  --root E:/Projects/other-repo --scope src/auth --port 8767 --provider codex
 
 # Import a SCIP semantic index exported as JSON
 python -m code_index import-scip --json-index index.scip.json
@@ -153,12 +153,22 @@ graph server. You can also set
 `CODE_INDEX_AGENT_PROVIDER=claude`, `CODE_INDEX_AGENT_PROVIDER=codex`, or
 `CODE_INDEX_AGENT_PROVIDER=kimi` for built-in local presets. The Kimi preset
 uses non-interactive stream JSON mode, thinking mode, one Ralph iteration, and a
-per-run MCP config that exposes `code_index mcp-serve` to the agent. Each
+per-run MCP config that exposes `code_index mcp-serve` to the agent. Kimi runs
+also use an isolated temporary `KIMI_SHARE_DIR`, seeded from the user's current
+Kimi config and credentials, so concurrent runs do not contend for
+`~/.kimi/logs/kimi.log` rotation on Windows. Set
+`CODE_INDEX_KIMI_ISOLATE_SHARE_DIR=0` to disable that isolation. Additional
+provider presets can be loaded without code changes by setting
+`CODE_INDEX_AGENT_PROVIDER_SPECS` to one or more path-separated JSON files with
+`providers` entries containing `id`, `display_name`, `command_preset`, and
+`capabilities`. Each
 submitted task includes a bounded
 `context_packet` with repo-map, selected files/nodes, matching chunks, graph
 notes, and recent agent activity. The command adapter streams stdout/stderr
 back as graph events and marks the run completed or failed from the process
-exit code.
+exit code. Known provider logging-noise blocks, such as Loguru handler
+tracebacks from failed log rotation, are compacted into one graph event instead
+of preserving every traceback line.
 Useful command placeholders are `{message}`, `{provider_prompt}`, `{run_id}`,
 `{root}`, `{task_json}`, `{selected_paths}`, and `{selected_nodes}`.
 
@@ -248,8 +258,12 @@ config, starter scripts, and a demo task:
 python plugins/code-index-agent/scripts/install_plugin.py --root . --provider codex --json
 ```
 
-The launcher accepts any local directory via `--root`. It injects this
-`code_index` source tree into `PYTHONPATH`, initializes a missing
+The promoted launcher is available as
+`python -m code_index agent-plugin start --root <repo> --scope <dir>`.
+`--root` owns the repo/index and `--scope` is the starting directory inside
+that repo for graph focus, search, and default task selection. The legacy
+plugin script accepts the same root/scope startup model. Both paths inject this
+`code_index` source tree into `PYTHONPATH`, initialize a missing
 `.code_index/index.db`, and then starts `graph-server`; pass `--refresh-index`
 when you explicitly want an existing target index rescanned before launch. The
 launcher validates configured provider executables before starting unless

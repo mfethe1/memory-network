@@ -20,6 +20,7 @@ from code_index import agent_activity
 from code_index import lease_manager
 from code_index.cli import main
 from code_index.commands import agent_adapter_cmd
+from code_index.commands import graph_server_cmd
 from code_index.commands import mcp_tool_impl
 from code_index.commands.graph_notes import graph_notes_block
 from code_index.commands.graph_server_cmd import _agent_stream_payload, _make_handler
@@ -276,6 +277,146 @@ def test_graph_server_agent_providers_endpoint_returns_registry(
         }
         assert providers_by_id["codex"]["display_name"] == "Codex"
         assert "stream_json_output" in providers_by_id["kimi"]["capabilities"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_graph_server_scope_focuses_start_search_and_task_selection(
+    tmp_path: Path, capsys, monkeypatch
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text(
+        "def scoped_needle() -> str:\n    return 'needle from scoped package'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "b.py").write_text(
+        "def outside_needle() -> str:\n    return 'needle from outside package'\n",
+        encoding="utf-8",
+    )
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+        scope="pkg",
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        graph = _request_json(f"{base_url}/repo-graph.json")
+        assert graph["root"] == str(tmp_path.resolve())
+        assert graph["scope"]["path"] == "pkg"
+        assert graph["scope"]["explicit"] is True
+        assert graph["focus_paths"] == ["pkg/a.py"]
+        assert "file:other/b.py" in {node["id"] for node in graph["nodes"]}
+        assert graph["agent"]["active_files"] == ["pkg/a.py"]
+
+        search = _request_json(f"{base_url}/api/search?q=needle&scope=all&limit=10")
+        assert search["files"]
+        assert {item["file_path"] for item in search["files"]} == {"pkg/a.py"}
+
+        preflight = _request_json(
+            f"{base_url}/api/agent-task-preflight",
+            {
+                "agent_name": "Codex",
+                "message": "Start from the scoped package.",
+            },
+        )
+        assert preflight["ok"] is True
+        assert preflight["draft"]["root"] == str(tmp_path.resolve())
+        assert preflight["draft"]["scope"]["path"] == "pkg"
+        assert preflight["draft"]["selected_paths"] == ["pkg/a.py"]
+        assert preflight["draft"]["context_policy"]["retrieval_handles"][
+            "selected_paths"
+        ] == ["pkg/a.py"]
+        assert preflight["draft"]["graph_context"]["selected_nodes"][0]["path"] == (
+            "pkg/a.py"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_graph_server_scope_must_stay_inside_root(tmp_path: Path, capsys):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    args = argparse.Namespace(
+        root=str(tmp_path),
+        scope=str(outside),
+        host="127.0.0.1",
+        port=0,
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+    )
+
+    assert graph_server_cmd.run(args) == 2
+    assert "error: scope must be inside root" in capsys.readouterr().out
+
+
+def test_graph_server_scope_rejects_task_selection_outside_scope(
+    tmp_path: Path, capsys, monkeypatch
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text("def scoped():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "b.py").write_text("def outside():\n    return 2\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+        scope="pkg",
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        status, body = _request_raw_status(
+            f"{base_url}/api/agent-task-preflight",
+            json.dumps(
+                {
+                    "agent_name": "Codex",
+                    "message": "Try to start outside the scoped package.",
+                    "selected_paths": ["other/b.py"],
+                }
+            ).encode("utf-8"),
+            {"Content-Type": "application/json"},
+        )
+        assert status == 400
+        assert json.loads(body)["error"] == (
+            "selected path is outside scope: other/b.py"
+        )
     finally:
         server.shutdown()
         server.server_close()

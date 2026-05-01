@@ -17,6 +17,7 @@ from code_index import agent_providers
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
 from code_index import run_orchestrator
+from code_index import scopes
 from code_index.agent_collaboration import append_event_jsonl
 from code_index.commands.graph_model import build_graph
 from code_index.commands.graph_notes import notes_path
@@ -242,14 +243,27 @@ def _build_payload(config: cfg_mod.Config, args: argparse.Namespace) -> dict[str
     conn = db_mod.connect(config.db_path)
     try:
         db_mod.ensure_schema(conn, config)
+        scope_selection = scopes.resolve_scope_from_args(config.root, args)
+        focus_paths = list(args.focus or [])
+        if scope_selection.explicit:
+            focus_paths.extend(
+                path
+                for path in scopes.indexed_file_paths_for_scope(
+                    conn,
+                    scope_selection,
+                    limit=200,
+                )
+                if path not in focus_paths
+            )
         payload = build_graph(
             conn,
             config.root,
             include_code=not args.no_code,
             max_code_bytes=max(0, int(args.max_code_bytes)),
-            focus_paths=args.focus or [],
+            focus_paths=focus_paths,
             agent_name=args.agent_name,
         )
+        payload["scope"] = scope_selection.to_dict()
         payload["live"] = {
             "server": True,
             "events_path": "/events",

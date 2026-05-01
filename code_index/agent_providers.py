@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 
 CAPABILITY_COMMAND_PRESET = "command_preset"
@@ -14,6 +18,7 @@ CAPABILITY_LAST_MESSAGE_FILE = "last_message_file"
 CAPABILITY_MCP_CONFIG_FILE = "mcp_config_file"
 CAPABILITY_JSON_OUTPUT = "json_output"
 CAPABILITY_STREAM_JSON_OUTPUT = "stream_json_output"
+PROVIDER_SPECS_ENV_VAR = "CODE_INDEX_AGENT_PROVIDER_SPECS"
 
 
 @dataclass(frozen=True)
@@ -27,7 +32,128 @@ class AgentProvider:
         return capability in self.capabilities
 
 
-_PROVIDER_ORDER = ("custom", "claude", "codex", "kimi")
+def normalize_provider_id(provider_id: str | None) -> str:
+    return (provider_id or "custom").strip().lower() or "custom"
+
+
+def _default_display_name(provider_id: str) -> str:
+    return provider_id.replace("_", " ").replace("-", " ").title()
+
+
+def _required_text(
+    value: Any,
+    *,
+    field_name: str,
+    source: str,
+) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{source}: provider {field_name} must be a non-empty string")
+    return value.strip()
+
+
+def _optional_text(
+    value: Any,
+    *,
+    field_name: str,
+    source: str,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{source}: provider {field_name} must be a string")
+    return value.strip() or None
+
+
+def _capabilities_from_value(value: Any, *, source: str) -> frozenset[str]:
+    if value is None:
+        return frozenset()
+    if not isinstance(value, list):
+        raise ValueError(f"{source}: provider capabilities must be a list of strings")
+    capabilities: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(
+                f"{source}: provider capabilities must be a list of strings"
+            )
+        capability = item.strip()
+        if capability not in capabilities:
+            capabilities.append(capability)
+    return frozenset(capabilities)
+
+
+@dataclass(frozen=True)
+class AgentProviderSpec:
+    id: str
+    display_name: str | None = None
+    command_preset: str | None = None
+    capabilities: frozenset[str] = frozenset()
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        source: str = "provider spec",
+    ) -> AgentProviderSpec:
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{source}: provider spec must be an object")
+        provider_id = normalize_provider_id(
+            _required_text(value.get("id"), field_name="id", source=source)
+        )
+        display_name = _optional_text(
+            value.get("display_name"),
+            field_name="display_name",
+            source=source,
+        )
+        command_preset = _optional_text(
+            value.get("command_preset"),
+            field_name="command_preset",
+            source=source,
+        )
+        return cls(
+            id=provider_id,
+            display_name=display_name,
+            command_preset=command_preset,
+            capabilities=_capabilities_from_value(
+                value.get("capabilities"),
+                source=source,
+            ),
+        )
+
+    def to_provider(self) -> AgentProvider:
+        capabilities = set(self.capabilities)
+        if self.command_preset:
+            capabilities.add(CAPABILITY_COMMAND_PRESET)
+        return AgentProvider(
+            id=normalize_provider_id(self.id),
+            display_name=self.display_name or _default_display_name(self.id),
+            command_preset=self.command_preset,
+            capabilities=frozenset(capabilities),
+        )
+
+
+@dataclass(frozen=True)
+class AgentProviderRegistry:
+    providers: dict[str, AgentProvider]
+    provider_order: tuple[str, ...]
+
+    @classmethod
+    def from_specs(cls, specs: Iterable[AgentProviderSpec]) -> AgentProviderRegistry:
+        providers: dict[str, AgentProvider] = {}
+        provider_order: list[str] = []
+        for spec in specs:
+            provider = spec.to_provider()
+            if provider.id not in providers:
+                provider_order.append(provider.id)
+            providers[provider.id] = provider
+        return cls(providers=providers, provider_order=tuple(provider_order))
+
+    def command_templates(self) -> dict[str, str]:
+        templates: dict[str, str] = {}
+        for provider_id, provider in self.providers.items():
+            if provider.command_preset:
+                templates[provider_id] = provider.command_preset
+        return templates
 
 
 def _bounded_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -62,65 +188,121 @@ def _kimi_command_preset() -> str:
         "< {provider_prompt_file}"
     )
 
-_PROVIDERS: dict[str, AgentProvider] = {
-    "custom": AgentProvider(
-        id="custom",
-        display_name="Custom",
-        command_preset=None,
-        capabilities=frozenset({CAPABILITY_CUSTOM_COMMAND}),
-    ),
-    "claude": AgentProvider(
-        id="claude",
-        display_name="Claude",
-        command_preset="claude -p {provider_prompt}",
-        capabilities=frozenset(
-            {
-                CAPABILITY_COMMAND_PRESET,
-                CAPABILITY_INLINE_PROVIDER_PROMPT,
-            }
+
+def _builtin_provider_specs() -> tuple[AgentProviderSpec, ...]:
+    return (
+        AgentProviderSpec(
+            id="custom",
+            display_name="Custom",
+            command_preset=None,
+            capabilities=frozenset({CAPABILITY_CUSTOM_COMMAND}),
         ),
-    ),
-    "codex": AgentProvider(
-        id="codex",
-        display_name="Codex",
-        command_preset=(
-            "codex exec -C {root} -s workspace-write --json "
-            "-o {last_message} - < {provider_prompt_file}"
+        AgentProviderSpec(
+            id="claude",
+            display_name="Claude",
+            command_preset="claude -p {provider_prompt}",
+            capabilities=frozenset(
+                {
+                    CAPABILITY_COMMAND_PRESET,
+                    CAPABILITY_INLINE_PROVIDER_PROMPT,
+                }
+            ),
         ),
-        capabilities=frozenset(
-            {
-                CAPABILITY_COMMAND_PRESET,
-                CAPABILITY_PROVIDER_PROMPT_FILE,
-                CAPABILITY_LAST_MESSAGE_FILE,
-                CAPABILITY_JSON_OUTPUT,
-            }
+        AgentProviderSpec(
+            id="codex",
+            display_name="Codex",
+            command_preset=(
+                "codex exec -C {root} -s workspace-write --json "
+                "-o {last_message} - < {provider_prompt_file}"
+            ),
+            capabilities=frozenset(
+                {
+                    CAPABILITY_COMMAND_PRESET,
+                    CAPABILITY_PROVIDER_PROMPT_FILE,
+                    CAPABILITY_LAST_MESSAGE_FILE,
+                    CAPABILITY_JSON_OUTPUT,
+                }
+            ),
         ),
-    ),
-    "kimi": AgentProvider(
-        id="kimi",
-        display_name="Kimi",
-        command_preset=_kimi_command_preset(),
-        capabilities=frozenset(
-            {
-                CAPABILITY_COMMAND_PRESET,
-                CAPABILITY_PROVIDER_PROMPT_FILE,
-                CAPABILITY_MCP_CONFIG_FILE,
-                CAPABILITY_STREAM_JSON_OUTPUT,
-            }
+        AgentProviderSpec(
+            id="kimi",
+            display_name="Kimi",
+            command_preset=_kimi_command_preset(),
+            capabilities=frozenset(
+                {
+                    CAPABILITY_COMMAND_PRESET,
+                    CAPABILITY_PROVIDER_PROMPT_FILE,
+                    CAPABILITY_MCP_CONFIG_FILE,
+                    CAPABILITY_STREAM_JSON_OUTPUT,
+                }
+            ),
         ),
-    ),
-}
+    )
+
+
+def _provider_spec_values(payload: Any, *, source: str) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        if "providers" not in payload:
+            return [payload]
+        providers = payload["providers"]
+        if not isinstance(providers, list):
+            raise ValueError(f"{source}: providers must be a list")
+        return providers
+    raise ValueError(f"{source}: provider specs must be an object or list")
+
+
+def load_provider_specs_from_json(
+    path: str | os.PathLike[str],
+) -> list[AgentProviderSpec]:
+    spec_path = Path(path).expanduser()
+    try:
+        text = spec_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(
+            f"{spec_path}: provider spec JSON could not be read: {exc}"
+        ) from exc
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{spec_path}: provider spec JSON is invalid: {exc}") from exc
+    values = _provider_spec_values(payload, source=str(spec_path))
+    specs: list[AgentProviderSpec] = []
+    for index, value in enumerate(values):
+        specs.append(
+            AgentProviderSpec.from_mapping(
+                value,
+                source=f"{spec_path}:providers[{index}]",
+            )
+        )
+    return specs
+
+
+def _optional_provider_spec_paths() -> list[Path]:
+    raw = os.environ.get(PROVIDER_SPECS_ENV_VAR)
+    if raw is None or not raw.strip():
+        return []
+    return [
+        Path(value.strip()).expanduser()
+        for value in raw.split(os.pathsep)
+        if value.strip()
+    ]
+
+
+def _default_registry() -> AgentProviderRegistry:
+    specs: list[AgentProviderSpec] = list(_builtin_provider_specs())
+    for path in _optional_provider_spec_paths():
+        specs.extend(load_provider_specs_from_json(path))
+    return AgentProviderRegistry.from_specs(specs)
+
+
+_REGISTRY = _default_registry()
+_PROVIDERS: dict[str, AgentProvider] = _REGISTRY.providers
+_PROVIDER_ORDER = _REGISTRY.provider_order
 
 # Mutable for tests and local overrides that patch legacy PROVIDER_COMMANDS.
-PROVIDER_COMMANDS: dict[str, str] = {
-    provider_id: provider.command_preset
-    for provider_id, provider in _PROVIDERS.items()
-    if provider.command_preset
-}
-
-
-def normalize_provider_id(provider_id: str | None) -> str:
-    return (provider_id or "custom").strip().lower() or "custom"
+PROVIDER_COMMANDS: dict[str, str] = _REGISTRY.command_templates()
 
 
 def provider_choices(*, include_custom: bool = True) -> list[str]:

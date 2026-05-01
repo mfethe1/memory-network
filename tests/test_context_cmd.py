@@ -52,6 +52,17 @@ def _write_context_fixture(root: Path) -> None:
         ).lstrip(),
         encoding="utf-8",
     )
+    other = root / "other"
+    other.mkdir()
+    (other / "outside.py").write_text(
+        textwrap.dedent(
+            """
+            def unrelated_memory_handoff() -> str:
+                return "memory handoff from outside the scoped package"
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
     (root / "README.md").write_text("# context fixture\n", encoding="utf-8")
 
 
@@ -202,6 +213,7 @@ def test_context_run_prints_json_packet(
         format="json",
         json=True,
         limit=6,
+        scope=None,
     )
 
     assert context_cmd.run(args) == 0
@@ -241,6 +253,123 @@ def test_context_cli_parser_routes_to_packet(
     assert payload["selected_paths"][0]["path"] == "pkg/memory.py"
 
 
+def test_context_cli_scope_defaults_selection_and_retrieval_to_directory(
+    tmp_path: Path, capsys
+):
+    _ready_repo(tmp_path)
+
+    assert (
+        main(
+            [
+                "context",
+                "--root",
+                str(tmp_path),
+                "--scope",
+                "pkg",
+                "memory handoff",
+                "--budget-tokens",
+                "3000",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["root"] == str(tmp_path.resolve())
+    assert payload["scope"]["path"] == "pkg"
+    assert payload["scope"]["explicit"] is True
+    assert payload["selected_paths"]
+    assert {item["path"] for item in payload["selected_paths"]} == {
+        "pkg/__init__.py",
+        "pkg/handoff.py",
+        "pkg/memory.py",
+    }
+    assert payload["matching_chunks"]
+    assert {
+        item["file_path"] for item in payload["matching_chunks"]
+    } <= {"pkg/__init__.py", "pkg/handoff.py", "pkg/memory.py"}
+
+
+def test_context_scope_omitted_preserves_unscoped_defaults(
+    tmp_path: Path, capsys
+):
+    _ready_repo(tmp_path)
+
+    assert (
+        main(
+            [
+                "context",
+                "--root",
+                str(tmp_path),
+                "memory handoff",
+                "--budget-tokens",
+                "5000",
+                "--limit",
+                "20",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["scope"]["path"] == "."
+    assert payload["scope"]["explicit"] is False
+    assert payload["selected_paths"] == []
+    assert {
+        item["file_path"] for item in payload["matching_chunks"]
+    } & {"other/outside.py"}
+
+
+def test_context_scope_must_stay_inside_root(tmp_path: Path, capsys):
+    _ready_repo(tmp_path)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+
+    assert (
+        main(
+            [
+                "context",
+                "--root",
+                str(tmp_path),
+                "--scope",
+                str(outside),
+                "memory handoff",
+                "--json",
+            ]
+        )
+        == 2
+    )
+
+    assert "error: scope must be inside root" in capsys.readouterr().out
+
+
+def test_context_selected_path_must_stay_inside_scope(tmp_path: Path, capsys):
+    _ready_repo(tmp_path)
+
+    assert (
+        main(
+            [
+                "context",
+                "--root",
+                str(tmp_path),
+                "--scope",
+                "pkg",
+                "--path",
+                "other/outside.py",
+                "memory handoff",
+                "--json",
+            ]
+        )
+        == 2
+    )
+
+    assert "error: selected path is outside scope: other/outside.py" in (
+        capsys.readouterr().out
+    )
+
+
 def test_context_run_without_index_returns_clear_error(
     tmp_path: Path, capsys
 ):
@@ -253,6 +382,7 @@ def test_context_run_without_index_returns_clear_error(
         format="json",
         json=True,
         limit=6,
+        scope=None,
     )
 
     assert context_cmd.run(args) == 2

@@ -36,7 +36,7 @@ The plugin `.mcp.json` exposes that command as the `code-index` MCP server.
 ## Start The Live Graph
 
 ```bash
-python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 8767
+python -m code_index agent-plugin start --root . --port 8767
 ```
 
 Open `http://127.0.0.1:8767/repo-graph.html`.
@@ -45,9 +45,13 @@ one yet. It also injects this source tree into `PYTHONPATH`, so the same
 script can serve another local codebase without installing `code_index` first:
 
 ```bash
-python E:/Projects/hackathon/memory-claude/plugins/code-index-agent/scripts/start_graph_server.py \
-  --root E:/Projects/other-repo --port 8767 --provider codex
+python -m code_index agent-plugin start \
+  --root E:/Projects/other-repo --scope src/auth --port 8767 --provider codex
 ```
+
+`--root` owns the repo/index. `--scope` is optional and starts graph focus,
+search, and browser task defaults inside that directory without shrinking the
+whole-repo index.
 
 Use `--refresh-index` to rescan a target that already has an index. The
 launcher checks that configured provider commands are on `PATH`; use

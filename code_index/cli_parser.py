@@ -12,6 +12,7 @@ from code_index import agent_providers
 from code_index.commands import (
     agent_adapter_cmd,
     agent_cmd,
+    agent_plugin_cmd,
     ask_cmd,
     branch_cmd,
     context_cmd,
@@ -292,6 +293,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_context)
     p_context.add_argument("task", nargs="?", help="task or question to package")
     p_context.add_argument(
+        "--scope",
+        help=(
+            "repo-relative starting directory for default selection and retrieval "
+            "(default: whole repo)"
+        ),
+    )
+    p_context.add_argument(
         "--budget-tokens",
         type=int,
         default=1200,
@@ -384,6 +392,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="repo-relative files to highlight as active agent work",
     )
     p_graph.add_argument(
+        "--scope",
+        help=(
+            "repo-relative starting directory to highlight; "
+            "--root still identifies the indexed repo"
+        ),
+    )
+    p_graph.add_argument(
         "--agent-name",
         default="Codex",
         help="agent label shown in the graph status panel (default: Codex)",
@@ -413,6 +428,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_graph_server)
     p_graph_server.add_argument("--host", default="127.0.0.1")
     p_graph_server.add_argument("--port", type=int, default=8767)
+    p_graph_server.add_argument(
+        "--scope",
+        help=(
+            "repo-relative starting directory for graph focus, search, and task "
+            "selection (default: whole repo)"
+        ),
+    )
     p_graph_server.add_argument(
         "--no-code",
         action="store_true",
@@ -635,6 +657,78 @@ def build_parser() -> argparse.ArgumentParser:
         help="finish dry-run mode with failed status",
     )
     p_agent_adapter.set_defaults(func=agent_adapter_cmd.run)
+
+    p_agent_plugin = subparsers.add_parser(
+        "agent-plugin",
+        help="start repo-scoped graph agent plugin sessions",
+    )
+    p_agent_plugin_sub = p_agent_plugin.add_subparsers(
+        dest="agent_plugin_action",
+        required=True,
+    )
+    p_agent_plugin_start = p_agent_plugin_sub.add_parser(
+        "start",
+        help="start graph-server with optional local agent dispatch",
+    )
+    p_agent_plugin_start.add_argument("--root", default=".", help="repo root to serve")
+    p_agent_plugin_start.add_argument(
+        "--scope",
+        help="starting directory inside --root for graph focus and task defaults",
+    )
+    p_agent_plugin_start.add_argument("--host", default="127.0.0.1", help="bind host")
+    p_agent_plugin_start.add_argument("--port", default="8767", help="bind port")
+    p_agent_plugin_start.add_argument(
+        "--provider",
+        choices=agent_providers.provider_choices(),
+        default="custom",
+        help="provider preset used when --agent-command is omitted",
+    )
+    p_agent_plugin_start.add_argument(
+        "--agent-command",
+        help="custom local agent command template; overrides --provider",
+    )
+    p_agent_plugin_start.add_argument(
+        "--graph-token",
+        help="optional bearer token required for browser POSTs and callbacks",
+    )
+    p_agent_plugin_start.add_argument(
+        "--command-timeout",
+        help="optional seconds before a local agent command is marked failed",
+    )
+    p_agent_plugin_start.add_argument(
+        "--max-output-events",
+        help="optional max stdout/stderr lines posted as tool events",
+    )
+    p_agent_plugin_start.add_argument(
+        "--ensure-index",
+        action="store_true",
+        default=True,
+        help="initialize .code_index/index.db in --root before starting when missing",
+    )
+    p_agent_plugin_start.add_argument(
+        "--no-ensure-index",
+        dest="ensure_index",
+        action="store_false",
+        help="fail if --root has no existing .code_index/index.db",
+    )
+    p_agent_plugin_start.add_argument(
+        "--refresh-index",
+        action="store_true",
+        help="run `code_index update --all` before starting when an index already exists",
+    )
+    p_agent_plugin_start.add_argument(
+        "--skip-provider-check",
+        action="store_true",
+        help="skip PATH checks for the selected local agent command",
+    )
+    p_agent_plugin_start.add_argument(
+        "--check-only",
+        action="store_true",
+        help="validate configuration and exit without starting graph-server",
+    )
+    p_agent_plugin_start.add_argument("--quiet", action="store_true")
+    p_agent_plugin_start.add_argument("--json", action="store_true")
+    p_agent_plugin_start.set_defaults(func=agent_plugin_cmd.run)
 
     p_run_orchestrator = subparsers.add_parser(
         "run-orchestrator",

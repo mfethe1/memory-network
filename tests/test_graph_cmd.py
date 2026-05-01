@@ -152,6 +152,42 @@ def test_graph_json_exposes_files_relations_care_and_code(
     )
 
 
+def test_graph_scope_marks_indexed_files_under_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    _write_graph_fixture(tmp_path)
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "graph",
+            "--root",
+            str(tmp_path),
+            "--scope",
+            "pkg",
+            "--format",
+            "json",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    payload = json.loads(out)
+
+    assert payload["root"] == str(tmp_path.resolve())
+    assert payload["scope"] == {"path": "pkg", "explicit": True}
+    assert payload["focus_paths"] == ["pkg/__init__.py", "pkg/low.py", "pkg/mid.py"]
+    assert payload["agent"]["active_files"] == [
+        "pkg/__init__.py",
+        "pkg/low.py",
+        "pkg/mid.py",
+    ]
+    nodes = {node["id"]: node for node in payload["nodes"]}
+    assert nodes["file:pkg/low.py"]["active_work"] is True
+    assert nodes["file:pkg/mid.py"]["active_work"] is True
+    assert nodes["file:tests/test_mid.py"]["active_work"] is False
+
+
 def test_graph_html_writes_standalone_view(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):

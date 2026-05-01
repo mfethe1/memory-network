@@ -14,7 +14,6 @@ from typing import Any
 from code_index import agent_providers
 from code_index import agent_swarm
 from code_index import config as cfg_mod
-from code_index import db_router as db_mod
 from code_index import task_gate
 from code_index.commands.graph_server_dispatch import (
     _build_task_collaboration_packet,
@@ -34,7 +33,8 @@ PREFLIGHT_TTL_SECONDS = 10 * 60
 
 
 def _task_request_from_payload(
-    payload: dict[str, Any], args: argparse.Namespace
+    payload: dict[str, Any],
+    args: argparse.Namespace,
 ) -> dict[str, Any]:
     provider = str(payload.get("provider") or "").strip().lower()
     provider_name = agent_providers.provider_display_name(
@@ -150,6 +150,12 @@ def _build_task_draft(
             },
         },
     }
+    if request.get("scope"):
+        task["scope"] = request["scope"]
+    scope = request.get("scope") or (request.get("metadata") or {}).get("scope")
+    if isinstance(scope, dict):
+        task["scope"] = scope
+        task["context_policy"]["scope"] = scope.get("path")
     if request["provider"]:
         task["provider"] = request["provider"]
     if request["parent_run_id"]:
