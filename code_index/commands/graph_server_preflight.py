@@ -15,6 +15,7 @@ from code_index import agent_providers
 from code_index import agent_swarm
 from code_index import config as cfg_mod
 from code_index import task_gate
+from code_index.commands.chat_context import normalise_chat_task
 from code_index.commands.graph_server_dispatch import (
     _build_task_collaboration_packet,
     _build_task_context_packet,
@@ -36,7 +37,8 @@ def _task_request_from_payload(
     payload: dict[str, Any],
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    provider = str(payload.get("provider") or "").strip().lower()
+    chat_context = normalise_chat_task(payload)
+    provider = chat_context["provider"]
     provider_name = agent_providers.provider_display_name(
         provider,
         default=(provider.title() if provider else ""),
@@ -47,14 +49,14 @@ def _task_request_from_payload(
         or args.agent_name
         or "Codex"
     )
-    selected_nodes = _string_list(payload.get("selected_nodes"))
+    selected_nodes = list(chat_context["selected_nodes"])
     if payload.get("node_id"):
         selected_nodes.extend(
             node
             for node in _string_list(payload.get("node_id"))
             if node not in selected_nodes
         )
-    selected_paths = _string_list(payload.get("selected_paths"))
+    selected_paths = list(chat_context["selected_paths"])
     if payload.get("path"):
         selected_paths.extend(
             path
@@ -73,6 +75,8 @@ def _task_request_from_payload(
     )
     context = {
         "selected_paths": selected_paths,
+        "selected_symbols": chat_context["selected_symbols"],
+        "edit_policy": chat_context["edit_policy"],
         "node": node,
         "source": "graph-server",
     }
@@ -103,11 +107,13 @@ def _task_request_from_payload(
     if public_swarm:
         context["swarm"] = public_swarm
     return {
-        "message": str(payload.get("message") or payload.get("prompt") or "").strip(),
+        "message": chat_context["message"],
         "provider": provider,
         "agent_name": agent_name,
         "selected_nodes": selected_nodes,
         "selected_paths": selected_paths,
+        "selected_symbols": chat_context["selected_symbols"],
+        "edit_policy": chat_context["edit_policy"],
         "node": node,
         "parent_run_id": parent_run_id,
         "run_context": run_context,
@@ -147,8 +153,11 @@ def _build_task_draft(
             "retrieval_handles": {
                 "selected_nodes": request["selected_nodes"],
                 "selected_paths": request["selected_paths"],
+                "selected_symbols": request.get("selected_symbols", []),
             },
         },
+        "selected_symbols": request.get("selected_symbols", []),
+        "edit_policy": request.get("edit_policy", "review_before_edit"),
     }
     if request.get("scope"):
         task["scope"] = request["scope"]
@@ -178,7 +187,62 @@ def _build_task_draft(
         selected_paths=request["selected_paths"],
         node=request["node"],
     )
+    task["context_preview"] = _build_context_preview(
+        config,
+        selected_paths=list(request["selected_paths"]),
+        selected_nodes=list(request["selected_nodes"]),
+        graph_context=task["graph_context"],
+        task=request["message"],
+    )
     return task
+
+
+def _build_context_preview(
+    config: cfg_mod.Config,
+    *,
+    selected_paths: list[str],
+    selected_nodes: list[str],
+    graph_context: dict[str, Any],
+    task: str = "",
+) -> dict[str, Any]:
+    if not selected_paths:
+        return {}
+    primary = selected_paths[0]
+    try:
+        from code_index.commands.context_cmd import build_context_packet
+
+        packet = build_context_packet(
+            config,
+            task,
+            budget_tokens=600,
+            selected_nodes=selected_nodes,
+            selected_paths=selected_paths,
+            limit=5,
+        )
+    except Exception:
+        packet = {}
+
+    file_info: dict[str, Any] = {}
+    for item in packet.get("selected_paths") or []:
+        if isinstance(item, dict) and item.get("path") == primary:
+            file_info = item
+            break
+
+    related_files = [
+        str(node.get("path"))
+        for node in graph_context.get("related_nodes") or []
+        if isinstance(node, dict) and node.get("path")
+    ][:8]
+
+    return {
+        "selected_file": primary,
+        "language": file_info.get("language"),
+        "parse_status": file_info.get("parse_status"),
+        "symbols": list(file_info.get("symbols") or [])[:10],
+        "chunks": list(file_info.get("chunks") or [])[:3],
+        "related_files": related_files,
+        "affected_tests": list(packet.get("tests") or []),
+    }
 
 
 def _claim_overlaps(

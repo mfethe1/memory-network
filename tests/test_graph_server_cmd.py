@@ -41,6 +41,125 @@ def _request_json(
         return json.loads(response.read().decode("utf-8"))
 
 
+class _GraphServerHarness:
+    def __init__(
+        self,
+        *,
+        root: Path,
+        server: ThreadingHTTPServer,
+        thread: threading.Thread,
+        capsys,
+    ) -> None:
+        self.root = root
+        self.server = server
+        self.thread = thread
+        self.capsys = capsys
+        self.base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def __enter__(self) -> "_GraphServerHarness":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def post_json(
+        self,
+        path: str,
+        payload: dict,
+        *,
+        headers: dict | None = None,
+        expect_status: int = 200,
+    ) -> dict:
+        return self._request(
+            path,
+            payload=payload,
+            headers=headers,
+            expect_status=expect_status,
+        )
+
+    def get_json(
+        self,
+        path: str,
+        *,
+        headers: dict | None = None,
+        expect_status: int = 200,
+    ) -> dict:
+        return self._request(path, headers=headers, expect_status=expect_status)
+
+    def reindex(self) -> None:
+        assert main(["update", "--root", str(self.root), "--json"]) == 0
+        self.capsys.readouterr()
+
+    def _request(
+        self,
+        path: str,
+        *,
+        payload: dict | None = None,
+        headers: dict | None = None,
+        expect_status: int = 200,
+    ) -> dict:
+        data = None
+        request_headers = dict(headers or {})
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            request_headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=data,
+            headers=request_headers,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                status = int(response.status)
+                body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            status = int(exc.code)
+            body = exc.read().decode("utf-8")
+        assert status == expect_status
+        return json.loads(body)
+
+
+def _make_server(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    *,
+    scope: str | None = None,
+) -> _GraphServerHarness:
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    monkeypatch.delenv("CODE_INDEX_GRAPH_TOKEN", raising=False)
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+        scope=scope,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return _GraphServerHarness(
+        root=tmp_path,
+        server=server,
+        thread=thread,
+        capsys=capsys,
+    )
+
+
 def _request_json_with_headers(
     url: str, payload: dict | None = None, headers: dict | None = None
 ) -> tuple[dict, dict]:
@@ -422,6 +541,83 @@ def test_graph_server_scope_rejects_task_selection_outside_scope(
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_preflight_returns_edit_policy_in_draft(
+    tmp_path: Path, capsys, monkeypatch
+):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text(
+        "def value():\n    return 1\n",
+        encoding="utf-8",
+    )
+
+    with _make_server(tmp_path, capsys, monkeypatch) as server:
+        resp = server.post_json(
+            "/api/agent-task-preflight",
+            {
+                "message": "do it",
+                "selected_paths": [],
+                "edit_policy": "direct_edit",
+                "provider": "codex",
+            },
+        )
+
+    assert resp["draft"]["edit_policy"] == "direct_edit"
+
+
+def test_preflight_selected_symbols_threaded_to_draft(
+    tmp_path: Path, capsys, monkeypatch
+):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text(
+        "def value():\n    return 1\n",
+        encoding="utf-8",
+    )
+    sym = {
+        "symbol_uid": "uid1",
+        "canonical_name": "pkg.a.value",
+        "kind": "function",
+        "def_file": "pkg/a.py",
+        "def_line": 1,
+    }
+
+    with _make_server(tmp_path, capsys, monkeypatch) as server:
+        resp = server.post_json(
+            "/api/agent-task-preflight",
+            {
+                "message": "review",
+                "selected_symbols": [sym],
+                "selected_paths": ["pkg/a.py"],
+            },
+        )
+
+    symbols = resp["draft"].get("selected_symbols", [])
+    assert any(symbol["canonical_name"] == "pkg.a.value" for symbol in symbols)
+
+
+def test_preflight_returns_context_preview_for_selected_path(
+    tmp_path: Path, capsys, monkeypatch
+):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "demo.py").write_text(
+        "def hello():\n    return 'hi'\n",
+        encoding="utf-8",
+    )
+
+    with _make_server(tmp_path, capsys, monkeypatch) as server:
+        server.reindex()
+        resp = server.post_json(
+            "/api/agent-task-preflight",
+            {
+                "message": "review",
+                "selected_paths": ["pkg/demo.py"],
+                "edit_policy": "review_before_edit",
+            },
+        )
+
+    preview = resp["draft"].get("context_preview", {})
+    assert preview.get("selected_file") == "pkg/demo.py"
 
 
 def test_graph_server_serves_graph_and_records_notes_and_events(
