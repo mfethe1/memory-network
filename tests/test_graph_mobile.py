@@ -303,6 +303,71 @@ def test_mobile_runs_surface_agent_streams_and_working_context():
     assert "Open chat" in html
 
 
+def test_mobile_open_stream_surfaces_selected_run_timeline_before_run_list():
+    html = _render_mobile_html(_payload())
+
+    runs_panel = re.search(
+        r"<section[^>]+id=[\"']panel-runs[\"'][\s\S]*?</section>",
+        html,
+        re.I,
+    )
+    assert runs_panel is not None
+    panel = runs_panel.group(0)
+
+    selected_stream = panel.index('id="selected-stream"')
+    run_list = panel.index('id="runs-list"')
+    assert selected_stream < run_list
+    assert 'aria-live="polite"' in panel
+    assert "renderSelectedStream" in html
+    assert "focusRunStream" in html
+    assert "openRun(run.run_id, { focusStream: true })" in html
+    assert "stream-card selected" in html
+    assert "Message run" in html
+
+
+def test_mobile_chat_has_selected_run_reply_target():
+    html = _render_mobile_html(_payload())
+
+    task_panel = re.search(
+        r"<section[^>]+id=[\"']panel-task[\"'][\s\S]*?</section>",
+        html,
+        re.I,
+    )
+    assert task_panel is not None
+    panel = task_panel.group(0)
+
+    run_context = panel.index('id="chat-run-context"')
+    message = panel.index('id="task-message"')
+    assert run_context < message
+    assert 'id="chat-run-context-title"' in panel
+    assert 'id="chat-run-context-stream"' in panel
+    assert 'id="chat-run-context-clear"' in panel
+    assert "updateComposerRunContext" in html
+    assert "clearSelectedRun" in html
+    assert "Send to run" in html
+
+
+def test_mobile_file_context_chips_have_preview_actions():
+    html = _render_mobile_html(_payload())
+
+    files_panel = re.search(
+        r"<section[^>]+id=[\"']panel-files[\"'][\s\S]*?</section>",
+        html,
+        re.I,
+    )
+    assert files_panel is not None
+    panel = files_panel.group(0)
+
+    selected_chips = panel.index('id="selected-file-chips"')
+    context_preview = panel.index('id="file-context-preview"')
+    assert selected_chips < context_preview
+    assert 'aria-label="Selected file context preview"' in panel
+    assert "renderFileContextPreview" in html
+    assert "previewPath(path)" in html
+    assert "fileNodeForPath" in html
+    assert "node.code.content" in html
+
+
 def test_mobile_graph_page_fetches_repo_graph_json_on_demand():
     html = _render_mobile_html(_payload())
 

@@ -27,6 +27,34 @@ DEFAULT_BUDGET_TOKENS = 1200
 DEFAULT_LIMIT = 8
 PREVIEW_CHARS = 420
 
+_COMMAND_REFERENCE: dict[str, Any] = {
+    "cli_commands": [
+        {"name": "code_index context", "purpose": "Build task-aware context packet for agent handoff"},
+        {"name": "code_index graph", "purpose": "Interactive file/directory graph with importance scores"},
+        {"name": "code_index grep", "purpose": "Fast lexical search (ripgrep fast path)"},
+        {"name": "code_index query", "purpose": "FTS-ranked retrieval over indexed chunks"},
+        {"name": "code_index symbol", "purpose": "Look up symbols by canonical or display name"},
+        {"name": "code_index impact", "purpose": "Blast-radius analysis (callers, subclasses, importers)"},
+        {"name": "code_index tests", "purpose": "Affected-tests lookup for a symbol"},
+        {"name": "code_index doctor", "purpose": "Index health, coverage, and drift report"},
+        {"name": "code_index ask", "purpose": "Natural-language query broker"},
+        {"name": "code_index update", "purpose": "Reindex changed or all files"},
+        {"name": "code_index mcp-serve", "purpose": "Start MCP server for agent tool access"},
+    ],
+    "mcp_tools": [
+        {"name": "search_text", "purpose": "Lexical fast path (ripgrep; python-re fallback)"},
+        {"name": "search_query", "purpose": "BM25 FTS retrieval over chunks"},
+        {"name": "search_ast", "purpose": "Tree-sitter structural queries for Python"},
+        {"name": "find_symbol", "purpose": "Symbol lookup with optional call-site references"},
+        {"name": "impact", "purpose": "Blast-radius via inbound calls/inherits/contains/imports"},
+        {"name": "affected_tests", "purpose": "Tests reaching a symbol + pytest invocation"},
+        {"name": "doctor", "purpose": "Health snapshot + FTS drift + rebuild recommendation"},
+        {"name": "retrieval_broker", "purpose": "Brokered retrieval over query + graph context"},
+        {"name": "graph_context", "purpose": "Budgeted layered graph context for agent tasks"},
+        {"name": "code_graph", "purpose": "Full repo graph with importance and care guidance"},
+    ],
+}
+
 
 def build_context_packet(
     config: cfg_mod.Config,
@@ -104,6 +132,7 @@ def build_context_packet(
                 file_limit=file_limit,
             ),
             "graph_notes": notes,
+            "command_reference": _compact_command_reference(limit=limit),
             "handoff_markdown": "",
             "budget": {
                 "budget_tokens": budget_tokens,
@@ -614,6 +643,15 @@ def _compact_activity(
     }
 
 
+def _compact_command_reference(*, limit: int) -> dict[str, Any]:
+    if limit <= 0:
+        return {"cli_commands": [], "mcp_tools": []}
+    return {
+        "cli_commands": _COMMAND_REFERENCE["cli_commands"][: max(limit, 4)],
+        "mcp_tools": _COMMAND_REFERENCE["mcp_tools"][: max(limit, 4)],
+    }
+
+
 def _compact_notes(block: dict[str, Any], *, limit: int) -> dict[str, Any]:
     items = [_compact_note(item) for item in list(block.get("items") or [])]
     items = sorted(items, key=lambda item: item.get("node_id") or "")
@@ -733,6 +771,20 @@ def _build_handoff_markdown(packet: dict[str, Any]) -> str:
             if text:
                 lines.append(f"- {note.get('node_id')}: {text}")
 
+    cmd_ref = packet.get("command_reference") or {}
+    cli_cmds = cmd_ref.get("cli_commands") or []
+    mcp_tools = cmd_ref.get("mcp_tools") or []
+    if cli_cmds or mcp_tools:
+        lines.extend(["", "## Command Reference"])
+        if cli_cmds:
+            lines.extend(["", "### Common CLI Commands"])
+            for item in cli_cmds:
+                lines.append(f"- `{item['name']}` — {item['purpose']}")
+        if mcp_tools:
+            lines.extend(["", "### MCP Tools"])
+            for item in mcp_tools:
+                lines.append(f"- `{item['name']}` — {item['purpose']}")
+
     return "\n".join(lines).strip() + "\n"
 
 
@@ -787,6 +839,9 @@ def _trim_to_budget(packet: dict[str, Any], budget_tokens: int) -> dict[str, Any
                 if item.get("node_id")
             }
             continue
+        if _pop_command_reference_last(packet):
+            was_truncated = True
+            continue
         markdown = packet.get("handoff_markdown") or ""
         if len(markdown) > 220:
             was_truncated = True
@@ -798,6 +853,18 @@ def _trim_to_budget(packet: dict[str, Any], budget_tokens: int) -> dict[str, Any
     if was_truncated:
         packet["budget"]["truncated"] = True
     return packet
+
+
+def _pop_command_reference_last(packet: dict[str, Any]) -> bool:
+    ref = packet.get("command_reference")
+    if not isinstance(ref, dict):
+        return False
+    for key in ("cli_commands", "mcp_tools"):
+        items = ref.get(key)
+        if isinstance(items, list) and items:
+            items.pop()
+            return True
+    return False
 
 
 def _pop_last(packet: dict[str, Any], path: list[str]) -> bool:

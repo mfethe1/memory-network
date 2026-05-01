@@ -386,6 +386,34 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
       background: linear-gradient(180deg, rgba(45, 212, 191, 0.1), var(--panel) 58%);
       border-color: rgba(45, 212, 191, 0.42);
     }
+    .run-context-bar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      border: 1px solid rgba(45, 212, 191, 0.42);
+      border-radius: 8px;
+      background: rgba(45, 212, 191, 0.09);
+      padding: 10px;
+    }
+    .run-context-bar strong {
+      display: block;
+      color: var(--text);
+      font-size: 14px;
+      overflow-wrap: anywhere;
+    }
+    .run-context-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .run-context-actions button {
+      min-height: 38px;
+      padding: 7px 10px;
+      font-size: 13px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
     .chat-form textarea {
       min-height: clamp(156px, 30svh, 260px);
       font-size: 16px;
@@ -422,6 +450,10 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     .stream-card.active {
       border-color: rgba(52, 211, 153, 0.34);
     }
+    .stream-card.selected {
+      border-color: var(--accent);
+      background: rgba(45, 212, 191, 0.09);
+    }
     .chat-message.stream {
       border-color: rgba(143, 183, 255, 0.28);
     }
@@ -434,6 +466,13 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     .stream-list {
       display: grid;
       gap: 9px;
+    }
+    .selected-stream-panel {
+      border-color: rgba(45, 212, 191, 0.48);
+    }
+    .stream-event-list {
+      display: grid;
+      gap: 8px;
     }
     .work-list {
       display: flex;
@@ -536,6 +575,28 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     .find-result-row code,
     .find-result-row span {
       overflow-wrap: anywhere;
+    }
+    .file-context-preview {
+      display: grid;
+      gap: 8px;
+    }
+    .context-card {
+      display: grid;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #11161d;
+      padding: 10px;
+    }
+    .code-preview {
+      max-height: 220px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #090d13;
+      color: var(--text);
+      padding: 10px;
+      white-space: pre-wrap;
     }
     .stat-grid {
       display: grid;
@@ -922,6 +983,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
             <p class="meta">Search, select paths, then jump into chat with that context.</p>
           </div>
           <div class="chip-row" id="selected-file-chips"></div>
+          <div class="file-context-preview" id="file-context-preview" aria-label="Selected file context preview"></div>
           <div class="toolbar">
             <button type="button" id="files-open-chat">Open chat</button>
             <button type="button" id="files-clear">Clear files</button>
@@ -959,6 +1021,16 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
             </div>
             <div class="chip-row" id="chat-file-chips"></div>
           </div>
+          <div class="run-context-bar" id="chat-run-context" hidden>
+            <div>
+              <p class="meta">Reply target</p>
+              <strong id="chat-run-context-title">No Agent Run selected</strong>
+            </div>
+            <div class="run-context-actions">
+              <button type="button" id="chat-run-context-stream">Stream</button>
+              <button type="button" id="chat-run-context-clear">Clear</button>
+            </div>
+          </div>
           <div class="find-results" id="mobile-find-results" hidden></div>
           <label for="task-message">Message
             <textarea id="task-message" name="message" placeholder="Ask the agent to inspect, change, or explain the selected files" aria-label="Agent Task message" required></textarea>
@@ -990,7 +1062,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
           <div class="preflight-box" id="preflight-box" aria-live="polite"></div>
           <div class="form-actions">
             <button class="primary" id="task-submit" type="submit">Submit task</button>
-            <button type="button" id="task-send-run-message">Send to open run</button>
+            <button type="button" id="task-send-run-message">Send to run</button>
             <button type="button" id="task-reset">Reset</button>
           </div>
         </form>
@@ -1013,7 +1085,8 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
           <button type="button" id="clear-transcript">Clear transcript</button>
         </div>
         <div class="status" id="runs-status" aria-live="polite">Select a run to inspect its transcript.</div>
-        <section class="stream-panel" aria-labelledby="agent-streams-title">
+        <div class="stream-panel selected-stream-panel" id="selected-stream" aria-labelledby="selected-stream-title" aria-live="polite" tabindex="-1"></div>
+        <div class="stream-panel" aria-labelledby="agent-streams-title">
           <div class="section-row">
             <div>
               <h2 id="agent-streams-title">Agent streams</h2>
@@ -1022,7 +1095,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
             <button type="button" data-open-view="task">Open chat</button>
           </div>
           <div class="stream-list" id="agent-streams" aria-label="Agent streams and current work"></div>
-        </section>
+        </div>
         <div class="run-list" id="runs-list" aria-label="Agent Runs"></div>
         <div class="transcript" id="run-transcript" aria-label="Selected Agent Run transcript"></div>
       </section>
@@ -1133,10 +1206,15 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     searchStatus: document.getElementById("search-status"),
     searchResults: document.getElementById("search-results"),
     selectedFileChips: document.getElementById("selected-file-chips"),
+    fileContextPreview: document.getElementById("file-context-preview"),
     chatFileChips: document.getElementById("chat-file-chips"),
     chatSelectedCount: document.getElementById("chat-selected-count"),
     chatAddFiles: document.getElementById("chat-add-files"),
     chatClearFiles: document.getElementById("chat-clear-files"),
+    chatRunContext: document.getElementById("chat-run-context"),
+    chatRunContextTitle: document.getElementById("chat-run-context-title"),
+    chatRunContextStream: document.getElementById("chat-run-context-stream"),
+    chatRunContextClear: document.getElementById("chat-run-context-clear"),
     findResults: document.getElementById("mobile-find-results"),
     chatHistory: document.getElementById("chat-history"),
     chatHistoryClear: document.getElementById("chat-history-clear"),
@@ -1154,6 +1232,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     taskStatus: document.getElementById("task-status"),
     preflightBox: document.getElementById("preflight-box"),
     runsStatus: document.getElementById("runs-status"),
+    selectedStream: document.getElementById("selected-stream"),
     agentStreams: document.getElementById("agent-streams"),
     runsList: document.getElementById("runs-list"),
     runTranscript: document.getElementById("run-transcript"),
@@ -1171,9 +1250,12 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     renderShell();
     renderProviders();
     renderSelectedFiles();
+    renderFileContextPreview();
+    updateComposerRunContext();
     renderBoard();
     syncChatHistoryFromRuns();
     renderChatHistory();
+    renderSelectedStream();
     renderAgentStreams();
     renderRuns();
     renderDebug();
@@ -1339,7 +1421,11 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     const panel = document.getElementById(`panel-${tab}`);
     if (panel) panel.focus({ preventScroll: true });
     if (tab === "graph") loadGraph({ quiet: true });
-    if (tab === "files" || tab === "task") renderSelectedFiles();
+    if (tab === "files" || tab === "task") {
+      renderSelectedFiles();
+      renderFileContextPreview();
+      updateComposerRunContext();
+    }
     if (tab === "runs") renderRuns();
     if (tab === "debug") renderDebug();
   }
@@ -1361,6 +1447,10 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     els.chatAddFiles.addEventListener("click", () => openFilePicker());
     els.filesClear.addEventListener("click", () => clearSelectedPaths());
     els.chatClearFiles.addEventListener("click", () => clearSelectedPaths());
+    els.chatRunContextStream.addEventListener("click", () => {
+      if (state.selectedRunId) openRun(state.selectedRunId, { focusStream: true });
+    });
+    els.chatRunContextClear.addEventListener("click", () => clearSelectedRun());
     els.chatHistoryClear.addEventListener("click", () => {
       state.chatMessages = [];
       state.chatMessageKeys = new Set();
@@ -1373,6 +1463,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     els.clearTranscript.addEventListener("click", () => {
       state.transcript = null;
       renderTranscript();
+      renderSelectedStream();
       setText(els.runsStatus, "Transcript cleared.");
     });
     els.clearSearch.addEventListener("click", () => {
@@ -1422,6 +1513,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     state.selectedPaths = [];
     syncSelectedPathsInput();
     renderSelectedFiles();
+    renderFileContextPreview();
     renderGraph();
   }
 
@@ -1512,6 +1604,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
       state.lastError = "";
       buildGraphLayout(payload);
       renderGraph();
+      renderFileContextPreview();
       if (!quiet) setText(els.graphStatus, "Graph loaded. Use two fingers to zoom.");
     } catch (err) {
       state.lastError = err && err.message ? err.message : "Graph load failed";
@@ -1869,13 +1962,13 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     actions.className = "card-actions";
     const open = document.createElement("button");
     open.type = "button";
-    open.textContent = "Open";
-    open.setAttribute("aria-label", `Open Agent Run ${run.run_id || ""}`);
-    open.addEventListener("click", () => openRun(run.run_id));
+    open.textContent = "Open stream";
+    open.setAttribute("aria-label", `Open Agent Run stream ${run.run_id || ""}`);
+    open.addEventListener("click", () => openRun(run.run_id, { focusStream: true }));
     const chat = document.createElement("button");
     chat.type = "button";
-    chat.textContent = "Open chat";
-    chat.setAttribute("aria-label", `Open chat for Agent Run ${run.run_id || ""}`);
+    chat.textContent = "Message run";
+    chat.setAttribute("aria-label", `Message Agent Run ${run.run_id || ""}`);
     chat.addEventListener("click", () => selectRunForChat(run));
     const cancel = document.createElement("button");
     cancel.type = "button";
@@ -1911,6 +2004,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
       runs.forEach(run => els.runsList.appendChild(runCard(run)));
     }
     setText(els.runsStatus, `${runs.length} Agent Runs loaded.`);
+    renderSelectedStream();
     renderAgentStreams();
     renderTranscript();
   }
@@ -1944,6 +2038,12 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
   async function openRun(runId, options) {
     if (!runId) return;
     state.selectedRunId = runId;
+    updateComposerRunContext();
+    renderSelectedStream();
+    renderAgentStreams();
+    if (options && options.focusStream && state.tab !== "runs") {
+      setTab("runs");
+    }
     setText(els.runsStatus, `Loading ${runId}.`);
     try {
       const transcript = await requestJson(apiRunPath(runId));
@@ -1952,15 +2052,31 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
       syncChatHistoryFromTranscript(transcript);
       renderTranscript();
       renderChatHistory();
+      updateComposerRunContext();
+      renderSelectedStream();
       renderAgentStreams();
       if (!(options && options.stayOnCurrentTab)) {
         setTab("runs");
       }
+      if (options && options.focusStream) {
+        focusRunStream();
+      }
     } catch (err) {
       state.lastError = err && err.message ? err.message : "Run load failed";
       setText(els.runsStatus, state.lastError);
+      renderSelectedStream();
+      renderAgentStreams();
       renderDebug();
     }
+  }
+
+  function focusRunStream() {
+    window.setTimeout(() => {
+      if (els.selectedStream) {
+        els.selectedStream.scrollIntoView({ block: "start", behavior: "smooth" });
+        els.selectedStream.focus({ preventScroll: true });
+      }
+    }, 0);
   }
 
   async function cancelRun(runId, button) {
@@ -2075,7 +2191,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
         const stream = document.createElement("button");
         stream.type = "button";
         stream.textContent = "Open stream";
-        stream.addEventListener("click", () => openRun(message.run_id));
+        stream.addEventListener("click", () => openRun(message.run_id, { focusStream: true }));
         const reply = document.createElement("button");
         reply.type = "button";
         reply.textContent = "Reply";
@@ -2089,6 +2205,145 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
       }
       els.chatHistory.appendChild(card);
     });
+  }
+
+  function renderSelectedStream() {
+    if (!els.selectedStream) return;
+    clear(els.selectedStream);
+    const run = selectedRun();
+    const title = document.createElement("div");
+    title.className = "section-row";
+    const titleText = document.createElement("div");
+    const heading = document.createElement("h2");
+    heading.id = "selected-stream-title";
+    heading.textContent = run ? runTitle(run) : "Selected stream";
+    const meta = document.createElement("p");
+    meta.className = "meta";
+    meta.textContent = run
+      ? compactText(run.prompt || run.message || "No prompt recorded.", 180)
+      : "No Agent Run selected.";
+    titleText.append(heading, meta);
+    const actions = document.createElement("div");
+    actions.className = "run-context-actions";
+    const message = document.createElement("button");
+    message.type = "button";
+    message.textContent = "Message run";
+    message.disabled = !run;
+    message.addEventListener("click", () => {
+      if (run) selectRunForChat(run);
+    });
+    const refresh = document.createElement("button");
+    refresh.type = "button";
+    refresh.textContent = "Refresh";
+    refresh.disabled = !state.selectedRunId;
+    refresh.addEventListener("click", () => {
+      if (state.selectedRunId) openRun(state.selectedRunId, { focusStream: true });
+    });
+    actions.append(message, refresh);
+    title.append(titleText, actions);
+    els.selectedStream.appendChild(title);
+    if (!run) return;
+
+    const badges = document.createElement("div");
+    badges.className = "badge-row";
+    badges.appendChild(badge(run.status || "working", statusClass(run.status)));
+    if (run.run_health && run.run_health.health) {
+      badges.appendChild(badge(`health ${run.run_health.health}`, statusClass(run.run_health.health)));
+    }
+    if (run.run_id) badges.appendChild(badge(String(run.run_id).slice(0, 8), ""));
+    els.selectedStream.appendChild(badges);
+
+    const files = workingFilesForRun(run);
+    const workList = document.createElement("div");
+    workList.className = "work-list";
+    if (!files.length) {
+      const empty = document.createElement("span");
+      empty.className = "meta";
+      empty.textContent = "No files attached.";
+      workList.appendChild(empty);
+    } else {
+      files.slice(0, 8).forEach(path => {
+        const chip = document.createElement("span");
+        chip.className = "chip";
+        const label = document.createElement("span");
+        label.textContent = path;
+        const preview = document.createElement("button");
+        preview.type = "button";
+        preview.textContent = "View";
+        preview.setAttribute("aria-label", `Preview ${path}`);
+        preview.addEventListener("click", () => previewPath(path));
+        chip.append(label, preview);
+        workList.appendChild(chip);
+      });
+    }
+    els.selectedStream.appendChild(workList);
+
+    const events = selectedRunEvents(run.run_id);
+    const eventList = document.createElement("div");
+    eventList.className = "stream-event-list";
+    if (!events.length) {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No events recorded for this run yet.";
+      eventList.appendChild(empty);
+    } else {
+      events.slice(-24).forEach(event => {
+        eventList.appendChild(streamEventCard(event));
+      });
+    }
+    els.selectedStream.appendChild(eventList);
+  }
+
+  function streamEventCard(event) {
+    const card = document.createElement("article");
+    card.className = "event-card";
+    const top = document.createElement("div");
+    top.className = "badge-row";
+    top.appendChild(badge(event.event_type || "event", statusClass(event.event_type)));
+    if (event.timestamp) top.appendChild(badge(event.timestamp, ""));
+    const body = document.createElement("p");
+    body.className = "stream-body";
+    body.textContent = event.message || event.file_path || "No message";
+    card.append(top, body);
+    if (event.file_path) {
+      const file = document.createElement("div");
+      file.className = "run-detail mono";
+      file.textContent = event.file_path;
+      card.appendChild(file);
+    }
+    return card;
+  }
+
+  function selectedRunEvents(runId) {
+    if (!runId) return [];
+    const transcriptRunId = state.transcript && state.transcript.run && state.transcript.run.run_id;
+    if (transcriptRunId === runId && Array.isArray(state.transcript.events)) {
+      return state.transcript.events.slice();
+    }
+    return (state.agentEvents || [])
+      .filter(event => event && event.run_id === runId)
+      .slice()
+      .reverse();
+  }
+
+  function selectedRun() {
+    const runId = state.selectedRunId;
+    if (!runId) return null;
+    if (state.transcript && state.transcript.run && state.transcript.run.run_id === runId) {
+      return state.transcript.run;
+    }
+    const run = flattenRuns().find(item => item && item.run_id === runId);
+    if (run) return run;
+    const event = (state.agentEvents || []).find(item => item && item.run_id === runId);
+    if (event) {
+      return {
+        run_id: runId,
+        agent_name: event.agent_name || "Agent",
+        status: event.run_status || "working",
+        prompt: ""
+      };
+    }
+    return { run_id: runId, agent_name: "Agent", status: "working", prompt: "" };
   }
 
   function renderAgentStreams() {
@@ -2106,7 +2361,8 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
       const latest = latestEventForRun(run);
       const files = workingFilesForRun(run);
       const card = document.createElement("article");
-      card.className = `stream-card ${canCancel(run) ? "active" : ""}`.trim();
+      const streamClass = run.run_id === state.selectedRunId ? "stream-card selected" : "stream-card";
+      card.className = `${streamClass} ${canCancel(run) ? "active" : ""}`.trim();
       const title = document.createElement("div");
       title.className = "run-title";
       title.textContent = runTitle(run);
@@ -2142,10 +2398,10 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
       const open = document.createElement("button");
       open.type = "button";
       open.textContent = "Open stream";
-      open.addEventListener("click", () => openRun(run.run_id));
+      open.addEventListener("click", () => openRun(run.run_id, { focusStream: true }));
       const chat = document.createElement("button");
       chat.type = "button";
-      chat.textContent = "Open chat";
+      chat.textContent = "Message run";
       chat.addEventListener("click", () => selectRunForChat(run));
       actions.append(open, chat);
       card.append(title, badges, body, workList, actions);
@@ -2256,6 +2512,8 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     renderBoard();
     renderRuns();
     renderChatHistory();
+    updateComposerRunContext();
+    renderSelectedStream();
     renderAgentStreams();
     renderDebug();
   }
@@ -2268,8 +2526,39 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     });
     syncSelectedPathsInput();
     renderSelectedFiles();
+    renderFileContextPreview();
+    updateComposerRunContext();
+    renderSelectedStream();
+    renderAgentStreams();
     openChatComposer();
     setText(els.taskStatus, `Replying to ${runTitle(run)}.`);
+  }
+
+  function updateComposerRunContext() {
+    if (!els.chatRunContext) return;
+    const run = selectedRun();
+    if (!run) {
+      els.chatRunContext.hidden = true;
+      setText(els.chatRunContextTitle, "No Agent Run selected");
+      if (els.taskSendRunMessage) {
+        els.taskSendRunMessage.textContent = "Send to run";
+      }
+      return;
+    }
+    els.chatRunContext.hidden = false;
+    setText(els.chatRunContextTitle, `${runTitle(run)} - ${run.status || "working"}`);
+    if (els.taskSendRunMessage) {
+      const shortId = run.run_id ? String(run.run_id).slice(0, 8) : "run";
+      els.taskSendRunMessage.textContent = `Send to ${shortId}`;
+    }
+  }
+
+  function clearSelectedRun() {
+    state.selectedRunId = null;
+    updateComposerRunContext();
+    renderSelectedStream();
+    renderAgentStreams();
+    setText(els.taskStatus, "No Agent Run selected.");
   }
 
   function workingFilesForRun(run) {
@@ -2406,15 +2695,98 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
         chip.className = "chip";
         const label = document.createElement("span");
         label.textContent = path;
+        const preview = document.createElement("button");
+        preview.type = "button";
+        preview.textContent = "View";
+        preview.setAttribute("aria-label", `Preview ${path}`);
+        preview.addEventListener("click", () => previewPath(path));
         const remove = document.createElement("button");
         remove.type = "button";
         remove.textContent = "x";
         remove.setAttribute("aria-label", `Remove ${path}`);
         remove.addEventListener("click", () => removeSelectedPath(path));
-        chip.append(label, remove);
+        chip.append(label, preview, remove);
         target.appendChild(chip);
       });
     });
+    renderFileContextPreview();
+  }
+
+  function renderFileContextPreview() {
+    if (!els.fileContextPreview) return;
+    clear(els.fileContextPreview);
+    const paths = state.selectedPaths.slice();
+    if (!paths.length) {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No file context selected.";
+      els.fileContextPreview.appendChild(empty);
+      return;
+    }
+    paths.slice(0, 5).forEach(path => {
+      els.fileContextPreview.appendChild(fileContextCard(path));
+    });
+  }
+
+  function fileContextCard(path) {
+    const node = fileNodeForPath(path);
+    const card = document.createElement("article");
+    card.className = "context-card";
+    const title = document.createElement("div");
+    title.className = "run-title mono";
+    title.textContent = path;
+    const badges = document.createElement("div");
+    badges.className = "badge-row";
+    if (node && node.language) badges.appendChild(badge(node.language, ""));
+    if (node && node.care_level) badges.appendChild(badge(node.care_level, statusClass(node.care_level)));
+    const symbolCount = node && Array.isArray(node.symbols) ? node.symbols.length : 0;
+    if (symbolCount) badges.appendChild(badge(`${symbolCount} symbols`, ""));
+    const summary = document.createElement("p");
+    summary.className = "run-detail";
+    summary.textContent = compactText(
+      (node && node.summary) || (node && node.role_label) || "Graph context will be attached when this path is sent.",
+      220
+    );
+    card.append(title, badges, summary);
+    const codeContent = node && node.code && node.code.content ? String(node.code.content) : "";
+    if (codeContent) {
+      const pre = document.createElement("pre");
+      pre.className = "code-preview mono";
+      pre.textContent = codeContent.length > 1400 ? `${codeContent.slice(0, 1400)}...` : codeContent;
+      card.appendChild(pre);
+    }
+    const actions = document.createElement("div");
+    actions.className = "card-actions";
+    const ask = document.createElement("button");
+    ask.type = "button";
+    ask.textContent = "Ask";
+    ask.addEventListener("click", () => {
+      selectPath(path, { focusChat: true });
+    });
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", () => removeSelectedPath(path));
+    actions.append(ask, remove);
+    card.appendChild(actions);
+    return card;
+  }
+
+  function fileNodeForPath(path) {
+    const clean = String(path || "").trim();
+    if (!clean) return null;
+    const payloads = [state.graphPayload, data].filter(Boolean);
+    for (const payload of payloads) {
+      const nodes = Array.isArray(payload && payload.nodes) ? payload.nodes : [];
+      const match = nodes.find(node => node && (node.path === clean || node.id === `file:${clean}`));
+      if (match) return match;
+    }
+    return null;
+  }
+
+  function previewPath(path) {
+    selectPath(path, { focusFiles: true });
+    renderFileContextPreview();
   }
 
   function selectedCountLabel(count) {
@@ -2524,6 +2896,8 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
         syncChatHistoryFromTranscript(result.transcript);
       }
       updateChatMessage(chatKey, { run_id: runId, status: "queued" });
+      updateComposerRunContext();
+      renderSelectedStream();
       setText(els.taskStatus, `Follow-up queued for ${runId}.`);
       await openRun(runId, { stayOnCurrentTab: true });
       setTab("task");
@@ -2588,6 +2962,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
       if (result.run) {
         state.selectedRunId = result.run.run_id || state.selectedRunId;
         syncChatHistoryFromRuns([result.run]);
+        updateComposerRunContext();
         updateChatMessage(chatKey, {
           run_id: result.run.run_id || null,
           agent_name: result.run.agent_name || payload.agent_name,
@@ -2605,6 +2980,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
       renderBoard();
       renderRuns();
       renderChatHistory();
+      renderSelectedStream();
       renderAgentStreams();
       setText(els.taskStatus, `Agent Run queued: ${result.run && result.run.run_id ? result.run.run_id : "created"}.`);
       setTab("task");

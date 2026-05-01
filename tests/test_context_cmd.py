@@ -161,6 +161,19 @@ def test_build_context_packet_includes_context_sources(tmp_path: Path):
     assert packet["graph_notes"]["count"] == 1
     assert "Task: memory handoff" in packet["handoff_markdown"]
 
+    assert "command_reference" in packet
+    assert packet["command_reference"]["cli_commands"]
+    assert packet["command_reference"]["mcp_tools"]
+    assert any(
+        item["name"] == "code_index context"
+        for item in packet["command_reference"]["cli_commands"]
+    )
+    assert any(
+        item["name"] == "find_symbol"
+        for item in packet["command_reference"]["mcp_tools"]
+    )
+    assert "Command Reference" in packet["handoff_markdown"]
+
 
 def test_context_packet_budget_trimming_is_stable(tmp_path: Path):
     config = _ready_repo(tmp_path)
@@ -268,7 +281,7 @@ def test_context_cli_scope_defaults_selection_and_retrieval_to_directory(
                 "pkg",
                 "memory handoff",
                 "--budget-tokens",
-                "3000",
+                "5000",
                 "--json",
             ]
         )
