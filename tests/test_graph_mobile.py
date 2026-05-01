@@ -63,6 +63,7 @@ def _payload() -> dict[str, Any]:
             "events_path": "/events",
             "debug_path": "/api/debug",
             "search_path": "/api/search",
+            "symbols_path": "/api/symbols",
             "agent_board_path": "/api/agent-board",
             "agent_preflight_path": "/api/agent-task-preflight",
             "agent_runs_path": "/api/agent-runs",
@@ -267,6 +268,19 @@ def test_mobile_chat_keeps_submitted_messages_reviewable():
     assert "appendChatMessage" in submit_body
     assert 'setTab("runs")' not in submit_body
     assert 'setTab("task")' in submit_body
+
+
+def test_mobile_chat_supports_find_command_and_symbol_context():
+    html = _render_mobile_html(_payload())
+
+    assert 'id="mobile-find-results"' in html
+    assert "parseChatCommand" in html
+    assert "handleFindCommand" in html
+    assert "api.symbols" in html
+    assert "symbol_definition" in html
+    assert "hit.def_file" in html
+    assert "selectPath(hit.def_file" in html
+    assert "edit_policy" in html
 
 
 def test_mobile_runs_surface_agent_streams_and_working_context():

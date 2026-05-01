@@ -186,10 +186,54 @@ function notePayload() {
 function taskPayload(node) {
   return agentTaskPayload(node, noteText(node));
 }
+function contextBasketLabel(path) {
+  const parts = String(path || "").split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : String(path || "");
+}
+function addToContextBasket(path) {
+  const clean = String(path || "").trim();
+  if (!clean || selectedContextPaths.includes(clean)) return;
+  selectedContextPaths.push(clean);
+  renderContextBasket();
+}
+function removeFromContextBasket(path) {
+  selectedContextPaths = selectedContextPaths.filter(item => item !== path);
+  renderContextBasket();
+}
+function renderContextBasket() {
+  const container = document.getElementById("context-basket");
+  if (!container) return;
+  container.innerHTML = "";
+  if (!selectedContextPaths.length) {
+    const empty = document.createElement("span");
+    empty.className = "inline-status";
+    empty.textContent = "No files selected.";
+    container.appendChild(empty);
+    return;
+  }
+  selectedContextPaths.forEach(path => {
+    const chip = document.createElement("span");
+    chip.className = "context-chip";
+    chip.title = path;
+    const label = document.createElement("span");
+    label.textContent = contextBasketLabel(path);
+    const remove = document.createElement("button");
+    remove.className = "context-chip-remove";
+    remove.type = "button";
+    remove.textContent = "x";
+    remove.setAttribute("aria-label", `Remove ${path}`);
+    remove.addEventListener("click", () => removeFromContextBasket(path));
+    chip.append(label, remove);
+    container.appendChild(chip);
+  });
+}
 function agentTaskPayload(node, message, options = {}) {
-  const selectedPaths = node.kind === "file"
+  const nodePaths = node.kind === "file"
     ? [node.path]
     : uniquePaths((node.metrics && ((node.metrics.active_files || []).concat(node.metrics.recent_files || []))) || []);
+  const selectedPaths = selectedContextPaths.length
+    ? uniquePaths(selectedContextPaths)
+    : nodePaths;
   const provider = String(options.provider ?? defaultChatProvider()).trim().toLowerCase();
   const executionStrategy = String(options.executionStrategy || options.execution_strategy || "").trim().toLowerCase();
   const payload = {
@@ -199,6 +243,7 @@ function agentTaskPayload(node, message, options = {}) {
     agent_name: options.agentName || agentNameForProvider(provider),
     selected_nodes: [node.id],
     selected_paths: selectedPaths,
+    edit_policy: String(options.editPolicy || options.edit_policy || "review_before_edit"),
     message: message || noteText(node),
     node: {
       id: node.id,
@@ -223,6 +268,61 @@ function agentTaskPayload(node, message, options = {}) {
     }
   }
   return payload;
+}
+function parseChatCommand(message) {
+  const match = String(message || "").trim().match(/^\/find\s+(?:(function|type|method|class)\s+)?(.+)$/i);
+  if (!match) return null;
+  return {
+    command: "find",
+    kind: match[1] ? match[1].toLowerCase() : null,
+    query: match[2].trim()
+  };
+}
+async function handleFindCommand(cmd, status) {
+  const params = new URLSearchParams({ q: cmd.query, limit: "10" });
+  if (cmd.kind) params.set("kind", cmd.kind);
+  if (status) status.textContent = `Finding symbols for ${cmd.query}`;
+  const path = (data.live && data.live.symbols_path) || "/api/symbols";
+  const response = await fetchGraphGet(`${path}?${params.toString()}`);
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  renderFindResults(data.results || []);
+  if (status) {
+    status.textContent = data.results && data.results.length
+      ? `${data.results.length} symbol result${data.results.length === 1 ? "" : "s"}`
+      : "No symbols found.";
+  }
+}
+function renderFindResults(results) {
+  const panel = document.getElementById("find-results");
+  if (!panel) return;
+  panel.innerHTML = "";
+  panel.hidden = false;
+  const items = Array.isArray(results) ? results : [];
+  if (!items.length) {
+    panel.textContent = "No symbols found.";
+    return;
+  }
+  items.forEach(result => {
+    const row = document.createElement("div");
+    row.className = "find-result-row";
+    const symbol = document.createElement("code");
+    symbol.textContent = result.canonical_name || result.display_name || "symbol";
+    const kind = document.createElement("span");
+    kind.className = "find-kind";
+    kind.textContent = result.symbol_kind || result.kind || "";
+    const file = document.createElement("span");
+    file.className = "find-file";
+    file.textContent = `${result.def_file || ""}:${result.def_line || ""}`;
+    const addButton = document.createElement("button");
+    addButton.className = "small-button";
+    addButton.type = "button";
+    addButton.textContent = "+ context";
+    addButton.disabled = !result.def_file;
+    addButton.addEventListener("click", () => addToContextBasket(result.def_file));
+    row.append(symbol, kind, file, addButton);
+    panel.appendChild(row);
+  });
 }
 async function postAgentTaskToServer(payload) {
   if (!canPostToGraphServer()) {

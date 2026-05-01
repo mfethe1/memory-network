@@ -217,6 +217,7 @@ function renderGraph() {
     group.dataset.id = node.id;
     group.addEventListener("click", event => {
       event.stopPropagation();
+      if (node.kind === "file") addToContextBasket(node.path);
       selectNode(node);
     });
     const r = fileRadius(node);

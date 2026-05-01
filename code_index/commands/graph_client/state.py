@@ -98,6 +98,7 @@ const viewStateKey = `code_index_graph_view:${data.root}`;
 const graphTokenKey = `code_index_graph_token:${data.root}`;
 const DIRECTORY_EXPANSION_DEFAULT_VERSION = 2;
 let notes = loadNotes();
+let selectedContextPaths = [];
 let eventSource = null;
 let liveConnected = false;
 let refreshing = false;

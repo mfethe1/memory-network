@@ -262,6 +262,7 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                     "debug_path": "/api/debug",
                     "debug_perf_path": "/api/debug/perf",
                     "search_path": "/api/search",
+                    "symbols_path": "/api/symbols",
                     "agent_board_path": "/api/agent-board",
                     "agent_preflight_path": "/api/agent-task-preflight",
                     "agent_runs_path": "/api/agent-runs",

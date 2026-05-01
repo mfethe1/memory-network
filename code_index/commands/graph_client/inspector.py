@@ -1223,6 +1223,8 @@ function renderChat(node) {
             </select>
           </label>
         </div>
+        <div id="context-basket" class="context-basket" aria-label="Selected files"></div>
+        <div id="find-results" class="find-results" hidden></div>
         <textarea class="note-box chat-box" id="agent-chat-message" placeholder="Send a focused task or follow-up about the selected node."></textarea>
         <div class="actions">
           <button class="small-button primary-action" id="send-agent-message" type="button"${disabled}>Send to agent</button>
@@ -1565,6 +1567,7 @@ function bindChatPanel(node) {
   const copyButton = document.getElementById("copy-agent-message-json");
   const status = document.getElementById("agent-chat-status");
   refreshAgentProviders();
+  renderContextBasket();
   document.querySelectorAll("[data-chat-node]").forEach(button => {
     button.addEventListener("click", () => {
       const target = nodeById.get(button.dataset.chatNode);
@@ -1595,6 +1598,18 @@ function bindChatPanel(node) {
       const message = messageBox.value.trim();
       if (!message) {
         status.textContent = "Message required";
+        return;
+      }
+      const command = parseChatCommand(message);
+      if (command && command.command === "find") {
+        sendButton.disabled = true;
+        try {
+          await handleFindCommand(command, status);
+        } catch (err) {
+          status.textContent = err.message || "Find failed";
+        } finally {
+          sendButton.disabled = !canPostToGraphServer();
+        }
         return;
       }
       const provider = providerFromChatControl(providerSelect);

@@ -262,6 +262,13 @@ def test_graph_html_writes_standalone_view(
     assert "submit-agent-task" in html
     assert "agent-chat-message" in html
     assert "send-agent-message" in html
+    assert "selectedContextPaths" in html
+    assert "context-basket" in html
+    assert "find-results" in html
+    assert "parseChatCommand" in html
+    assert "handleFindCommand" in html
+    assert "/api/symbols" in html
+    assert "edit_policy" in html
     assert "agent-provider" in html
     assert "agent_providers" in html
     assert "agent_runtime" in html

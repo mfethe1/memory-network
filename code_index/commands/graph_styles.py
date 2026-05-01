@@ -1062,6 +1062,68 @@ GRAPH_CSS = r"""
       display: grid;
       gap: 10px;
     }
+    .context-basket {
+      min-height: 28px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+    .context-chip {
+      min-width: 0;
+      max-width: 100%;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid rgba(93,212,198,0.45);
+      border-radius: 999px;
+      background: rgba(93,212,198,0.12);
+      color: #b8fff7;
+      padding: 4px 8px;
+      font-size: 12px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
+    .context-chip-remove {
+      border: 0;
+      border-radius: 999px;
+      background: transparent;
+      color: inherit;
+      padding: 0 3px;
+      cursor: pointer;
+      font-size: 14px;
+      line-height: 1;
+    }
+    .find-results {
+      display: grid;
+      gap: 6px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+      padding: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .find-results[hidden] {
+      display: none;
+    }
+    .find-result-row {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 6px;
+      align-items: center;
+    }
+    .find-result-row code {
+      color: var(--ink);
+      overflow-wrap: anywhere;
+    }
+    .find-kind,
+    .find-file {
+      color: var(--muted);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
     .agent-focus {
       border-bottom: 1px solid var(--line);
       padding-bottom: 14px;

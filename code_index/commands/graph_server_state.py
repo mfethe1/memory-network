@@ -294,6 +294,7 @@ def _build_payload(config: cfg_mod.Config, args: argparse.Namespace) -> dict[str
             "events_path": "/events",
             "notes_path": "/api/notes",
             "search_path": "/api/search",
+            "symbols_path": "/api/symbols",
             "agent_preflight_path": "/api/agent-task-preflight",
             "agent_runs_path": "/api/agent-runs",
             "agent_events_path": "/api/agent-events",

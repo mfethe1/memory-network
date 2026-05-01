@@ -510,6 +510,33 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
       color: var(--muted);
       font-size: 14px;
     }
+    .find-results {
+      display: grid;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 10px;
+      box-shadow: var(--shadow);
+    }
+    .find-results[hidden] {
+      display: none;
+    }
+    .find-result-row {
+      min-width: 0;
+      display: grid;
+      gap: 6px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 8px;
+    }
+    .find-result-row:last-child {
+      border-bottom: 0;
+      padding-bottom: 0;
+    }
+    .find-result-row code,
+    .find-result-row span {
+      overflow-wrap: anywhere;
+    }
     .stat-grid {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
@@ -932,6 +959,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
             </div>
             <div class="chip-row" id="chat-file-chips"></div>
           </div>
+          <div class="find-results" id="mobile-find-results" hidden></div>
           <label for="task-message">Message
             <textarea id="task-message" name="message" placeholder="Ask the agent to inspect, change, or explain the selected files" aria-label="Agent Task message" required></textarea>
           </label>
@@ -1043,6 +1071,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     graph: sameOriginPath(live.graph_path, "/repo-graph.json"),
     board: sameOriginPath(live.agent_board_path, "/api/agent-board"),
     search: sameOriginPath(live.search_path, "/api/search"),
+    symbols: sameOriginPath(live.symbols_path, "/api/symbols"),
     preflight: sameOriginPath(live.agent_preflight_path, "/api/agent-task-preflight"),
     runs: sameOriginPath(live.agent_runs_path, "/api/agent-runs"),
     runDetail: sameOriginPath(live.agent_run_detail_path, "/api/agent-runs/{run_id}"),
@@ -1108,6 +1137,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     chatSelectedCount: document.getElementById("chat-selected-count"),
     chatAddFiles: document.getElementById("chat-add-files"),
     chatClearFiles: document.getElementById("chat-clear-files"),
+    findResults: document.getElementById("mobile-find-results"),
     chatHistory: document.getElementById("chat-history"),
     chatHistoryClear: document.getElementById("chat-history-clear"),
     filesOpenChat: document.getElementById("files-open-chat"),
@@ -1214,6 +1244,60 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
       method: "POST",
       body: JSON.stringify(payload || {}),
       headers: { Accept: "application/json", "Content-Type": "application/json" }
+    });
+  }
+
+  function parseChatCommand(message) {
+    const match = String(message || "").trim().match(/^\/find\s+(?:(function|type|method|class)\s+)?(.+)$/i);
+    if (!match) return null;
+    return {
+      command: "find",
+      kind: match[1] ? match[1].toLowerCase() : null,
+      query: match[2].trim()
+    };
+  }
+
+  async function handleFindCommand(cmd) {
+    const params = new URLSearchParams({ q: cmd.query, limit: "10" });
+    if (cmd.kind) params.set("kind", cmd.kind);
+    setText(els.taskStatus, `Finding symbols for ${cmd.query}.`);
+    const result = await requestJson(`${api.symbols}?${params.toString()}`);
+    renderFindResults(result.results || []);
+    const count = Array.isArray(result.results) ? result.results.length : 0;
+    setText(els.taskStatus, count ? `${count} symbol result${count === 1 ? "" : "s"}.` : "No symbols found.");
+  }
+
+  function renderFindResults(results) {
+    if (!els.findResults) return;
+    clear(els.findResults);
+    els.findResults.hidden = false;
+    const hits = Array.isArray(results) ? results : [];
+    if (!hits.length) {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No symbols found.";
+      els.findResults.appendChild(empty);
+      return;
+    }
+    hits.forEach(hit => {
+      const row = document.createElement("div");
+      row.className = "find-result-row";
+      const name = document.createElement("code");
+      name.textContent = hit.canonical_name || hit.display_name || "symbol";
+      const detail = document.createElement("span");
+      detail.className = "meta";
+      detail.textContent = `${hit.symbol_kind || hit.kind || "symbol"} · ${hit.def_file || ""}:${hit.def_line || ""}`;
+      const addBtn = document.createElement("button");
+      addBtn.type = "button";
+      addBtn.textContent = "+ context";
+      addBtn.disabled = !(hit.kind === "symbol_definition" && hit.def_file);
+      addBtn.addEventListener("click", () => {
+        if (hit.kind === "symbol_definition" && hit.def_file) {
+          selectPath(hit.def_file, { focusChat: true });
+        }
+      });
+      row.append(name, detail, addBtn);
+      els.findResults.appendChild(row);
     });
   }
 
@@ -2258,8 +2342,11 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     const result = state.searchResult;
     if (!result) return;
     const files = Array.isArray(result.files) ? result.files : [];
+    const symbols = Array.isArray(result.symbols)
+      ? result.symbols
+      : (Array.isArray(result.results) ? result.results.filter(item => item && item.kind === "symbol_definition") : []);
     const transcripts = Array.isArray(result.transcripts) ? result.transcripts : [];
-    if (!files.length && !transcripts.length) {
+    if (!files.length && !symbols.length && !transcripts.length) {
       const empty = document.createElement("p");
       empty.className = "empty";
       empty.textContent = "No results.";
@@ -2267,6 +2354,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
       return;
     }
     files.forEach(item => els.searchResults.appendChild(resultCard(item, "file")));
+    symbols.forEach(item => els.searchResults.appendChild(resultCard(item, "symbol")));
     transcripts.forEach(item => els.searchResults.appendChild(resultCard(item, "transcript")));
   }
 
@@ -2335,22 +2423,23 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
   }
 
   function resultCard(item, kind) {
+    const contextPath = item.file_path || item.def_file || "";
     const card = document.createElement("article");
     card.className = "result-card";
     const title = document.createElement("div");
     title.className = "run-title";
-    title.textContent = item.file_path || item.symbol_path || item.run_id || kind;
+    title.textContent = item.canonical_name || item.file_path || item.symbol_path || item.run_id || kind;
     const snippet = document.createElement("p");
     snippet.className = "run-detail";
-    snippet.textContent = compactText(item.snippet || item.message || item.prompt || "", 240);
+    snippet.textContent = compactText(item.signature || item.snippet || item.message || item.prompt || "", 240);
     const actions = document.createElement("div");
     actions.className = "card-actions";
     const usePath = document.createElement("button");
     usePath.type = "button";
-    usePath.textContent = "Use path";
-    usePath.disabled = !item.file_path;
+    usePath.textContent = kind === "symbol" ? "+ context" : "Use path";
+    usePath.disabled = !contextPath;
     usePath.addEventListener("click", () => {
-      selectPath(item.file_path || "", { focusFiles: true });
+      selectPath(contextPath, { focusFiles: true });
     });
     const openRunButton = document.createElement("button");
     openRunButton.type = "button";
@@ -2360,9 +2449,9 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     const askButton = document.createElement("button");
     askButton.type = "button";
     askButton.textContent = "Ask";
-    askButton.disabled = !item.file_path;
+    askButton.disabled = !contextPath;
     askButton.addEventListener("click", () => {
-      selectPath(item.file_path || "", { focusChat: true });
+      selectPath(contextPath, { focusChat: true });
     });
     actions.append(usePath, askButton, openRunButton);
     card.append(title, snippet, actions);
@@ -2396,6 +2485,17 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
 
   async function sendRunMessage() {
     const runId = state.selectedRunId;
+    const command = parseChatCommand(els.taskMessage.value);
+    if (command && command.command === "find") {
+      try {
+        await handleFindCommand(command);
+      } catch (err) {
+        state.lastError = err && err.message ? err.message : "Find failed";
+        setText(els.taskStatus, state.lastError);
+        renderDebug();
+      }
+      return;
+    }
     const payload = taskPayload();
     if (!runId) {
       setText(els.taskStatus, "Open an Agent Run before sending a follow-up message.");
@@ -2438,6 +2538,17 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
   }
 
   async function submitTask() {
+    const command = parseChatCommand(els.taskMessage.value);
+    if (command && command.command === "find") {
+      try {
+        await handleFindCommand(command);
+      } catch (err) {
+        state.lastError = err && err.message ? err.message : "Find failed";
+        setText(els.taskStatus, state.lastError);
+        renderDebug();
+      }
+      return;
+    }
     const payload = taskPayload();
     if (!payload.message) {
       setText(els.taskStatus, "Agent Task message is required.");
@@ -2513,6 +2624,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
     const payload = {
       message: els.taskMessage.value.trim(),
       agent_name: els.taskAgent.value.trim() || "Codex",
+      edit_policy: "review_before_edit",
       run_context: {
         source: "mobile-orchestrator",
         kind: "targeted_run",
