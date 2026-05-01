@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import sys
 import time
 from pathlib import Path
@@ -81,6 +82,56 @@ def test_agent_provider_registry_exposes_commands_and_capabilities():
     }
     assert payload["claude"]["display_name"] == "Claude"
     assert payload["custom"]["command_preset"] is None
+
+
+def test_agent_provider_registry_loads_optional_json_specs(tmp_path, monkeypatch):
+    spec_path = tmp_path / "agent-providers.json"
+    spec_path.write_text(
+        """
+        {
+          "providers": [
+            {
+              "id": "opencode",
+              "display_name": "OpenCode",
+              "command_preset": "opencode run --print < {provider_prompt_file}",
+              "capabilities": ["provider_prompt_file", "json_output"]
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv(agent_providers.PROVIDER_SPECS_ENV_VAR, str(spec_path))
+    importlib.reload(agent_providers)
+    try:
+        assert agent_providers.provider_choices() == [
+            "custom",
+            "claude",
+            "codex",
+            "kimi",
+            "opencode",
+        ]
+        assert agent_providers.provider_display_name("opencode") == "OpenCode"
+        assert (
+            agent_providers.provider_command_template("opencode")
+            == "opencode run --print < {provider_prompt_file}"
+        )
+        assert agent_providers.provider_has_capability(
+            "opencode", agent_providers.CAPABILITY_PROVIDER_PROMPT_FILE
+        )
+        assert agent_providers.provider_has_capability(
+            "opencode", agent_providers.CAPABILITY_COMMAND_PRESET
+        )
+        payload = {
+            provider["id"]: provider
+            for provider in agent_providers.provider_registry_payload()
+        }
+        assert payload["opencode"]["display_name"] == "OpenCode"
+    finally:
+        monkeypatch.delenv(agent_providers.PROVIDER_SPECS_ENV_VAR, raising=False)
+        importlib.reload(agent_providers)
+        agent_adapter_cmd.PROVIDER_COMMANDS = agent_providers.PROVIDER_COMMANDS
 
 
 def test_parse_output_event_accepts_json_event_line():
