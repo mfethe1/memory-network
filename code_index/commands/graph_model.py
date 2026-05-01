@@ -183,7 +183,11 @@ def _role_for_file(path: str, language: str | None) -> str:
 def _read_code(
     root: Path, rel_path: str, *, include_code: bool, max_code_bytes: int
 ) -> tuple[int | None, dict[str, Any]]:
-    path = root / rel_path
+    path = (root / rel_path).resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError:
+        return None, {"included": False, "content": "", "reason": "path outside root"}
     if not path.is_file():
         return None, {
             "included": False,

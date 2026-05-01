@@ -93,7 +93,7 @@ def _resolve_paths(
     paths: list[Path] | None,
 ) -> list[tuple[Path, str, int]]:
     """Return (absolute_path, rel_posix, size) triples to index."""
-    if paths:
+    if paths is not None:
         out: list[tuple[Path, str, int]] = []
         for raw in paths:
             p = raw if raw.is_absolute() else (config.root / raw)
@@ -127,7 +127,7 @@ def _resolve_paths(
 
 def _missing_explicit_paths(config: Config, paths: list[Path] | None) -> set[str]:
     """Return repo-relative paths explicitly requested but absent on disk."""
-    if not paths:
+    if paths is None:
         return set()
     root = config.root.resolve()
     missing: set[str] = set()
@@ -930,16 +930,26 @@ def _reindex_body(
                 touched.add(rel_path)
                 continue
 
+        # Re-check size guard; file may have grown between scan and read.
+        if stat_result.st_size > config.max_file_bytes:
+            stats.errors.append(f"{rel_path}: file grew beyond max_file_bytes")
+            continue
+
         text, data, read_err = _read_source(abs_path)
         # Git metadata for this file (cheap: blob_oid from ls-files cache;
         # commit_info short-circuits to (None, None) on non-git repos).
-        git_blob_oid = git_meta.blob_oid(rel_path)
-        git_ts, git_author = git_meta.commit_info(rel_path)
+        try:
+            git_blob_oid = git_meta.blob_oid(rel_path)
+            git_ts, git_author = git_meta.commit_info(rel_path)
+        except Exception:
+            git_blob_oid = None
+            git_ts = None
+            git_author = None
         if read_err:
             stats.files_failed += 1
             stats.errors.append(f"{rel_path}: {read_err}")
             with transaction(conn):
-                _ensure_file_row(
+                file_pk = _ensure_file_row(
                     conn,
                     rel_path=rel_path,
                     language=None,
@@ -953,6 +963,14 @@ def _reindex_body(
                     git_blob_oid=git_blob_oid,
                     git_committed_at=git_ts,
                     git_author=git_author,
+                )
+                _tombstone_file(
+                    conn,
+                    file_pk=file_pk,
+                    now=_now_iso(),
+                    event_source=event_source,
+                    stats=stats,
+                    test_symbols_to_rebuild=test_symbols_to_rebuild,
                 )
             continue
         wth = worktree_hash(data or b"")
@@ -979,7 +997,7 @@ def _reindex_body(
             stats.files_failed += 1
             stats.errors.append(f"{rel_path}: parser {parser.name} crashed: {exc!r}")
             with transaction(conn):
-                _ensure_file_row(
+                file_pk = _ensure_file_row(
                     conn,
                     rel_path=rel_path,
                     language=None,
@@ -993,6 +1011,14 @@ def _reindex_body(
                     git_blob_oid=git_blob_oid,
                     git_committed_at=git_ts,
                     git_author=git_author,
+                )
+                _tombstone_file(
+                    conn,
+                    file_pk=file_pk,
+                    now=_now_iso(),
+                    event_source=event_source,
+                    stats=stats,
+                    test_symbols_to_rebuild=test_symbols_to_rebuild,
                 )
             continue
 

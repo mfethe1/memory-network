@@ -194,6 +194,13 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                     _json_bytes({"error": "invalid Content-Length"}),
                 )
                 return None
+            MAX_BODY_SIZE = 2 * 1024 * 1024  # 2 MB
+            if length > MAX_BODY_SIZE:
+                self._send_bytes(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": "body too large"}),
+                )
+                return None
             try:
                 body = self.rfile.read(length).decode("utf-8")
                 payload = json.loads(body or "{}")
@@ -484,6 +491,7 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                 limit = int((params.get("limit") or ["12"])[0])
             except ValueError:
                 limit = 12
+            limit = max(1, min(100, limit))
             result = _build_search_payload(
                 config,
                 query=query,

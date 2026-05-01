@@ -22,9 +22,13 @@ def _apply_pragmas(conn: sqlite3.Connection) -> None:
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    _apply_pragmas(conn)
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        _apply_pragmas(conn)
+        return conn
+    except Exception:
+        conn.close()
+        raise
 
 
 def fts5_available(conn: sqlite3.Connection) -> bool:
@@ -94,6 +98,8 @@ def ensure_schema(conn: sqlite3.Connection, config=None) -> None:
 
     try:
         with writer_lock(config, timeout_s=5.0):
+            if schema_is_ready(conn):
+                return
             apply_schema(conn)
     except LockTimeoutError:
         # Another writer is mid-reindex; it will leave the schema at the
@@ -269,8 +275,9 @@ def _repair_expected_columns(conn: sqlite3.Connection) -> None:
                  WHERE content_hash IS NULL
                 """
             )
-        except sqlite3.OperationalError:
-            pass
+        except sqlite3.OperationalError as exc:
+            if "no such" not in str(exc).lower():
+                raise
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -378,20 +385,27 @@ def get_schema_version(conn: sqlite3.Connection) -> str | None:
 
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    if conn.in_transaction:
+        raise sqlite3.ProgrammingError("Nested transactions are not supported")
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
-    else:
         conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
 
 
 def optimize(conn: sqlite3.Connection) -> None:
     try:
         conn.execute("PRAGMA optimize")
     except sqlite3.OperationalError:
+        # PRAGMA optimize can fail with "database is locked" when another
+        # connection holds the write lock, or with "not within a transaction".
+        # Both are benign on close.
         pass
 
 

@@ -9,8 +9,13 @@ from code_index.commands.graph_template import HTML_TEMPLATE
 
 
 def _json_for_html(payload: dict[str, Any]) -> str:
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).replace(
-        "</", "<\\/"
+    return (
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
     )
 
 
