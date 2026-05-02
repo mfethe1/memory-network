@@ -52,6 +52,7 @@ from code_index.commands.graph_server_preflight import (
 )
 from code_index.commands.graph_server_search import _build_search_payload
 from code_index.commands.graph_server_state import (
+    GraphServerProjectState,
     _agent_stream_payload,
     _build_debug_payload,
     _build_payload,
@@ -69,6 +70,7 @@ def _make_routes_class(
     args: argparse.Namespace,
     preflight_secret: str,
     perf_state: dict[str, Any],
+    project_state: GraphServerProjectState,
 ):
     """Return a mixin class containing all heavy route handlers.
 
@@ -195,6 +197,36 @@ def _make_routes_class(
                     }
                 ),
             )
+
+        def _send_dirs(self, query_string: str) -> None:
+            params = parse_qs(query_string, keep_blank_values=False)
+            path = str((params.get("path") or [""])[0]).strip() or None
+            payload = project_state.directory_listing(path)
+            status = (
+                HTTPStatus.BAD_REQUEST
+                if payload.get("error") == "not a directory"
+                else HTTPStatus.OK
+            )
+            self._send_bytes(status, _json_bytes(payload))
+
+        def _send_init_status(self, query_string: str) -> None:
+            params = parse_qs(query_string, keep_blank_values=False)
+            path = str((params.get("path") or [""])[0]).strip()
+            result = project_state.init_status(path)
+            status = HTTPStatus.BAD_REQUEST if result.get("error") else HTTPStatus.OK
+            self._send_bytes(status, _json_bytes(result))
+
+        def _switch_project(self, payload: dict[str, Any]) -> None:
+            result = project_state.switch_or_initialize_project(
+                str(payload.get("path") or ""),
+                initialize=bool(payload.get("initialize")),
+            )
+            if result.get("ok"):
+                setattr(args, "scope", None)
+                if hasattr(args, "_resolved_scope"):
+                    delattr(args, "_resolved_scope")
+            status = HTTPStatus.BAD_REQUEST if result.get("error") else HTTPStatus.OK
+            self._send_bytes(status, _json_bytes(result))
 
         def _send_events(self, query_string: str) -> None:
             params = parse_qs(query_string, keep_blank_values=False)

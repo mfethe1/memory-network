@@ -43,6 +43,8 @@ Install repo-local integration files:
 python plugins/code-index-agent/scripts/install_plugin.py --root . --provider codex --json
 # or use Kimi Code CLI for browser-submitted coding tasks
 python plugins/code-index-agent/scripts/install_plugin.py --root . --provider kimi --json
+# or use OpenCode CLI
+python plugins/code-index-agent/scripts/install_plugin.py --root . --provider opencode --json
 ```
 
 Start the graph server:
@@ -58,24 +60,34 @@ http://127.0.0.1:8767/repo-graph.html
 ```
 
 To let graph-submitted tasks launch a local agent command, set
-`CODE_INDEX_AGENT_PROVIDER=claude`, `CODE_INDEX_AGENT_PROVIDER=codex`, or
+`CODE_INDEX_AGENT_PROVIDER=codex`, `CODE_INDEX_AGENT_PROVIDER=claude`,
+`CODE_INDEX_AGENT_PROVIDER=kimi`, `CODE_INDEX_AGENT_PROVIDER=opencode`, or
 `CODE_INDEX_AGENT_COMMAND` before starting the server. Useful command
-placeholders: `{message}`, `{run_id}`, `{root}`, `{task_json}`,
-`{selected_paths}`, and `{selected_nodes}`.
+placeholders: `{message}`, `{provider_prompt}`, `{provider_prompt_file}`,
+`{mcp_config_file}`, `{run_id}`, `{root}`, `{task_json}`, `{selected_paths}`,
+and `{selected_nodes}`.
 
 Examples:
 
 ```bash
 CODE_INDEX_AGENT_PROVIDER=claude python -m code_index graph-server --port 8767
 CODE_INDEX_AGENT_PROVIDER=codex python -m code_index graph-server --port 8767
+CODE_INDEX_AGENT_PROVIDER=opencode python -m code_index graph-server --port 8767
+```
+
+Inspect the active provider registry with:
+
+```bash
+python -m code_index agent-adapter --list-providers --json
 ```
 
 The browser cancel button interrupts the local command process tree and records
 the run as `cancelled`. HTTP webhook dispatch still works through
 `CODE_INDEX_AGENT_WEBHOOK_URL` when a separate adapter service is preferred.
 Submitted task JSON includes `context_packet`; provider output can emit JSON
-events or prefixed lines such as `EDIT path/to/file.py message` to update the
-graph with structured activity. Inspect long runs with:
+events from Codex, Claude, Kimi, or OpenCode, or prefixed lines such as
+`EDIT path/to/file.py message`, to update the graph with structured activity.
+Inspect long runs with:
 
 ```bash
 python -m code_index agent transcript --run-id <run-id> --json

@@ -1264,6 +1264,13 @@ def build_graph(
             "agent_runs_path": None,
             "agent_events_path": None,
             "agent_board_path": None,
+            "dirs_path": "/api/dirs",
+            "switch_project_path": "/api/switch-project",
+            "init_status_path": "/api/init-status",
+            "active_project": {
+                "name": root.name,
+                "path": root.resolve().as_posix(),
+            },
         },
         "agent": {
             "name": agent_name or (", ".join(active_agent_names) or "Agent"),

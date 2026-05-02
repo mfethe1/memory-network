@@ -5,6 +5,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from code_index.commands.graph_project_switcher import (
+    PROJECT_SWITCHER_CSS,
+    PROJECT_SWITCHER_HTML,
+    PROJECT_SWITCHER_SCRIPT,
+)
+
 
 def _json_for_html(payload: dict[str, Any]) -> str:
     return (
@@ -902,6 +908,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
         grid-template-columns: 1fr 1fr;
       }
     }
+    __PROJECT_SWITCHER_CSS__
   </style>
 </head>
 <body>
@@ -911,6 +918,7 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
         <div class="topbar-title">
           <p class="kicker">Graph Agent Companion</p>
           <h1 id="repo-title">Mobile graph</h1>
+          __PROJECT_SWITCHER_HTML__
         </div>
         <div class="topbar-actions">
           <button type="button" class="context-toggle" id="top-context-toggle" aria-expanded="false" aria-controls="top-context-details">Context</button>
@@ -3188,6 +3196,9 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
   }
 })();
   </script>
+  <script>
+__PROJECT_SWITCHER_SCRIPT__
+  </script>
 </body>
 </html>
 """
@@ -3196,7 +3207,13 @@ MOBILE_HTML_TEMPLATE = r"""<!doctype html>
 def render_mobile_html(payload: dict) -> str:
     """Return a self-contained mobile graph-server HTML document."""
 
-    return MOBILE_HTML_TEMPLATE.replace("__MOBILE_JSON__", _json_for_html(payload))
+    return (
+        MOBILE_HTML_TEMPLATE
+        .replace("__PROJECT_SWITCHER_CSS__", PROJECT_SWITCHER_CSS)
+        .replace("__PROJECT_SWITCHER_HTML__", PROJECT_SWITCHER_HTML)
+        .replace("__PROJECT_SWITCHER_SCRIPT__", PROJECT_SWITCHER_SCRIPT)
+        .replace("__MOBILE_JSON__", _json_for_html(payload))
+    )
 
 
 __all__ = ["render_mobile_html"]

@@ -364,16 +364,17 @@ def test_graph_ui_refreshes_provider_registry_without_touching_runs(
             page.goto(f"{base_url}/repo-graph.html", wait_until="domcontentloaded")
             page.get_by_role("button", name="Chat").click()
             assert page.locator("#agent-provider").input_value() == "codex"
-            assert page.locator('#agent-provider option[value="opencode"]').count() == 0
+            assert page.locator('#agent-provider option[value="opencode"]').count() == 1
+            assert page.locator('#agent-provider option[value="aider"]').count() == 0
 
             original_payload = agent_providers.provider_registry_payload
 
-            def provider_registry_with_opencode() -> list[dict[str, object]]:
+            def provider_registry_with_aider() -> list[dict[str, object]]:
                 return original_payload() + [
                     {
-                        "id": "opencode",
-                        "display_name": "OpenCode",
-                        "command_preset": "opencode run {provider_prompt_file}",
+                        "id": "aider",
+                        "display_name": "Aider",
+                        "command_preset": "aider --message {provider_prompt}",
                         "capabilities": ["command_preset", "provider_prompt_file"],
                     }
                 ]
@@ -381,12 +382,12 @@ def test_graph_ui_refreshes_provider_registry_without_touching_runs(
             monkeypatch.setattr(
                 agent_providers,
                 "provider_registry_payload",
-                provider_registry_with_opencode,
+                provider_registry_with_aider,
             )
 
             page.evaluate("() => refreshAgentProviders({ force: true })")
 
-            page.locator('#agent-provider option[value="opencode"]').wait_for(
+            page.locator('#agent-provider option[value="aider"]').wait_for(
                 state="attached",
                 timeout=10000,
             )

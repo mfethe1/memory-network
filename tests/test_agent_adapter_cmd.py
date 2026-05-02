@@ -31,7 +31,8 @@ def test_resolve_agent_command_uses_provider_presets(monkeypatch):
     monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
     monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
     assert resolve_agent_command(provider="claude") == (
-        "claude -p {provider_prompt}",
+        "claude -p --output-format stream-json "
+        "--mcp-config {mcp_config_file} < {provider_prompt_file}",
         "claude",
     )
     assert resolve_agent_command(provider="codex") == (
@@ -46,6 +47,11 @@ def test_resolve_agent_command_uses_provider_presets(monkeypatch):
         "< {provider_prompt_file}",
         "kimi",
     )
+    assert resolve_agent_command(provider="opencode") == (
+        "opencode run --dir {root} --format json "
+        "--file {task_json} {provider_prompt}",
+        "opencode",
+    )
 
 
 def test_resolve_agent_command_explicit_provider_overrides_env_command(monkeypatch):
@@ -56,6 +62,7 @@ def test_resolve_agent_command_explicit_provider_overrides_env_command(monkeypat
         "codex",
     )
     assert resolve_agent_command(provider="kimi")[1] == "kimi"
+    assert resolve_agent_command(provider="opencode")[1] == "opencode"
 
 
 def test_resolve_agent_command_rejects_unknown_provider(monkeypatch):
@@ -65,11 +72,18 @@ def test_resolve_agent_command_rejects_unknown_provider(monkeypatch):
 
 
 def test_agent_provider_registry_exposes_commands_and_capabilities():
-    assert agent_providers.provider_choices() == ["custom", "claude", "codex", "kimi"]
+    assert agent_providers.provider_choices() == [
+        "custom",
+        "claude",
+        "codex",
+        "kimi",
+        "opencode",
+    ]
     assert agent_providers.provider_choices(include_custom=False) == [
         "claude",
         "codex",
         "kimi",
+        "opencode",
     ]
     assert agent_providers.is_known_provider(" CLAUDE ")
     assert agent_providers.require_provider("codex").display_name == "Codex"
@@ -79,11 +93,19 @@ def test_agent_provider_registry_exposes_commands_and_capabilities():
         == "codex exec -C {root} -s workspace-write --json "
         "-o {last_message} - < {provider_prompt_file}"
     )
+    assert (
+        agent_providers.provider_command_template("opencode")
+        == "opencode run --dir {root} --format json "
+        "--file {task_json} {provider_prompt}"
+    )
     assert agent_providers.provider_has_capability(
         "custom", agent_providers.CAPABILITY_CUSTOM_COMMAND
     )
     assert agent_providers.provider_has_capability(
         "kimi", agent_providers.CAPABILITY_MCP_CONFIG_FILE
+    )
+    assert agent_providers.provider_has_capability(
+        "opencode", agent_providers.CAPABILITY_TASK_JSON_FILE
     )
     payload = {
         provider["id"]: provider
@@ -92,6 +114,7 @@ def test_agent_provider_registry_exposes_commands_and_capabilities():
     assert payload["claude"]["display_name"] == "Claude"
     assert payload["custom"]["command_preset"] is None
     assert payload["kimi"]["command_preset"].startswith("kimi --work-dir")
+    assert payload["opencode"]["display_name"] == "OpenCode"
 
 
 def test_agent_provider_registry_loads_optional_json_specs(tmp_path, monkeypatch):
@@ -101,9 +124,9 @@ def test_agent_provider_registry_loads_optional_json_specs(tmp_path, monkeypatch
         {
           "providers": [
             {
-              "id": "opencode",
-              "display_name": "OpenCode",
-              "command_preset": "opencode run --print < {provider_prompt_file}",
+              "id": "aider",
+              "display_name": "Aider",
+              "command_preset": "aider --message {provider_prompt}",
               "capabilities": ["provider_prompt_file", "json_output"]
             }
           ]
@@ -122,31 +145,45 @@ def test_agent_provider_registry_loads_optional_json_specs(tmp_path, monkeypatch
             "codex",
             "kimi",
             "opencode",
+            "aider",
         ]
-        assert agent_providers.provider_display_name("opencode") == "OpenCode"
+        assert agent_providers.provider_display_name("aider") == "Aider"
         assert (
-            agent_providers.provider_command_template("opencode")
-            == "opencode run --print < {provider_prompt_file}"
+            agent_providers.provider_command_template("aider")
+            == "aider --message {provider_prompt}"
         )
-        assert resolve_agent_command(provider="opencode") == (
-            "opencode run --print < {provider_prompt_file}",
-            "opencode",
-        )
-        assert agent_providers.provider_has_capability(
-            "opencode", agent_providers.CAPABILITY_PROVIDER_PROMPT_FILE
+        assert resolve_agent_command(provider="aider") == (
+            "aider --message {provider_prompt}",
+            "aider",
         )
         assert agent_providers.provider_has_capability(
-            "opencode", agent_providers.CAPABILITY_COMMAND_PRESET
+            "aider", agent_providers.CAPABILITY_PROVIDER_PROMPT_FILE
+        )
+        assert agent_providers.provider_has_capability(
+            "aider", agent_providers.CAPABILITY_COMMAND_PRESET
         )
         payload = {
             provider["id"]: provider
             for provider in agent_providers.provider_registry_payload()
         }
-        assert payload["opencode"]["display_name"] == "OpenCode"
+        assert payload["aider"]["display_name"] == "Aider"
     finally:
         monkeypatch.delenv(agent_providers.PROVIDER_SPECS_ENV_VAR, raising=False)
         importlib.reload(agent_providers)
         agent_adapter_cmd.PROVIDER_COMMANDS = agent_providers.PROVIDER_COMMANDS
+
+
+def test_agent_adapter_cli_lists_provider_registry(capsys):
+    from code_index.cli import main
+
+    rc = main(["agent-adapter", "--list-providers", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["kind"] == "code_index_agent_provider_registry"
+    providers = {provider["id"]: provider for provider in payload["providers"]}
+    assert providers["codex"]["display_name"] == "Codex"
+    assert providers["opencode"]["command_preset"].startswith("opencode run")
 
 
 def test_parse_output_event_accepts_json_event_line():
@@ -225,6 +262,86 @@ def test_parse_output_event_accepts_kimi_stream_json_tool_call():
     assert parsed["file_path"] == "pkg/a.py"
     assert "Read" in parsed["message"]
     assert parsed["payload"]["provider_event"] == "kimi.message"
+
+
+def test_parse_output_event_accepts_claude_stream_json_assistant_text():
+    parsed = _parse_output_event(
+        (
+            '{"type":"assistant","session_id":"session_1","message":'
+            '{"role":"assistant","content":[{"type":"text",'
+            '"text":"Changed pkg/a.py\\nTests passed."}]}}'
+        ),
+        stream_name="stdout",
+        command_label="claude -p --output-format stream-json",
+    )
+    assert parsed["event_type"] == "decision"
+    assert parsed["message"] == "Changed pkg/a.py\nTests passed."
+    assert parsed["payload"]["provider_event"] == "claude.assistant"
+    assert parsed["payload"]["session_id"] == "session_1"
+
+
+def test_parse_output_event_accepts_claude_stream_json_tool_use():
+    parsed = _parse_output_event(
+        (
+            '{"type":"assistant","session_id":"session_1","message":'
+            '{"role":"assistant","content":[{"type":"tool_use","name":"Edit",'
+            '"input":{"file_path":"pkg/a.py"}}]}}'
+        ),
+        stream_name="stdout",
+        command_label="claude -p --output-format stream-json",
+    )
+    assert parsed["event_type"] == "edit"
+    assert parsed["file_path"] == "pkg/a.py"
+    assert "Edit" in parsed["message"]
+    assert parsed["payload"]["provider_event"] == "claude.assistant"
+
+
+def test_parse_output_event_accepts_opencode_json_text():
+    parsed = _parse_output_event(
+        (
+            '{"type":"text","timestamp":1767036064268,'
+            '"sessionID":"ses_123","part":{"type":"text",'
+            '"text":"Changed pkg/a.py\\nTests passed."}}'
+        ),
+        stream_name="stdout",
+        command_label="opencode run --format json",
+    )
+    assert parsed["event_type"] == "decision"
+    assert parsed["message"] == "Changed pkg/a.py\nTests passed."
+    assert parsed["payload"]["provider_event"] == "opencode.text"
+    assert parsed["payload"]["session_id"] == "ses_123"
+
+
+def test_parse_output_event_accepts_opencode_json_tool_use():
+    parsed = _parse_output_event(
+        (
+            '{"type":"tool_use","sessionID":"ses_123","part":{"type":"tool",'
+            '"tool":"write","state":{"status":"completed",'
+            '"input":{"file_path":"pkg/a.py"},"title":"Write pkg/a.py",'
+            '"output":"ok","metadata":{"exit":0}}}}'
+        ),
+        stream_name="stdout",
+        command_label="opencode run --format json",
+    )
+    assert parsed["event_type"] == "edit"
+    assert parsed["file_path"] == "pkg/a.py"
+    assert "OpenCode used write" in parsed["message"]
+    assert parsed["payload"]["provider_event"] == "opencode.tool_use"
+
+
+def test_parse_output_event_accepts_opencode_json_error():
+    parsed = _parse_output_event(
+        (
+            '{"type":"error","sessionID":"ses_123",'
+            '"error":{"name":"APIError","data":{"message":"Rate limit exceeded"}}}'
+        ),
+        stream_name="stdout",
+        command_label="opencode run --format json",
+    )
+    assert parsed["event_type"] == "status"
+    assert parsed["status"] == "failed"
+    assert "Rate limit exceeded" in parsed["message"]
+    assert parsed["payload"]["provider_event"] == "opencode.error"
 
 
 def test_format_command_provider_prompt_mentions_graph_context(tmp_path: Path):

@@ -301,6 +301,12 @@ def test_graph_html_writes_standalone_view(
     assert "data-accept-review-run" in html
     assert "Approve reviewed work" in html
     assert "search_path" in html
+    assert "project-switcher" in html
+    assert "project-switcher-template" in html
+    assert "switch_project_path" in html
+    assert "/api/dirs" in html
+    assert "/api/switch-project" in html
+    assert "/api/init-status" in html
     assert "graphTokenKey" in html
     assert "fetchGraphGet" in html
     assert "/api/search" in html

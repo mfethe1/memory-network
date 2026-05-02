@@ -2,7 +2,8 @@
 
 Repo-local plugin package for `code_index`.
 
-It gives Claude, Codex, and other MCP-capable systems the same control plane:
+It gives Codex, Claude, Kimi, OpenCode, and other MCP-capable systems the same
+control plane:
 
 - read-only MCP retrieval by default
 - graph-server browser UI for repo navigation and task oversight
@@ -23,7 +24,8 @@ python plugins/code-index-agent/scripts/install_plugin.py --root . --provider co
 This writes `.mcp.json`, `.claude/settings.local.json`,
 `.code_index/agent-plugin.json`, `.code_index/start-code-index-agent.ps1`,
 `.code_index/start-code-index-agent.sh`, and a demo task JSON. Use
-`--provider claude`, `--provider codex`, or `--agent-command "your command"`.
+`--provider codex`, `--provider claude`, `--provider kimi`,
+`--provider opencode`, or `--agent-command "your command"`.
 
 ## Start MCP
 
@@ -71,15 +73,29 @@ Codex example:
 python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 8767 --provider codex
 ```
 
+OpenCode example:
+
+```bash
+python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 8767 --provider opencode
+```
+
 Use `--agent-command` when another local agent needs a custom command. Command
 templates support `{message}`, `{run_id}`, `{root}`, `{task_json}`,
+`{provider_prompt}`, `{provider_prompt_file}`, `{mcp_config_file}`,
 `{selected_paths}`, and `{selected_nodes}`. The adapter posts process output
-back as graph events and marks the run `completed`, `failed`, or `cancelled`.
+back as normalized graph events and marks the run `completed`, `failed`, or
+`cancelled`.
 Submitted task JSON includes a `context_packet` so agents start with the
 selected graph node, matching chunks, notes, and recent work history.
 Completed or failed runs include post-run suggestions in the transcript:
 diagnostics for touched files and pytest node ids derived from affected-test
 edges.
+
+Inspect active provider presets with:
+
+```bash
+python -m code_index agent-adapter --list-providers --json
+```
 
 ## Demo
 

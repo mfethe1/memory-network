@@ -10,6 +10,7 @@ import threading
 import textwrap
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -158,6 +159,28 @@ def _make_server(
         thread=thread,
         capsys=capsys,
     )
+
+
+def _start_graph_server_for_root(
+    root: Path,
+    *,
+    scope: str | None = None,
+) -> tuple[ThreadingHTTPServer, threading.Thread, str]:
+    config = cfg_mod.load(root)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+        scope=scope,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, f"http://127.0.0.1:{server.server_address[1]}"
 
 
 def _request_json_with_headers(
@@ -358,6 +381,129 @@ def _wait_for_process_row(config: cfg_mod.Config, run_id: str) -> dict:
                 return dict(row)
         time.sleep(0.05)
     raise AssertionError(f"process row for {run_id} did not finish: {last_status}")
+
+
+def test_graph_server_browses_dirs_and_switches_to_indexed_project(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    repo_one = tmp_path / "repo-one"
+    repo_two = tmp_path / "repo-two"
+    repo_one.mkdir()
+    repo_two.mkdir()
+    (repo_one / "a.py").write_text("def one():\n    return 1\n", encoding="utf-8")
+    (repo_two / "b.py").write_text("def two():\n    return 2\n", encoding="utf-8")
+    assert main(["init", "--root", str(repo_one), "--json"]) == 0
+    capsys.readouterr()
+    assert main(["init", "--root", str(repo_two), "--json"]) == 0
+    capsys.readouterr()
+
+    server, thread, base_url = _start_graph_server_for_root(repo_one)
+    try:
+        dirs = _request_json(f"{base_url}/api/dirs")
+        assert dirs["path"] == tmp_path.resolve().as_posix()
+        entries = {entry["name"]: entry for entry in dirs["entries"]}
+        assert entries["repo-one"]["indexed"] is True
+        assert entries["repo-two"]["indexed"] is True
+
+        switched = _request_json(
+            f"{base_url}/api/switch-project",
+            {"path": str(repo_two)},
+        )
+        assert switched["ok"] is True
+        assert switched["path"] == repo_two.resolve().as_posix()
+
+        graph = _request_json(f"{base_url}/repo-graph.json")
+        assert graph["root"] == str(repo_two.resolve())
+        assert graph["live"]["active_project"]["path"] == repo_two.resolve().as_posix()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_graph_server_initializes_unindexed_project_before_switch(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    indexed_repo = tmp_path / "indexed"
+    new_repo = tmp_path / "new-project"
+    indexed_repo.mkdir()
+    new_repo.mkdir()
+    (indexed_repo / "a.py").write_text("def indexed():\n    return 1\n", encoding="utf-8")
+    (new_repo / "c.py").write_text("def created():\n    return 3\n", encoding="utf-8")
+    assert main(["init", "--root", str(indexed_repo), "--json"]) == 0
+    capsys.readouterr()
+
+    server, thread, base_url = _start_graph_server_for_root(indexed_repo)
+    try:
+        first = _request_json(
+            f"{base_url}/api/switch-project",
+            {"path": str(new_repo)},
+        )
+        assert first == {
+            "needs_init": True,
+            "path": new_repo.resolve().as_posix(),
+        }
+
+        started = _request_json(
+            f"{base_url}/api/switch-project",
+            {"path": str(new_repo), "initialize": True},
+        )
+        assert started["needs_init"] is True
+        assert started["path"] == new_repo.resolve().as_posix()
+        assert started["status"] in {"running", "done"}
+
+        status: dict | None = None
+        query = urllib.parse.urlencode({"path": str(new_repo)})
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            status = _request_json(f"{base_url}/api/init-status?{query}")
+            if status["status"] == "done":
+                break
+            assert status["status"] == "running"
+            time.sleep(0.05)
+        assert status is not None
+        assert status["status"] == "done"
+        assert status["path"] == new_repo.resolve().as_posix()
+
+        switched = _request_json(
+            f"{base_url}/api/switch-project",
+            {"path": str(new_repo)},
+        )
+        assert switched["ok"] is True
+        assert switched["path"] == new_repo.resolve().as_posix()
+        graph = _request_json(f"{base_url}/repo-graph.json")
+        assert graph["root"] == str(new_repo.resolve())
+
+        workspace_path = home / ".code_index" / "workspaces.json"
+        workspace = json.loads(workspace_path.read_text(encoding="utf-8"))
+        assert any(
+            member["path"] == new_repo.resolve().as_posix()
+            for member in workspace["members"]
+        )
+        listing = _request_json(
+            f"{base_url}/api/dirs?{urllib.parse.urlencode({'path': str(tmp_path)})}"
+        )
+        assert any(
+            project["path"] == new_repo.resolve().as_posix()
+            for project in listing["known_projects"]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_graph_server_agent_providers_endpoint_returns_registry(
@@ -1667,6 +1813,26 @@ def test_graph_server_posts_followup_message_to_existing_agent_run(
     assert main(["init", "--root", str(tmp_path), "--json"]) == 0
     capsys.readouterr()
 
+    script_path = tmp_path / "followup_adapter.py"
+    script_path.write_text(
+        textwrap.dedent(
+            """
+            import json
+            import sys
+
+            with open(sys.argv[1], encoding="utf-8") as handle:
+                task = json.load(handle)
+            print(f"followup dispatch: {task['provider']} {task['message']}")
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(
+        agent_adapter_cmd.PROVIDER_COMMANDS,
+        "opencode",
+        f'"{sys.executable}" "{script_path}" {{task_json}}',
+    )
+
     config = cfg_mod.load(tmp_path)
     conn = db_mod.connect(config.db_path)
     try:
@@ -1724,18 +1890,26 @@ def test_graph_server_posts_followup_message_to_existing_agent_run(
 
         transcript = _request_json(f"{base_url}/api/agent-runs/{run['run_id']}")
         assert transcript["run"]["run_id"] == run["run_id"]
-        assert transcript["run"]["status"] == "working"
-        assert [event["message"] for event in transcript["events"]] == [
-            "Continue in this same session."
+        assert transcript["run"]["status"] in {"working", "completed"}
+        assert "Continue in this same session." in [
+            event["message"] for event in transcript["events"]
         ]
         assert transcript["active_files"] == ["pkg/a.py"]
+        completed = _wait_for_run_status(config, run["run_id"], "completed")
+        assert completed["run_id"] == run["run_id"]
 
         conn = db_mod.connect(config.db_path)
         try:
             count = conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0]
+            recent = agent_activity.recent_events(conn, limit=12)
         finally:
             db_mod.close(conn)
         assert count == 1
+        assert any(
+            "followup dispatch: opencode Continue in this same session."
+            in event["message"]
+            for event in recent
+        )
     finally:
         server.shutdown()
         server.server_close()

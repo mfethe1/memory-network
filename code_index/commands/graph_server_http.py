@@ -22,9 +22,11 @@ from code_index.commands.graph_server_perf import (
     _perf_snapshot,
 )
 from code_index.commands.graph_server_state import (
+    GraphServerProjectState,
     _agent_runtime_payload,
     _build_debug_payload,
     _build_payload,
+    _path_for_client,
     _record_user_note_event,
 )
 from code_index.commands.graph_server_router import Router
@@ -48,8 +50,15 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
 
     preflight_secret = _preflight_secret()
     perf_state = _make_perf_state()
+    project_state = GraphServerProjectState(config)
 
-    RoutesBase = _make_routes_class(config, args, preflight_secret, perf_state)
+    RoutesBase = _make_routes_class(
+        config,
+        args,
+        preflight_secret,
+        perf_state,
+        project_state,
+    )
 
     class GraphHandler(BaseHTTPRequestHandler, RoutesBase):
         server_version = "code_index-graph/1"
@@ -216,6 +225,8 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             router.get("/api/file-claims", cls._route_file_claims)
             router.get("/api/search", cls._route_search)
             router.get("/api/symbols", cls._route_symbols)
+            router.get("/api/dirs", cls._route_dirs)
+            router.get("/api/init-status", cls._route_init_status)
             router.get("/api/events", cls._route_events)
             router.get("/api/events/summary", cls._route_events_summary)
             router.get("/api/agent-runs/{run_id}", cls._route_agent_run_get)
@@ -230,6 +241,7 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             router.post("/api/agent-runs/{run_id}/accept-review", cls._route_agent_run_accept_review)
             router.post("/api/agent-runs/{run_id}/archive", cls._route_agent_run_archive)
             router.post("/api/agent-events", cls._route_agent_events_post)
+            router.post("/api/switch-project", cls._route_switch_project)
             router.post("/api/file-claims/{claim_id}/renew", cls._route_claim_renew)
             router.post("/api/file-claims/{claim_id}/release", cls._route_claim_release)
             router.post("/api/file-claims", cls._route_file_claims_post)
@@ -274,6 +286,13 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
                     "agent_providers_path": "/api/agent-providers",
                     "file_claims_path": "/api/file-claims",
                     "events_summary_path": "/api/events/summary",
+                    "dirs_path": "/api/dirs",
+                    "switch_project_path": "/api/switch-project",
+                    "init_status_path": "/api/init-status",
+                    "active_project": {
+                        "name": config.root.name,
+                        "path": _path_for_client(config.root),
+                    },
                 },
             }
             self._send_bytes(
@@ -330,6 +349,14 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
         def _route_symbols(self, _params: dict[str, str]) -> None:
             parsed = urlparse(self.path)
             self._send_symbols(parsed.query)
+
+        def _route_dirs(self, _params: dict[str, str]) -> None:
+            parsed = urlparse(self.path)
+            self._send_dirs(parsed.query)
+
+        def _route_init_status(self, _params: dict[str, str]) -> None:
+            parsed = urlparse(self.path)
+            self._send_init_status(parsed.query)
 
         def _route_events(self, _params: dict[str, str]) -> None:
             parsed = urlparse(self.path)
@@ -410,6 +437,12 @@ def _make_handler(config: cfg_mod.Config, args: argparse.Namespace):
             if payload is None:
                 return
             self._record_agent_event(payload)
+
+        def _route_switch_project(self, _params: dict[str, str]) -> None:
+            payload = self._read_json_payload()
+            if payload is None:
+                return
+            self._switch_project(payload)
 
         def _route_claim_renew(self, params: dict[str, str]) -> None:
             payload = self._read_json_payload()

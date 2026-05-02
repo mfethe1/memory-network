@@ -80,7 +80,7 @@ python -m code_index agent-adapter --mode command \
   --task-json .code_index/sample-task.json \
   --command 'claude -p {provider_prompt}' --json
 
-# Start the repo-local plugin launcher for Claude/Codex/other command adapters
+# Start the repo-local plugin launcher for Codex/Claude/Kimi/OpenCode adapters
 python plugins/code-index-agent/scripts/install_plugin.py --root . --provider codex --json
 python -m code_index agent-plugin start --root . --port 8767 \
   --provider codex
@@ -160,9 +160,9 @@ uses this to highlight active files and the last edited files before the index
 has been refreshed.
 
 When served through `graph-server`, the Chat tab can submit a task for the
-selected node and choose the configured adapter, Codex CLI, Claude CLI, or Kimi
-Code CLI per message. The Notes tab keeps the same submit/export path for saved
-guidance.
+selected node and choose the configured adapter, Codex CLI, Claude CLI, Kimi
+Code CLI, or OpenCode CLI per message. The Notes tab keeps the same
+submit/export path for saved guidance.
 Browser task submission now runs as draft -> preflight -> dispatch:
 `POST /api/agent-task-preflight` builds the normalized task draft, graph
 context, runtime retrieval policy, care warnings, and active file-claim
@@ -173,9 +173,11 @@ callback URL, and dispatches the task when an adapter is configured. Set
 `CODE_INDEX_AGENT_WEBHOOK_URL` to send task JSON to an HTTP webhook, or set
 `CODE_INDEX_AGENT_COMMAND` to launch a local command adapter directly from the
 graph server. You can also set
-`CODE_INDEX_AGENT_PROVIDER=claude`, `CODE_INDEX_AGENT_PROVIDER=codex`, or
-`CODE_INDEX_AGENT_PROVIDER=kimi` for built-in local presets. The Kimi preset
-uses non-interactive stream JSON mode, thinking mode, one Ralph iteration, and a
+`CODE_INDEX_AGENT_PROVIDER=claude`, `CODE_INDEX_AGENT_PROVIDER=codex`,
+`CODE_INDEX_AGENT_PROVIDER=kimi`, or `CODE_INDEX_AGENT_PROVIDER=opencode` for
+built-in local presets. The Codex, Claude, Kimi, and OpenCode presets normalize
+provider JSON output into the same graph event stream. The Kimi preset uses
+non-interactive stream JSON mode, thinking mode, one Ralph iteration, and a
 per-run MCP config that exposes `code_index mcp-serve` to the agent. Kimi runs
 also use an isolated temporary `KIMI_SHARE_DIR`, seeded from the user's current
 Kimi config and credentials, so concurrent runs do not contend for
@@ -184,8 +186,9 @@ Kimi config and credentials, so concurrent runs do not contend for
 provider presets can be loaded without code changes by setting
 `CODE_INDEX_AGENT_PROVIDER_SPECS` to one or more path-separated JSON files with
 `providers` entries containing `id`, `display_name`, `command_preset`, and
-`capabilities`. Each
-submitted task includes a bounded
+`capabilities`. Inspect the active registry with
+`python -m code_index agent-adapter --list-providers --json`. Each submitted
+task includes a bounded
 `context_packet` with repo-map, selected files/nodes, matching chunks, graph
 notes, and recent agent activity. The command adapter streams stdout/stderr
 back as graph events and marks the run completed or failed from the process
@@ -275,11 +278,16 @@ The repo-local plugin package lives in `plugins/code-index-agent`. It includes
 a Codex plugin manifest, MCP server config, a skill playbook, demo assets, an
 installer, and a cross-platform graph-server launcher. The installer writes
 repo-local `.mcp.json`, `.claude/settings.local.json`, `.code_index` launcher
-config, starter scripts, and a demo task:
+config, starter scripts, and a demo task. Codex is the default publishing
+target; the same provider registry supports Claude, Kimi, OpenCode, and custom
+commands:
 
 ```bash
 python plugins/code-index-agent/scripts/install_plugin.py --root . --provider codex --json
 ```
+
+Provider adapter details and extension examples live in
+[`docs/agent-provider-adapters.md`](docs/agent-provider-adapters.md).
 
 The promoted launcher is available as
 `python -m code_index agent-plugin start --root <repo> --scope <dir>`.
@@ -391,8 +399,8 @@ Tracked as TODOs rather than silent gaps:
 - **Graph-server is local-first.** It supports SSE, durable notes, and local
   POST adapters, but it is not yet a hosted multi-user collaboration service.
 - **Provider routing is adapter-level.** The graph can export node task JSON
-  and record activity, but choosing Codex vs Claude still belongs in a thin
-  orchestration/webhook layer above `code_index`.
+  and record activity, while Codex, Claude, Kimi, OpenCode, and custom command
+  selection stays in the thin adapter registry above `code_index`.
 - **Call graph / override / implements relations not yet extracted.**
 - **Inner-block chunks are de-scoped in v1** per the spec; oversized
   functions are not split.

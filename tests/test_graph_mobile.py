@@ -75,6 +75,10 @@ def _payload() -> dict[str, Any]:
             "agent_providers_path": "/api/agent-providers",
             "file_claims_path": "/api/file-claims",
             "auth_browser_session_path": "/api/auth/browser-session",
+            "dirs_path": "/api/dirs",
+            "switch_project_path": "/api/switch-project",
+            "init_status_path": "/api/init-status",
+            "active_project": {"name": "repo", "path": "/repo"},
         },
     }
 
@@ -389,6 +393,17 @@ def test_mobile_graph_page_exposes_phone_client_api_routes():
             continue
         assert f'"{key}"' in html
         assert path in html
+
+
+def test_mobile_graph_page_includes_project_switcher():
+    html = _render_mobile_html(_payload())
+
+    assert "project-switcher" in html
+    assert "project-switcher-template" in html
+    assert "Switch Project" in html
+    assert "/api/dirs" in html
+    assert "/api/switch-project" in html
+    assert "/api/init-status" in html
 
 
 def test_mobile_graph_page_safely_embeds_graph_json():

@@ -16,6 +16,7 @@ CAPABILITY_INLINE_PROVIDER_PROMPT = "inline_provider_prompt"
 CAPABILITY_PROVIDER_PROMPT_FILE = "provider_prompt_file"
 CAPABILITY_LAST_MESSAGE_FILE = "last_message_file"
 CAPABILITY_MCP_CONFIG_FILE = "mcp_config_file"
+CAPABILITY_TASK_JSON_FILE = "task_json_file"
 CAPABILITY_JSON_OUTPUT = "json_output"
 CAPABILITY_STREAM_JSON_OUTPUT = "stream_json_output"
 PROVIDER_SPECS_ENV_VAR = "CODE_INDEX_AGENT_PROVIDER_SPECS"
@@ -200,11 +201,16 @@ def _builtin_provider_specs() -> tuple[AgentProviderSpec, ...]:
         AgentProviderSpec(
             id="claude",
             display_name="Claude",
-            command_preset="claude -p {provider_prompt}",
+            command_preset=(
+                "claude -p --output-format stream-json "
+                "--mcp-config {mcp_config_file} < {provider_prompt_file}"
+            ),
             capabilities=frozenset(
                 {
                     CAPABILITY_COMMAND_PRESET,
-                    CAPABILITY_INLINE_PROVIDER_PROMPT,
+                    CAPABILITY_PROVIDER_PROMPT_FILE,
+                    CAPABILITY_MCP_CONFIG_FILE,
+                    CAPABILITY_STREAM_JSON_OUTPUT,
                 }
             ),
         ),
@@ -234,6 +240,22 @@ def _builtin_provider_specs() -> tuple[AgentProviderSpec, ...]:
                     CAPABILITY_PROVIDER_PROMPT_FILE,
                     CAPABILITY_MCP_CONFIG_FILE,
                     CAPABILITY_STREAM_JSON_OUTPUT,
+                }
+            ),
+        ),
+        AgentProviderSpec(
+            id="opencode",
+            display_name="OpenCode",
+            command_preset=(
+                "opencode run --dir {root} --format json "
+                "--file {task_json} {provider_prompt}"
+            ),
+            capabilities=frozenset(
+                {
+                    CAPABILITY_COMMAND_PRESET,
+                    CAPABILITY_INLINE_PROVIDER_PROMPT,
+                    CAPABILITY_TASK_JSON_FILE,
+                    CAPABILITY_JSON_OUTPUT,
                 }
             ),
         ),

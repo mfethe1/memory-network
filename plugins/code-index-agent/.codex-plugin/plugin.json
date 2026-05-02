@@ -21,7 +21,7 @@
   "interface": {
     "displayName": "Code Index Agent",
     "shortDescription": "Graph-aware repo memory and task supervision for coding agents.",
-    "longDescription": "Code Index Agent packages the code_index CLI, MCP server, and live graph control plane so Claude, Codex, and other MCP-capable agents can search symbols, inspect impact, submit tasks, watch active files, and cancel local command runs from the browser.",
+    "longDescription": "Code Index Agent packages the code_index CLI, MCP server, and live graph control plane so Codex, Claude, Kimi, OpenCode, and other MCP-capable agents can search symbols, inspect impact, submit tasks, watch active files, and cancel local command runs from the browser.",
     "developerName": "code_index contributors",
     "category": "Developer Tools",
     "capabilities": [

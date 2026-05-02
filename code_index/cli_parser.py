@@ -608,6 +608,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="task JSON file path or @path; reads stdin when omitted",
     )
     p_agent_adapter.add_argument(
+        "--list-providers",
+        action="store_true",
+        help="print configured agent provider presets and exit",
+    )
+    p_agent_adapter.add_argument(
         "--callback-url",
         help="override task.callback.agent_events_url",
     )
