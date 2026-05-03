@@ -11,13 +11,16 @@ agent memory into `github.com/mfethe1/fumemory` on Railway.
 **Architecture:** Keep each PC's local `code_index` graph-server and SQLite
 store authoritative for local run status, transcripts, process state, file
 claims, and graph context. Add a thin OpenClaw host daemon per PC for outbound
-fleet coordination, use NATS JetStream/KV for task/event transport and
-host/repo/task leases, and sync long-term summaries into `fumemory`.
+fleet coordination, add an OpenClaw Messaging Service as the single
+human-facing conversation and routing layer, use NATS JetStream/KV for
+task/event/message transport and host/repo/task leases, and sync long-term
+summaries into `fumemory`.
 
 **Tech Stack:** Python `code_index`, Windows Service host daemon, Windows
 OpenSSH, Tailscale/private networking, NATS JetStream/KV, Model Context
-Protocol, OpenTelemetry, Claude/Kimi/Codex/OpenCode/Goose provider adapters,
-Cursor TypeScript SDK via a Node sidecar, and `fumemory` on Railway.
+Protocol, OpenTelemetry, OpenClaw web UI, Telegram notification adapter,
+Claude/Kimi/Codex/OpenCode/Goose provider adapters, Cursor TypeScript SDK via
+a Node sidecar, and `fumemory` on Railway.
 
 ---
 
@@ -49,6 +52,9 @@ Important local facts:
 5. Direct standalone `agent-adapter --provider ...` execution requires a graph
    callback URL, so external CLI review was run directly through `claude -p`
    and `kimi --print`.
+6. The repo already has unified chat context, same-run follow-up messages,
+   Agent Swarm parent/child metadata, local file claims, and graph-server
+   provider registry plumbing that should be reused for OpenClaw messaging.
 
 ## Research Sources
 
@@ -124,6 +130,21 @@ Kimi CLI review changes accepted:
 6. MCP should stay local stdio for `code_index` tools; expose central memory
    and fleet tools over authenticated HTTP only where needed.
 
+OpenClaw messaging review additions accepted:
+
+1. Do not send separate Telegram messages directly to each OpenClaw host or
+   Agent Run.
+2. Add an OpenClaw Messaging Service as the single room/message/notification
+   layer for humans, UI clients, Telegram, scripts, and future API clients.
+3. Treat Telegram as an inbound/outbound adapter for high-signal notifications
+   and operator replies, not as the transport or source of truth.
+4. Route human messages through durable task/run/swarm rooms, then fan out
+   signed commands or delivery records to eligible hosts and Agent Runs.
+5. Preserve the existing local communication layers: local graph-server owns
+   Agent Run transcripts and claims, host daemon bridges local state to fleet
+   transport, Fleet Controller owns assignments and leases, and `fumemory`
+   stores explicit checkpoints instead of raw chat.
+
 ## Non-Goals For The First Version
 
 1. Do not replace the local graph-server.
@@ -133,6 +154,9 @@ Kimi CLI review changes accepted:
 5. Do not implement cross-host file-level locks in the first release.
 6. Do not depend on Cursor SDK as the only provider path.
 7. Do not add Temporal before the basic task/event/lease model is stable.
+8. Do not make Telegram the primary task/event transport.
+9. Do not duplicate user-facing conversation state independently inside every
+   host daemon.
 
 ## Target Architecture
 
@@ -175,6 +199,57 @@ Responsibilities:
    transcripts.
 6. Local MCP stdio tools for agents.
 
+### Module: OpenClaw Messaging Service
+
+Runs centrally next to the Fleet Controller or as a separate service,
+depending on the chosen implementation scenario.
+
+Responsibilities:
+
+1. Store durable rooms for fleet, repo, task, run, host, and swarm
+   conversations.
+2. Accept messages from OpenClaw web UI, Telegram, CLI, scripts, and API
+   clients through one contract.
+3. Normalize human chat, operator commands, agent replies, host alerts, and
+   controller events into one append-only room timeline.
+4. Create delivery records for target hosts, Agent Runs, swarm rooms, Telegram
+   chats, and web clients.
+5. Convert approved mutating messages into signed command references for the
+   Fleet Controller or host daemon inbox.
+6. Project delivery, acknowledgement, and failure state back into the UI.
+7. Apply notification rules so Telegram receives high-signal alerts and
+   replies instead of raw heartbeats or every run event.
+8. Preserve `trace_id`, `correlation_id`, `task_id`, `run_id`, `host_id`, and
+   event offsets so messages can be audited and synced into memory summaries.
+
+The messaging service is not responsible for:
+
+1. Deciding host eligibility or bypassing Fleet Controller leases.
+2. Owning local terminal `AgentRun` status.
+3. Storing raw full transcripts in `fumemory`.
+4. Letting Telegram commands mutate execution without central validation and
+   signing.
+
+### Module: OpenClaw Web UI
+
+The OpenClaw Web UI is the primary human command surface. Telegram mirrors
+selected alerts and replies, but the web UI should be the most complete view of
+fleet state.
+
+Responsibilities:
+
+1. Show one inbox for fleet, repo, task, run, host, and swarm rooms.
+2. Default task communication to one task room, with the Swarm Lead and child
+   Agent Runs shown as room participants.
+3. Provide a target selector for task, swarm, run, host, and fleet messages.
+4. Preview delivery recipients before a user sends a message.
+5. Render mutating messages as command cards with validation, signature,
+   delivery, acknowledgement, and rejection state.
+6. Keep a context side panel for leases, selected paths, active claims, context
+   health, Run Health, Verification State, and memory checkpoints.
+7. Let users filter notification noise by severity, room, repo, task, host,
+   provider, and delivery state.
+
 ### Module: Fleet Controller
 
 Runs centrally, likely next to or near `fumemory`.
@@ -182,13 +257,14 @@ Runs centrally, likely next to or near `fumemory`.
 Responsibilities:
 
 1. Maintain host inventory.
-2. Accept task requests from humans, browser UI, scripts, or API clients.
+2. Accept task requests and command references from the OpenClaw Messaging
+   Service, browser UI, scripts, or API clients.
 3. Select eligible hosts based on repo, provider capabilities, current leases,
    health, and policy.
 4. Assign tasks over NATS.
 5. Aggregate fleet run health from host heartbeats and run events.
 6. Store fleet-level audit events.
-7. Provide dashboard/API views.
+7. Provide dashboard/API views and message-friendly fleet projections.
 8. Push durable memory objects to `fumemory` or accept host-pushed summaries.
 
 The controller may mark a host or run as `unknown` or `stale`, but it must not
@@ -306,6 +382,93 @@ agent_tasks:
   completed_at
 ```
 
+### Message Room
+
+Rooms are the user-facing conversation model. The room controls visibility,
+notification policy, and default delivery targets; it does not override host
+leases or local file claims.
+
+```text
+openclaw_rooms:
+  room_id
+  room_kind              # fleet | repo | task | run | host | swarm
+  display_name
+  repo_id
+  task_id
+  run_id
+  host_id
+  parent_room_id
+  notification_policy
+  created_at
+  archived_at
+  metadata_json
+```
+
+### Message Envelope
+
+Every inbound human message, agent reply, host alert, command request, and
+delivery update uses the same envelope.
+
+```text
+openclaw_messages:
+  message_id
+  room_id
+  sender_kind            # human | agent | controller | host | system
+  sender_id
+  target_scope_json
+  message_type           # chat | command | event | summary | alert
+  body
+  context_handles_json
+  trace_id
+  correlation_id
+  parent_message_id
+  idempotency_key
+  created_at
+  metadata_json
+```
+
+### Message Delivery
+
+Delivery records separate "one user message" from the many hosts, Agent Runs,
+web clients, and notification adapters that may need to receive or acknowledge
+it.
+
+```text
+openclaw_message_deliveries:
+  delivery_id
+  message_id
+  recipient_kind         # host | run | agent | telegram | web | controller
+  recipient_id
+  delivery_status        # queued | delivered | acked | failed | expired
+  nats_sequence
+  delivered_at
+  acked_at
+  error
+  metadata_json
+```
+
+### Signed Command Reference
+
+Mutating messages become command references after validation. This keeps chat
+auditable while preserving the Fleet Controller as the authority for
+assignment, leases, cancellation, and force operations.
+
+```text
+openclaw_command_refs:
+  command_id
+  message_id
+  command_type           # assign_task | run_message | cancel | retry | checkpoint
+  target_host_id
+  task_id
+  run_id
+  lease_id
+  signed_payload
+  signature_key_id
+  expires_at
+  status
+  created_at
+```
+
 ### Provider Run References
 
 ```text
@@ -370,6 +533,11 @@ openclaw.task.<host_id>.ack
 openclaw.run.<host_id>.<run_id>.events
 openclaw.run.<host_id>.<run_id>.status
 openclaw.run.<host_id>.<run_id>.verification
+openclaw.message.inbound
+openclaw.room.<room_id>.events
+openclaw.host.<host_id>.inbox
+openclaw.host.<host_id>.messages.ack
+openclaw.notification.telegram.outbound
 openclaw.audit.<host_id>
 ```
 
@@ -380,6 +548,7 @@ openclaw_hosts
 openclaw_leases
 openclaw_provider_caps
 openclaw_controller_config
+openclaw_message_routes
 ```
 
 Subject ACL baseline:
@@ -391,6 +560,95 @@ Subject ACL baseline:
 4. Controller may consume all host events.
 5. No host may consume another host's task stream.
 6. No host may publish controller config.
+7. Messaging Service may publish room events, host inbox messages, and
+   notification adapter messages.
+8. Telegram adapter may publish only inbound user messages and consume only its
+   own outbound notification subject.
+9. Hosts may consume only their own inbox and publish only acknowledgements for
+   messages addressed to that host.
+
+## Implementation Scenarios
+
+These scenarios are ordered from fastest to most scalable. The recommended
+path is Scenario A for the first milestone, with interfaces kept narrow enough
+to split into Scenario B later.
+
+### Scenario A - Controller-Embedded Messaging
+
+Implement rooms, messages, delivery records, and Telegram adapter endpoints in
+the Fleet Controller package.
+
+Best when:
+
+1. The first milestone needs one deployable service.
+2. The team wants fewer moving pieces while task assignment, leases, and host
+   daemon behavior are still being proven.
+3. Telegram notifications are high-signal alerts, not a heavy chat workload.
+
+Tradeoffs:
+
+1. Fastest path to an end-to-end demo.
+2. Simplest auth and deployment story.
+3. Messaging and scheduling code must keep clear module interfaces to avoid a
+   future split becoming painful.
+
+### Scenario B - Standalone Messaging Service
+
+Run `openclaw_messaging` as a separate service with its own storage and API.
+The Fleet Controller accepts signed command references from it.
+
+Best when:
+
+1. Multiple UI clients, Telegram, and API clients become active at the same
+   time.
+2. Message retention, notification rules, or moderation/audit needs start
+   growing faster than scheduling.
+3. The controller should stay focused on host eligibility, leases, assignment,
+   and fleet health.
+
+Tradeoffs:
+
+1. Cleaner long-term locality for conversation behavior.
+2. Easier to scale notification adapters independently.
+3. Requires service-to-service auth, separate migrations, and more operational
+   surface in the first release.
+
+### Scenario C - Broker-First Messaging
+
+Make NATS JetStream the primary append-only room event log and build projections
+for UI/API reads.
+
+Best when:
+
+1. Replayability and event sourcing are more important than simple relational
+   queries.
+2. The system expects many hosts and high-volume run/event mirroring.
+3. The team is already operating JetStream confidently with durable storage and
+   backup.
+
+Tradeoffs:
+
+1. Strong replay story and natural fan-out.
+2. More complicated read models, migrations, and user-facing history queries.
+3. Riskier before broker persistence and retention behavior are proven.
+
+### Scenario D - Local-First Messaging With Fleet Projection
+
+Keep per-host graph-server conversations as local authority and project them
+centrally for the OpenClaw UI.
+
+Best when:
+
+1. Hosts are often offline or disconnected for long periods.
+2. Local operator workflows must work even when the central service is down.
+3. Cross-host messaging can tolerate delayed convergence.
+
+Tradeoffs:
+
+1. Strong local resilience.
+2. Harder to present one clean task room across all hosts.
+3. Duplicate delivery and conflict handling become more complex than Scenario
+   A or B.
 
 ## Implementation Slices
 
@@ -477,7 +735,57 @@ Verification:
 2. Host daemon reports graph-server unavailable without crashing.
 3. Cancellation request maps to the local graph-server cancel route.
 
-### Slice 3 - NATS Event Outbox And Task Inbox
+### Slice 3 - OpenClaw Messaging Service And UI Rooms
+
+**Files:**
+
+1. Create: `code_index/openclaw_messaging/__init__.py`
+2. Create: `code_index/openclaw_messaging/models.py`
+3. Create: `code_index/openclaw_messaging/store.py`
+4. Create: `code_index/openclaw_messaging/routes.py`
+5. Create: `code_index/openclaw_messaging/telegram.py`
+6. Create: `code_index/openclaw_messaging/notifications.py`
+7. Create: `docs/openclaw/messaging-service.md`
+8. Create: `docs/openclaw/openclaw-ui-command-center.md`
+9. Create: `tests/openclaw_messaging/test_rooms.py`
+10. Create: `tests/openclaw_messaging/test_message_delivery.py`
+11. Create: `tests/openclaw_messaging/test_telegram_adapter.py`
+12. Modify: `code_index/openclaw_controller/app.py`
+13. Modify: `pyproject.toml`
+
+Tasks:
+
+- [ ] Implement `openclaw_rooms`, `openclaw_messages`,
+      `openclaw_message_deliveries`, and `openclaw_command_refs` storage.
+- [ ] Add room kinds for fleet, repo, task, run, host, and swarm.
+- [ ] Add APIs for `GET /rooms`, `GET /rooms/{room_id}/messages`,
+      `POST /messages`, `POST /messages/{message_id}/ack`, and
+      `GET /messages/stream`.
+- [ ] Add a task room projection that shows Swarm Lead and child Agent Runs as
+      participants.
+- [ ] Add target preview: task, swarm, run, host, or fleet, including expected
+      delivery recipients before a user sends.
+- [ ] Define the OpenClaw Web UI command center layout: inbox, room timeline,
+      target selector, command cards, delivery state, and context side panel.
+- [ ] Convert mutating messages into signed command references instead of
+      directly publishing host tasks from Telegram or UI code.
+- [ ] Add Telegram inbound webhook handling and outbound notification delivery.
+- [ ] Add notification rules for `needs_attention`, `blocked`, `failed`,
+      `completed`, `lease_conflict`, and `verification_blocked`.
+- [ ] Add duplicate delivery tests and idempotency tests for repeated Telegram
+      webhook updates.
+
+Verification:
+
+1. One human message can be stored once and delivered to multiple host/run
+   recipients with separate acknowledgement records.
+2. A Telegram reply creates the same message envelope as a web UI message.
+3. A Telegram update replay does not create duplicate commands or deliveries.
+4. Mutating messages require a signed command reference before host delivery.
+5. A task room can show all Agent Swarm child runs without sending separate
+   Telegram messages to each one.
+
+### Slice 4 - NATS Event Outbox And Task Inbox
 
 **Files:**
 
@@ -495,6 +803,9 @@ Tasks:
 - [ ] Add an outbox that can persist unsent events locally.
 - [ ] Add task inbox message validation.
 - [ ] Add task ACK publishing.
+- [ ] Add host inbox message validation for signed command references and
+      non-mutating room deliveries.
+- [ ] Publish message delivery ACKs back to the Messaging Service.
 - [ ] Add replay-safe event sequence numbers.
 - [ ] Add tests for idempotent handling of duplicate task messages.
 
@@ -504,8 +815,10 @@ Verification:
    runs.
 2. Outbox keeps events when publish fails.
 3. Outbox drains after reconnect.
+4. Duplicate message delivery with the same `message_id` and `delivery_id` is
+   acknowledged once.
 
-### Slice 4 - Fleet Leases And Fencing
+### Slice 5 - Fleet Leases And Fencing
 
 **Files:**
 
@@ -530,7 +843,7 @@ Verification:
 2. A stale lower fencing revision cannot release or overwrite a newer lease.
 3. Local file claims continue to work without NATS.
 
-### Slice 5 - Fleet Controller API
+### Slice 6 - Fleet Controller API
 
 **Files:**
 
@@ -546,9 +859,12 @@ Tasks:
 
 - [ ] Add host inventory model.
 - [ ] Add task creation endpoint.
+- [ ] Accept signed command references from the Messaging Service.
 - [ ] Add host eligibility filtering by repo root, provider capability, health,
       and lease availability.
 - [ ] Add NATS task publish.
+- [ ] Return assignment and rejection results in a shape the Messaging Service
+      can attach to the originating room message.
 - [ ] Add run health aggregation from heartbeats and events.
 - [ ] Add API tests for host selection and rejected assignments.
 
@@ -558,8 +874,9 @@ Verification:
 2. Controller refuses assignment when the repo lease is held elsewhere.
 3. Controller marks host health `unknown` or `stale` without mutating local
    terminal run status.
+4. Controller rejects unsigned or expired command references.
 
-### Slice 6 - fumemory Sync
+### Slice 7 - fumemory Sync
 
 **Files:**
 
@@ -585,7 +902,7 @@ Verification:
 2. Duplicate sync payload is safe.
 3. Memory payload can be traced back to the original run.
 
-### Slice 7 - Cursor SDK Provider Adapter
+### Slice 8 - Cursor SDK Provider Adapter
 
 **Files:**
 
@@ -616,7 +933,7 @@ Verification:
 3. Cancellation emits a local terminal status exactly once.
 4. SDK version is pinned and documented.
 
-### Slice 8 - Open Source Provider Adapters
+### Slice 9 - Open Source Provider Adapters
 
 **Files:**
 
@@ -641,7 +958,7 @@ Verification:
 2. Each provider preset can be smoke-tested or gracefully reports missing CLI.
 3. Missing provider CLI never crashes the host daemon.
 
-### Slice 9 - Observability
+### Slice 10 - Observability
 
 **Files:**
 
@@ -667,7 +984,7 @@ Verification:
 2. Collector outage does not fail task execution.
 3. Logs do not contain provider secrets.
 
-### Slice 10 - Windows Installation And Operations
+### Slice 11 - Windows Installation And Operations
 
 **Files:**
 
@@ -727,6 +1044,20 @@ Initial timing:
 3. Do not expose local filesystem MCP tools broadly over the network.
 4. Use least-privilege tool registration per provider.
 
+### Messaging And Notifications
+
+1. OpenClaw Messaging Service owns central room/message/delivery state.
+2. Telegram is a notification and reply adapter, not a host transport.
+3. User-visible task communication should default to one task room, with run
+   and host threads available for focused follow-up.
+4. A message can create multiple delivery records, but it must remain one
+   durable user message.
+5. Mutating messages require validation and a signed command reference before
+   host delivery.
+6. Notification rules should suppress routine heartbeats and raw event spam.
+7. Delivery and ACK failures should appear in the room timeline without
+   changing local terminal `AgentRun` status.
+
 ## Risks And Mitigations
 
 1. Railway-hosted JetStream loses or replays data unexpectedly.
@@ -768,6 +1099,21 @@ Initial timing:
     - Mitigation: Windows-native service first; WSL support only through an
       explicit adapter later.
 
+11. Telegram becomes a noisy parallel control path.
+    - Mitigation: route Telegram through the Messaging Service, require the
+      same message envelope and command signing as the web UI, and notify only
+      high-signal events by default.
+
+12. Message fan-out creates duplicate work.
+    - Mitigation: store one durable message with per-recipient delivery
+      records, require idempotency keys, and keep Fleet Controller leases as
+      the gate before task assignment.
+
+13. Room history drifts from local run transcripts.
+    - Mitigation: store message references and summarized events centrally,
+      keep local graph-server as transcript authority, and sync only explicit
+      checkpoints to `fumemory`.
+
 ## Success Criteria
 
 1. A Windows PC can enroll as an OpenClaw host with a stable `host_id`.
@@ -787,6 +1133,12 @@ Initial timing:
     dependency.
 13. The same `trace_id` follows a task from controller to host daemon to local
     run to memory sync.
+14. One task room can coordinate a Swarm Lead and child Agent Runs without
+    separate Telegram messages to each OpenClaw instance.
+15. Telegram replies and web UI messages create the same message envelope and
+    delivery records.
+16. A user can see whether a message is queued, delivered, acknowledged,
+    failed, or expired per host/run recipient.
 
 ## First Milestone Definition
 
@@ -797,18 +1149,26 @@ Milestone 1 scope:
 1. Slice 0: broker, identity, security docs and config.
 2. Slice 1: host daemon skeleton.
 3. Slice 2: local graph-server adapter.
-4. Slice 3: task inbox and event outbox.
-5. Minimal controller task assignment.
+4. Slice 3: embedded Messaging Service with rooms, message storage, delivery
+   records, and Telegram adapter stubs.
+5. Slice 4: task inbox, host inbox, message ACKs, and event outbox.
+6. Slice 5: minimal host/repo/task leases and fencing before adding a second
+   host.
+7. Slice 6: minimal controller task assignment from signed command references.
 
 Milestone 1 demo:
 
 1. Start NATS with persistence.
 2. Start the controller.
-3. Start one Windows host daemon.
-4. Submit one task to the controller.
-5. Host receives task, dispatches local adapter, publishes events, and reports
+3. Use Scenario A embedded Messaging Service mode in the controller.
+4. Start one Windows host daemon.
+5. Submit one task room message from the OpenClaw UI or API.
+6. Messaging Service stores the message once, creates delivery records, and
+   asks the controller to sign and assign the task.
+7. Host receives task, dispatches local adapter, publishes events, and reports
    final local status.
-6. Stop the network connection during a run and verify local status remains
+8. Telegram receives only the high-signal task status notification.
+9. Stop the network connection during a run and verify local status remains
    authoritative.
 
 ## Recommended Next Command Sequence
