@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +15,7 @@ STATE_DIR_ENV = "OPENCLAW_HOSTD_STATE_DIR"
 HOST_IDENTITY_PATH_ENV = "OPENCLAW_HOSTD_HOST_ID_PATH"
 REPO_ROOTS_ENV = "OPENCLAW_HOSTD_REPO_ROOTS"
 GRAPH_SERVER_URL_ENV = "OPENCLAW_HOSTD_GRAPH_SERVER_URL"
+GRAPH_SERVER_TOKEN_ENV = "OPENCLAW_HOSTD_GRAPH_SERVER_TOKEN"
 SSH_HOSTNAME_ENV = "OPENCLAW_HOSTD_SSH_HOSTNAME"
 HEARTBEAT_INTERVAL_ENV = "OPENCLAW_HOSTD_HEARTBEAT_INTERVAL_SECONDS"
 
@@ -28,6 +29,7 @@ class HostDaemonConfig:
     host_identity_path: Path
     repo_roots: tuple[Path, ...]
     graph_server_url: str | None = DEFAULT_GRAPH_SERVER_URL
+    graph_server_token: str | None = field(default=None, repr=False)
     ssh_hostname: str | None = None
     heartbeat_interval_seconds: int = DEFAULT_HEARTBEAT_INTERVAL_SECONDS
     config_path: Path | None = None
@@ -124,6 +126,9 @@ def load_config(
             data.get("graph_server_url", DEFAULT_GRAPH_SERVER_URL),
         )
     )
+    graph_server_token = _text_or_none(
+        environ.get(GRAPH_SERVER_TOKEN_ENV, data.get("graph_server_token"))
+    )
     ssh_hostname = _text_or_none(
         environ.get(SSH_HOSTNAME_ENV, data.get("ssh_hostname"))
     )
@@ -140,6 +145,7 @@ def load_config(
         host_identity_path=host_identity_path,
         repo_roots=tuple(repo_roots),
         graph_server_url=graph_server_url,
+        graph_server_token=graph_server_token,
         ssh_hostname=ssh_hostname,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
         config_path=selected_config_path,

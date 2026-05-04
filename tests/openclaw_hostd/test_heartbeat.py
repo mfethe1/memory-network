@@ -9,6 +9,7 @@ import pytest
 from code_index.openclaw_hostd import heartbeat
 from code_index.openclaw_hostd import service
 from code_index.openclaw_hostd.config import (
+    GRAPH_SERVER_TOKEN_ENV,
     GRAPH_SERVER_URL_ENV,
     HOST_IDENTITY_PATH_ENV,
     HostDaemonConfig,
@@ -154,6 +155,7 @@ def test_config_loads_json_file_with_environment_overrides(tmp_path: Path) -> No
                 "state_dir": str(tmp_path / "state-from-file"),
                 "repo_roots": [str(file_root)],
                 "graph_server_url": "http://127.0.0.1:1111/health",
+                "graph_server_token": "file-token",
                 "ssh_hostname": "file-host",
                 "heartbeat_interval_seconds": 45,
             }
@@ -166,6 +168,7 @@ def test_config_loads_json_file_with_environment_overrides(tmp_path: Path) -> No
         env={
             REPO_ROOTS_ENV: str(env_root),
             GRAPH_SERVER_URL_ENV: "",
+            GRAPH_SERVER_TOKEN_ENV: "env-token",
             HOST_IDENTITY_PATH_ENV: str(tmp_path / "identity-from-env.json"),
         },
         cwd=tmp_path,
@@ -176,5 +179,7 @@ def test_config_loads_json_file_with_environment_overrides(tmp_path: Path) -> No
     assert config.host_identity_path == tmp_path / "identity-from-env.json"
     assert config.repo_roots == (env_root,)
     assert config.graph_server_url is None
+    assert config.graph_server_token == "env-token"
+    assert "env-token" not in repr(config)
     assert config.ssh_hostname == "file-host"
     assert config.heartbeat_interval_seconds == 45

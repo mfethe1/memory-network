@@ -56,9 +56,17 @@ def _emit_payload(payload: dict[str, object], *, as_json: bool) -> None:
     )
 
 
-def _probe_graph_server_provider_registry(url: str) -> bool:
+def _probe_graph_server_provider_registry(
+    url: str,
+    *,
+    bearer_token: str | None = None,
+) -> bool:
     try:
-        return GraphServerClient(url, timeout=0.5).health().available
+        return GraphServerClient(
+            url,
+            timeout=0.5,
+            bearer_token=bearer_token,
+        ).health().available
     except ValueError:
         return False
 
@@ -70,9 +78,12 @@ def run_once(
     probe_graph_server: bool = False,
 ) -> dict[str, object]:
     identity = load_or_create_host_identity(config.host_identity_path)
-    graph_server_probe = (
-        _probe_graph_server_provider_registry if probe_graph_server else None
-    )
+    graph_server_probe = None
+    if probe_graph_server:
+        graph_server_probe = lambda url: _probe_graph_server_provider_registry(
+            url,
+            bearer_token=config.graph_server_token,
+        )
     payload = build_heartbeat_payload(
         config,
         identity,

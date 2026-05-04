@@ -52,9 +52,16 @@ class GraphServerHealth:
 class GraphServerClient:
     """Small stdlib-HTTP client for the local graph-server API."""
 
-    def __init__(self, base_url: str, *, timeout: float = 2.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout: float = 2.0,
+        bearer_token: str | None = None,
+    ) -> None:
         self.base_url = _normalise_base_url(base_url)
         self.timeout = timeout
+        self.bearer_token = str(bearer_token or "").strip() or None
 
     def health(self) -> GraphServerHealth:
         response = self._request_json("GET", "/api/agent-providers")
@@ -110,9 +117,18 @@ class GraphServerClient:
             payload["agent_name"] = agent_name_text
         return self._request_json("POST", "/api/agent-runs", payload)
 
-    def get_run_status(self, run_id: str) -> GraphServerResponse:
+    def get_run_status(
+        self,
+        run_id: str,
+        *,
+        request_timeout: float | None = None,
+    ) -> GraphServerResponse:
         encoded_run_id = quote(str(run_id).strip(), safe="")
-        return self._request_json("GET", f"/api/agent-runs/{encoded_run_id}")
+        return self._request_json(
+            "GET",
+            f"/api/agent-runs/{encoded_run_id}",
+            timeout=request_timeout,
+        )
 
     def cancel_run(self, run_id: str) -> GraphServerResponse:
         encoded_run_id = quote(str(run_id).strip(), safe="")
@@ -136,21 +152,26 @@ class GraphServerClient:
             if str(status).strip()
         }
         deadline = time.monotonic() + max(0.0, timeout_seconds)
+        last_response: GraphServerResponse | None = None
         while True:
-            response = self.get_run_status(run_id)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return _poll_timeout_response(run_id, last_response)
+            response = self.get_run_status(
+                run_id,
+                request_timeout=min(self.timeout, remaining),
+            )
+            last_response = response
             if not response.ok:
+                if time.monotonic() >= deadline:
+                    return _poll_timeout_response(run_id, response)
                 return response
             status = _run_status(response.payload)
             if status in stopped:
                 return response
             now = time.monotonic()
             if now >= deadline:
-                return GraphServerResponse(
-                    ok=False,
-                    status_code=response.status_code,
-                    payload=response.payload,
-                    error=f"timed out waiting for graph-server run {run_id} status",
-                )
+                return _poll_timeout_response(run_id, response)
             sleep_for = max(0.0, min(interval_seconds, deadline - now))
             if sleep_for:
                 time.sleep(sleep_for)
@@ -160,9 +181,12 @@ class GraphServerClient:
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> GraphServerResponse:
         data: bytes | None = None
         headers = {"Accept": "application/json"}
+        if self.bearer_token:
+            headers["Authorization"] = f"Bearer {self.bearer_token}"
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -173,7 +197,8 @@ class GraphServerClient:
             method=method,
         )
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            request_timeout = self.timeout if timeout is None else max(0.0, timeout)
+            with urlopen(request, timeout=request_timeout) as response:
                 return _json_response(
                     status_code=int(response.status),
                     body=response.read(),
@@ -197,15 +222,23 @@ class GraphServerClient:
 
 def _normalise_base_url(raw_url: str) -> str:
     parsed = urlsplit(str(raw_url or "").strip())
-    if not parsed.scheme or not parsed.netloc:
+    if not parsed.scheme or not parsed.netloc or not parsed.hostname:
         raise ValueError("graph-server URL must be absolute")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("graph-server URL has an invalid port") from exc
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
     path = parsed.path.rstrip("/")
     if any(
         path == endpoint or path.startswith(f"{endpoint}/")
         for endpoint in _GRAPH_SERVER_ENDPOINT_PREFIXES
     ):
         path = ""
-    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
+    return urlunsplit((parsed.scheme, netloc, path, "", "")).rstrip("/")
 
 
 def _json_response(
@@ -265,3 +298,15 @@ def _string_list(values: Iterable[str] | str | None) -> list[str]:
 def _run_status(payload: dict[str, Any]) -> str:
     run = payload.get("run") if isinstance(payload.get("run"), dict) else {}
     return str(run.get("status") or payload.get("status") or "").strip().lower()
+
+
+def _poll_timeout_response(
+    run_id: str,
+    response: GraphServerResponse | None,
+) -> GraphServerResponse:
+    return GraphServerResponse(
+        ok=False,
+        status_code=response.status_code if response else None,
+        payload=response.payload if response else {},
+        error=f"timed out waiting for graph-server run {run_id} status",
+    )
