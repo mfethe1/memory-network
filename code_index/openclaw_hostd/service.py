@@ -593,14 +593,19 @@ def setup_nats_runtime(
         command_ref_verifier=command_ref_verifier,
     )
     dispatcher = NatsMessageDispatcher(logger=logger)
+    task_handler = lambda message: _dispatch_nats_message(
+        dispatcher,
+        message,
+        task_inbox.handle_task_assignment,
+        nats_client=nats_client,
+    )
+    nats_client.subscribe(
+        f"openclaw.task.{identity.host_id}.assigned",
+        task_handler,
+    )
     nats_client.subscribe(
         f"openclaw.deliver.{identity.host_id}.tasks",
-        lambda message: _dispatch_nats_message(
-            dispatcher,
-            message,
-            task_inbox.handle_task_assignment,
-            nats_client=nats_client,
-        ),
+        task_handler,
     )
     nats_client.subscribe(
         f"openclaw.host.{identity.host_id}.inbox",

@@ -275,6 +275,7 @@ def test_daemon_loop_uses_connected_nats_for_subscriptions_outbox_and_agent_stat
     assert transport.closed is True
     assert transport.connected is False
     assert set(transport.subscriptions) == {
+        f"openclaw.task.{HOST_ID}.assigned",
         f"openclaw.deliver.{HOST_ID}.tasks",
         f"openclaw.host.{HOST_ID}.inbox",
     }
@@ -350,6 +351,7 @@ def test_configured_nats_transport_factory_subscribes_drains_and_publishes_agent
 
     assert factory_urls == ["nats://127.0.0.1:4222"]
     assert set(transport.subscriptions) == {
+        f"openclaw.task.{HOST_ID}.assigned",
         f"openclaw.deliver.{HOST_ID}.tasks",
         f"openclaw.host.{HOST_ID}.inbox",
     }
@@ -379,6 +381,7 @@ def test_configured_nats_runs_with_empty_graph_server_url(
 
     assert factory_urls == ["nats://127.0.0.1:4222"]
     assert set(transport.subscriptions) == {
+        f"openclaw.task.{HOST_ID}.assigned",
         f"openclaw.deliver.{HOST_ID}.tasks",
         f"openclaw.host.{HOST_ID}.inbox",
     }
@@ -588,7 +591,10 @@ def test_daemon_loop_nats_callbacks_route_task_and_host_inbox_messages(
     )
     assert runtime is not None
 
-    transport.subscriptions[f"openclaw.deliver.{HOST_ID}.tasks"](
+    assert f"openclaw.task.{HOST_ID}.assigned" in transport.subscriptions
+    assert f"openclaw.deliver.{HOST_ID}.tasks" in transport.subscriptions
+
+    transport.subscriptions[f"openclaw.task.{HOST_ID}.assigned"](
         {
             "kind": "openclaw.task.assigned",
             "schema_version": 1,
