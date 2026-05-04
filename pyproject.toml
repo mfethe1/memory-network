@@ -39,6 +39,7 @@ index = "code_index.index_launcher:main"
 code_index = "code_index.cli:main"
 code-index = "code_index.cli:main"
 code-index-openclaw-hostd = "code_index.openclaw_hostd.service:main"
+code-index-openclaw-context-probe = "code_index.openclaw_hostd.context_probe:main"
 code-index-openclaw-controller = "code_index.openclaw_controller.app:main"
 code-index-openclaw-fleet-controller = "code_index.openclaw_controller.app:main"
 

@@ -180,6 +180,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Check local graph-server availability during heartbeat generation.",
     )
+    parser.add_argument(
+        "--probe-context",
+        action="store_true",
+        help="Attach passive context metrics to heartbeat output.",
+    )
     return parser
 
 
@@ -620,6 +625,7 @@ def run_daemon_loop(
     outbox: Any | None = None,
     lease_store: Any | None = None,
     active_run_provider: ActiveRunProvider | None = None,
+    context_probe: Any | None = None,
     command_ref_verifier: Callable[[Mapping[str, Any]], bool] | None = None,
     logger: Any | None = None,
     sleep: Callable[[float], None] = time.sleep,
@@ -668,6 +674,7 @@ def run_daemon_loop(
                 probe_graph_server=probe_graph_server,
                 nats_client=runtime.nats_client if runtime is not None else None,
                 active_agent_runs=active_agent_runs,
+                context_probe=context_probe,
                 logger=logger,
             )
             if runtime is not None:
@@ -765,6 +772,7 @@ def run_once(
     probe_graph_server: bool = False,
     nats_client: Any | None = None,
     active_agent_runs: Iterable[AgentRunState | Mapping[str, Any]] = (),
+    context_probe: Any | None = None,
     logger: Any | None = None,
 ) -> dict[str, object]:
     identity = load_or_create_host_identity(config.host_identity_path)
@@ -780,6 +788,14 @@ def run_once(
         graph_server_probe=graph_server_probe,
         probe_graph_server=probe_graph_server,
     )
+    active_agent_runs = tuple(active_agent_runs)
+    if context_probe is not None:
+        payload["context"] = _context_probe_payload(
+            context_probe,
+            active_agent_runs=active_agent_runs,
+            host_id=identity.host_id,
+            logger=logger or get_logger(),
+        )
     if nats_client is not None:
         try:
             publish_agent_state_entries(
@@ -805,19 +821,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         if args.once:
+            context_probe = (
+                _configured_context_probe(config) if args.probe_context else None
+            )
             run_daemon_loop(
                 config,
                 as_json=bool(args.json),
                 probe_graph_server=bool(args.probe_graph_server),
+                context_probe=context_probe,
                 sleep=lambda seconds: None,
                 max_iterations=1,
             )
             return 0
 
+        context_probe = (
+            _configured_context_probe(config) if args.probe_context else None
+        )
         run_daemon_loop(
             config,
             as_json=bool(args.json),
             probe_graph_server=bool(args.probe_graph_server),
+            context_probe=context_probe,
         )
     except KeyboardInterrupt:
         logger.info("OpenClaw host daemon interrupted")
@@ -825,6 +849,76 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         print(f"OpenClaw host daemon failed: {exc}", file=sys.stderr)
         return 1
+
+
+def _configured_context_probe(config: HostDaemonConfig) -> Any:
+    from code_index.openclaw_hostd.context_probe import HostContextProbe
+
+    repo_root = config.repo_roots[0] if config.repo_roots else None
+    return HostContextProbe(repo_root=repo_root)
+
+
+def _context_probe_payload(
+    context_probe: Any,
+    *,
+    active_agent_runs: Iterable[AgentRunState | Mapping[str, Any]],
+    host_id: str,
+    logger: Any | None = None,
+) -> dict[str, Any]:
+    metrics: list[dict[str, Any]] = []
+    health_flags: list[dict[str, Any]] = []
+    for run in active_agent_runs:
+        try:
+            mapping = _run_state_mapping(run, host_id=host_id)
+            item = context_probe.collect_run_metrics(mapping)
+        except Exception as exc:
+            _logger_warning(
+                logger,
+                "OpenClaw context probe failed; continuing heartbeat loop: %s",
+                exc,
+            )
+            continue
+        metrics.append(item.to_dict())
+        if item.degraded_reasons:
+            health_flags.append(
+                {
+                    "run_id": item.run_id,
+                    "severity": "warning",
+                    "event_kind": "context_manager_degraded",
+                    "reasons": list(item.degraded_reasons),
+                }
+            )
+    return {
+        "schema_version": 1,
+        "metrics": metrics,
+        "health_flags": health_flags,
+    }
+
+
+def _run_state_mapping(
+    run: AgentRunState | Mapping[str, Any],
+    *,
+    host_id: str,
+) -> dict[str, Any]:
+    if isinstance(run, Mapping):
+        out = dict(run)
+    else:
+        out = {
+            "agent_id": run.agent_id,
+            "task_id": run.task_id,
+            "run_id": run.run_id,
+            "current_subtask": run.current_subtask,
+            "active_files": list(run.active_files),
+            "active_symbols": list(run.active_symbols),
+            "loaded_context_handles": [
+                dict(item) for item in run.loaded_context_handles
+            ],
+            "estimated_tokens": run.estimated_tokens,
+            "approach_history": list(run.approach_history),
+            "last_action_at": run.last_action_at,
+        }
+    out.setdefault("host_id", host_id)
+    return out
 
 
 if __name__ == "__main__":
