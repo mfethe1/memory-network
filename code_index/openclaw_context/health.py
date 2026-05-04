@@ -20,6 +20,8 @@ class ContextHealthInputs:
     manifest_source_hashes: dict[str, str] | None = None
     current_source_hashes: dict[str, str] | None = None
     required_pointer_ids: tuple[str, ...] = ()
+    contradiction_signals: tuple[dict[str, Any], ...] = ()
+    drift_signals: tuple[dict[str, Any], ...] = ()
     context_manager_handoff_present: bool = False
     budget_tokens: int = FRESH_SESSION_TOKENS
 
@@ -119,6 +121,54 @@ def evaluate_context_health(
                 severity="warning",
                 budget_tokens=inputs.budget_tokens,
                 details={"approaches": repeated_approaches},
+                store=store,
+            )
+        )
+
+    if inputs.contradiction_signals:
+        events.append(
+            _event(
+                metrics,
+                event_kind="contradiction",
+                severity="warning",
+                budget_tokens=inputs.budget_tokens,
+                details={
+                    "signals": [
+                        dict(signal) for signal in inputs.contradiction_signals
+                    ],
+                    "passive": True,
+                },
+                store=store,
+            )
+        )
+
+    if inputs.drift_signals:
+        drift_details = {
+            "signals": [dict(signal) for signal in inputs.drift_signals],
+            "passive": True,
+        }
+        events.append(
+            _event(
+                metrics,
+                event_kind="drift",
+                severity="warning",
+                budget_tokens=inputs.budget_tokens,
+                details=drift_details,
+                store=store,
+            )
+        )
+        events.append(
+            _event(
+                metrics,
+                event_kind="correction_needed",
+                severity="warning",
+                budget_tokens=inputs.budget_tokens,
+                details={
+                    **drift_details,
+                    "source_event_kind": "drift",
+                    "enforced": False,
+                    "invoked_llm": False,
+                },
                 store=store,
             )
         )

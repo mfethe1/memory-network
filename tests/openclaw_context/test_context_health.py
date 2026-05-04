@@ -6,6 +6,7 @@ from code_index.openclaw_context.health import ContextHealthInputs
 from code_index.openclaw_context.health import evaluate_context_health
 from code_index.openclaw_context.models import HostContextMetrics
 from code_index.openclaw_context.policy import detect_quality_gate_flags
+from code_index.openclaw_context.policy import record_quality_gate_events
 from code_index.openclaw_context.store import SQLiteContextStore
 from code_index.openclaw_hostd.context_probe import HostContextProbe
 
@@ -70,6 +71,52 @@ def test_source_hash_mismatch_and_compaction_emit_stale_and_critical_events(
         store.close()
 
 
+def test_contradiction_and_drift_signals_emit_passive_health_events(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteContextStore(tmp_path / "context.db")
+    try:
+        metrics = HostContextMetrics(
+            host_id="host-a",
+            run_id="run-contradiction",
+            task_id="task-contradiction",
+            agent_id="agent-a",
+            estimated_tokens=12_000,
+        )
+
+        events = evaluate_context_health(
+            ContextHealthInputs(
+                metrics=metrics,
+                contradiction_signals=(
+                    {
+                        "claim": "retry loop removed",
+                        "conflicts_with": "decision pointer says preserve retries",
+                    },
+                ),
+                drift_signals=(
+                    {
+                        "acceptance_criteria": "preserve retries",
+                        "recent_activity": "edited unrelated docs",
+                    },
+                ),
+            ),
+            store=store,
+        )
+
+        by_kind = {event.event_kind: event for event in events}
+        assert by_kind["contradiction"].severity == "warning"
+        assert by_kind["drift"].severity == "warning"
+        assert by_kind["correction_needed"].severity == "warning"
+        assert by_kind["correction_needed"].details["passive"] is True
+        assert by_kind["correction_needed"].details["enforced"] is False
+        assert {
+            event.event_kind
+            for event in store.list_context_health_events(run_id="run-contradiction")
+        } == {"contradiction", "drift", "correction_needed"}
+    finally:
+        store.close()
+
+
 def test_quality_gate_patterns_emit_passive_flags_without_llm_invocation() -> None:
     flags = detect_quality_gate_flags(
         {
@@ -97,9 +144,65 @@ def test_quality_gate_patterns_emit_passive_flags_without_llm_invocation() -> No
         "premature_done_without_verification",
         "repeated_approach",
         "goal_drift",
+        "correction_needed",
     }
     assert all(flag.passive is True for flag in flags)
     assert all(flag.invoked_llm is False for flag in flags)
+
+
+def test_quality_gate_flags_are_persisted_as_passive_health_events(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteContextStore(tmp_path / "context.db")
+    try:
+        events = record_quality_gate_events(
+            store,
+            {
+                "host_id": "host-a",
+                "agent_id": "agent-a",
+                "task_id": "task-complex",
+                "run_id": "run-complex",
+                "task_complexity": "complex",
+                "test_run_count": 0,
+                "estimated_tokens": 10_000,
+            },
+        )
+
+        assert [(event.event_kind, event.severity) for event in events] == [
+            ("quality_gate_zero_test_runs", "warning")
+        ]
+        persisted = store.list_context_health_events(run_id="run-complex")
+        assert persisted[0].details["flag_kind"] == "zero_test_runs"
+        assert persisted[0].details["passive"] is True
+        assert persisted[0].details["invoked_llm"] is False
+    finally:
+        store.close()
+
+
+def test_goal_drift_quality_gate_persists_correction_needed_event(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteContextStore(tmp_path / "context.db")
+    try:
+        events = record_quality_gate_events(
+            store,
+            {
+                "host_id": "host-a",
+                "agent_id": "agent-a",
+                "task_id": "task-drift",
+                "run_id": "run-drift",
+                "acceptance_criteria": ["preserve retry behavior"],
+                "last_tool_calls": ["opened README", "edited docs", "reported done"],
+            },
+        )
+
+        by_kind = {event.event_kind: event for event in events}
+        assert by_kind["quality_gate_goal_drift"].details["passive"] is True
+        assert by_kind["correction_needed"].details["passive"] is True
+        assert by_kind["correction_needed"].details["enforced"] is False
+        assert by_kind["correction_needed"].details["invoked_llm"] is False
+    finally:
+        store.close()
 
 
 class FailingStore:

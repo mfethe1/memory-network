@@ -4,8 +4,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from code_index.openclaw_context.manifest import CodeIndexContextProbe
 from code_index.openclaw_context.manifest import ContextManifestBuilder
 from code_index.openclaw_context.manifest import ManifestRequest
+from code_index.openclaw_hostd.leases import InMemoryFleetLeaseStore
 from code_index.openclaw_context.store import SQLiteContextStore
 
 
@@ -196,5 +198,70 @@ def test_manifest_builder_aborts_with_error_manifest_when_doctor_reports_stale(
         assert manifest.error_kind == "stale_index"
         assert manifest.pointer_ids == ()
         assert [name for name, _ in probe.calls] == ["doctor"]
+    finally:
+        store.close()
+
+
+class FakeCommandResult:
+    def __init__(self, stdout: str, *, returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.stderr = ""
+        self.returncode = returncode
+
+
+def test_manifest_builder_default_probe_reads_fleet_context_graph_from_lease_store(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteContextStore(tmp_path / "context.db")
+    lease_store = InMemoryFleetLeaseStore()
+    lease_store.put_agent_state(
+        "host-peer.run-peer",
+        {
+            "host_id": "host-peer",
+            "agent_id": "agent-peer",
+            "task_id": "task-peer",
+            "run_id": "run-peer",
+            "active_symbols_json": '["pkg.service.handle"]',
+            "current_subtask": "found retry behavior decision",
+            "last_action_at": NOW.isoformat(),
+        },
+    )
+    commands: list[list[str]] = []
+
+    def runner(args: list[str]) -> FakeCommandResult:
+        commands.append(args)
+        if "doctor" in args:
+            return FakeCommandResult('{"ok": true}')
+        if "impact" in args:
+            return FakeCommandResult('{"impacted": []}')
+        if "tests" in args:
+            return FakeCommandResult('{"node_ids": []}')
+        if "repo-map" in args:
+            return FakeCommandResult("pkg.service.handle -> pkg/service.py")
+        return FakeCommandResult("{}", returncode=1)
+
+    try:
+        builder = ContextManifestBuilder(
+            store=store,
+            probe=CodeIndexContextProbe(runner=runner, lease_store=lease_store),
+            signing_secret="test-secret",
+            now=lambda: NOW,
+        )
+
+        manifest = builder.build_manifest(_request())
+
+        assert manifest.status == "signed"
+        assert manifest.peer_agent_states == (
+            {
+                "host_id": "host-peer",
+                "agent_id": "agent-peer",
+                "task_id": "task-peer",
+                "run_id": "run-peer",
+                "active_symbols_json": '["pkg.service.handle"]',
+                "current_subtask": "found retry behavior decision",
+                "last_action_at": NOW.isoformat(),
+            },
+        )
+        assert any("repo-map" in command for command in commands)
     finally:
         store.close()

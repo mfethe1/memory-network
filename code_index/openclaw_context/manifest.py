@@ -60,10 +60,18 @@ class CodeIndexContextProbe:
         repo_root: str | Path | None = None,
         runner: Callable[[list[str]], Any] | None = None,
         agent_state_reader: Callable[[], list[dict[str, Any]]] | None = None,
+        lease_store: Any | None = None,
+        lease_store_path: str | Path | None = None,
     ) -> None:
         self.repo_root = Path(repo_root or Path.cwd())
         self.runner = runner or self._subprocess_run
-        self.agent_state_reader = agent_state_reader or (lambda: [])
+        if agent_state_reader is not None:
+            self.agent_state_reader = agent_state_reader
+        else:
+            self.agent_state_reader = FleetContextGraphReader(
+                lease_store=lease_store,
+                lease_store_path=lease_store_path,
+            ).read_active_agent_states
 
     def doctor(self) -> dict[str, Any]:
         result = self.runner([sys.executable, "-m", "code_index", "doctor", "--json"])
@@ -133,6 +141,44 @@ class CodeIndexContextProbe:
             text=True,
             capture_output=True,
         )
+
+
+class FleetContextGraphReader:
+    """Read active `openclaw_agent_states` through existing M1 stores."""
+
+    def __init__(
+        self,
+        *,
+        lease_store: Any | None = None,
+        lease_store_path: str | Path | None = None,
+    ) -> None:
+        self.lease_store = lease_store
+        self.lease_store_path = Path(lease_store_path) if lease_store_path else None
+
+    def read_active_agent_states(self) -> list[dict[str, Any]]:
+        store = self.lease_store
+        close_after = False
+        if store is None and self.lease_store_path is not None:
+            from code_index.openclaw_hostd.leases import SQLiteFleetLeaseStore
+
+            store = SQLiteFleetLeaseStore(self.lease_store_path)
+            close_after = True
+        if store is None:
+            return []
+        try:
+            list_agent_states = getattr(store, "list_agent_states", None)
+            if list_agent_states is None:
+                return []
+            return [
+                dict(state)
+                for state in list_agent_states()
+                if _active_agent_state(dict(state))
+            ]
+        finally:
+            if close_after:
+                close = getattr(store, "close", None)
+                if close is not None:
+                    close()
 
 
 class ContextManifestBuilder:
@@ -429,6 +475,22 @@ def _doctor_ok(result: dict[str, Any]) -> bool:
     if fts.get("rebuild_recommended") is True:
         return False
     return True
+
+
+def _active_agent_state(state: dict[str, Any]) -> bool:
+    status = str(
+        state.get("status") or state.get("run_status") or ""
+    ).strip().lower()
+    return status not in {
+        "completed",
+        "done",
+        "failed",
+        "cancelled",
+        "canceled",
+        "review",
+        "needs_review",
+        "needs-review",
+    }
 
 
 def _auto_load_blocked(pointer: ContextPointer) -> bool:

@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from code_index.openclaw_context.models import ContextHealthEvent
 from code_index.openclaw_context.models import ContextPointer
 from code_index.openclaw_context.models import HoldDecision
 from code_index.openclaw_context.models import QualityGateFlag
@@ -117,16 +118,65 @@ def detect_quality_gate_flags(agent_state: dict[str, Any]) -> tuple[QualityGateF
     criteria = _string_list(agent_state.get("acceptance_criteria"))
     calls = _string_list(agent_state.get("last_tool_calls"))[-3:]
     if criteria and calls and _looks_drifted(criteria, calls):
+        details = {"acceptance_criteria": criteria, "last_tool_calls": calls}
         flags.append(
             _flag(
                 "goal_drift",
                 "warning",
                 "recent activity no longer matches task acceptance criteria",
-                {"acceptance_criteria": criteria, "last_tool_calls": calls},
+                details,
+            )
+        )
+        flags.append(
+            _flag(
+                "correction_needed",
+                "warning",
+                "goal drift needs passive correction review",
+                {
+                    **details,
+                    "source_flag": "goal_drift",
+                    "enforced": False,
+                },
             )
         )
 
     return tuple(flags)
+
+
+def record_quality_gate_events(
+    store: Any,
+    agent_state: dict[str, Any],
+    *,
+    budget_tokens: int = 80_000,
+) -> tuple[ContextHealthEvent, ...]:
+    flags = detect_quality_gate_flags(agent_state)
+    events: list[ContextHealthEvent] = []
+    for flag in flags:
+        event_kind = (
+            "correction_needed"
+            if flag.flag_kind == "correction_needed"
+            else f"quality_gate_{flag.flag_kind}"
+        )
+        events.append(
+            store.record_health_event(
+                host_id=_optional_text(agent_state.get("host_id")),
+                run_id=_required_text(agent_state.get("run_id"), "run_id"),
+                agent_id=_required_text(agent_state.get("agent_id"), "agent_id"),
+                task_id=_required_text(agent_state.get("task_id"), "task_id"),
+                event_kind=event_kind,
+                severity=flag.severity,
+                observed_tokens=_int(agent_state.get("estimated_tokens")),
+                budget_tokens=budget_tokens,
+                details={
+                    "flag_kind": flag.flag_kind,
+                    "message": flag.message,
+                    "passive": flag.passive,
+                    "invoked_llm": flag.invoked_llm,
+                    **dict(flag.details or {}),
+                },
+            )
+        )
+    return tuple(events)
 
 
 def _flag(
@@ -190,6 +240,18 @@ def _has_verification(agent_state: dict[str, Any], verification: str) -> bool:
     if _int(agent_state.get("test_run_count") or agent_state.get("tests_run_count")) > 0:
         return True
     return bool(agent_state.get("verification_passed"))
+
+
+def _required_text(value: object, field_name: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} is required")
+    return text
+
+
+def _optional_text(value: object) -> str | None:
+    text = str(value or "").strip()
+    return text or None
 
 
 def _approach_history(value: Any) -> list[str]:
