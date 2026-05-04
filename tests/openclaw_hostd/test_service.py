@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import threading
+import time
 from typing import Any
 
 import pytest
@@ -11,6 +12,7 @@ from code_index.openclaw_hostd import service
 from code_index.openclaw_hostd.config import HostDaemonConfig
 from code_index.openclaw_hostd.graph_client import GraphServerResponse
 from code_index.openclaw_hostd.identity import HostIdentity
+from code_index.openclaw_hostd.leases import LeaseConflictError
 from code_index.openclaw_hostd.leases import SQLiteFleetLeaseStore
 from code_index.openclaw_hostd.nats_client import AgentRunState
 from code_index.openclaw_hostd.nats_client import NatsClient
@@ -735,6 +737,204 @@ def test_daemon_loop_releases_task_lease_when_graph_reports_terminal_run(
         assert task is not None
         assert task.status == "completed"
         assert task.terminal_status == "completed"
+    finally:
+        verified.close()
+
+
+def test_daemon_loop_renews_active_task_lease_before_original_ttl_expires(
+    tmp_path: Path,
+) -> None:
+    config = _config_with_nats_and_leases(tmp_path)
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    graph = RespectRunIdGraphClient()
+    runtime = service.setup_nats_runtime(
+        config,
+        HostIdentity(host_id=HOST_ID),
+        nats_client=nats,
+        graph_client=graph,
+    )
+    assert runtime is not None
+    runtime.task_inbox.lease_ttl_seconds = 0.08
+    transport.subscriptions[f"openclaw.deliver.{HOST_ID}.tasks"](
+        {
+            "kind": "openclaw.task.assigned",
+            "schema_version": 1,
+            "host_id": HOST_ID,
+            "task_id": "task-renew",
+            "message_id": "msg-renew",
+            "delivery_id": "delivery-renew",
+            "message": "Stay active long enough to renew.",
+        }
+    )
+    run_id = graph.requests[0]["run_id"]
+    runtime.close()
+    time.sleep(0.03)
+    graph.agent_board_payload = {
+        "runs": [
+            {
+                "run_id": run_id,
+                "task_id": "task-renew",
+                "status": "working",
+                "updated_at": "2026-05-04T12:00:00+00:00",
+            }
+        ]
+    }
+
+    loop_transport = FakeNatsTransport()
+    loop_nats = NatsClient(transport=loop_transport)
+    service.run_daemon_loop(
+        config,
+        as_json=True,
+        nats_client=loop_nats,
+        graph_client=graph,
+        sleep=lambda seconds: None,
+        max_iterations=1,
+    )
+    time.sleep(0.08)
+    other_host = SQLiteFleetLeaseStore(config.fleet_lease_store_path)
+    try:
+        with pytest.raises(LeaseConflictError, match=HOST_ID):
+            other_host.acquire_lease(
+                "task",
+                "task-renew",
+                owner_host_id="host-other",
+                owner_run_id="run-other",
+            )
+    finally:
+        other_host.close()
+
+
+def test_daemon_loop_terminal_release_after_renewal_uses_current_fence(
+    tmp_path: Path,
+) -> None:
+    config = _config_with_nats_and_leases(tmp_path)
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    graph = RespectRunIdGraphClient()
+    runtime = service.setup_nats_runtime(
+        config,
+        HostIdentity(host_id=HOST_ID),
+        nats_client=nats,
+        graph_client=graph,
+    )
+    assert runtime is not None
+    transport.subscriptions[f"openclaw.deliver.{HOST_ID}.tasks"](
+        {
+            "kind": "openclaw.task.assigned",
+            "schema_version": 1,
+            "host_id": HOST_ID,
+            "task_id": "task-renew-complete",
+            "message_id": "msg-renew-complete",
+            "delivery_id": "delivery-renew-complete",
+            "message": "Renew then complete.",
+        }
+    )
+    run_id = graph.requests[0]["run_id"]
+    runtime.close()
+    graph.agent_board_payload = {
+        "runs": [
+            {
+                "run_id": run_id,
+                "task_id": "task-renew-complete",
+                "status": "working",
+            }
+        ]
+    }
+    first_loop_transport = FakeNatsTransport()
+    first_loop_nats = NatsClient(transport=first_loop_transport)
+    service.run_daemon_loop(
+        config,
+        as_json=True,
+        nats_client=first_loop_nats,
+        graph_client=graph,
+        sleep=lambda seconds: None,
+        max_iterations=1,
+    )
+    graph.agent_board_payload = {
+        "runs": [
+            {
+                "run_id": run_id,
+                "task_id": "task-renew-complete",
+                "status": "completed",
+            }
+        ]
+    }
+    second_loop_transport = FakeNatsTransport()
+    second_loop_nats = NatsClient(transport=second_loop_transport)
+
+    service.run_daemon_loop(
+        config,
+        as_json=True,
+        nats_client=second_loop_nats,
+        graph_client=graph,
+        sleep=lambda seconds: None,
+        max_iterations=1,
+    )
+
+    verified = SQLiteFleetLeaseStore(config.fleet_lease_store_path)
+    task = verified.get_task_record("task-renew-complete")
+    try:
+        assert verified.get_active_lease("task", "task-renew-complete") is None
+        assert task is not None
+        assert task.status == "completed"
+    finally:
+        verified.close()
+
+
+def test_daemon_loop_wrong_run_terminal_row_does_not_release_current_lease(
+    tmp_path: Path,
+) -> None:
+    config = _config_with_nats_and_leases(tmp_path)
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    graph = RespectRunIdGraphClient()
+    runtime = service.setup_nats_runtime(
+        config,
+        HostIdentity(host_id=HOST_ID),
+        nats_client=nats,
+        graph_client=graph,
+    )
+    assert runtime is not None
+    transport.subscriptions[f"openclaw.deliver.{HOST_ID}.tasks"](
+        {
+            "kind": "openclaw.task.assigned",
+            "schema_version": 1,
+            "host_id": HOST_ID,
+            "task_id": "task-wrong-run",
+            "message_id": "msg-wrong-run",
+            "delivery_id": "delivery-wrong-run",
+            "message": "Ignore stale terminal rows.",
+        }
+    )
+    runtime.close()
+    graph.agent_board_payload = {
+        "runs": [
+            {
+                "run_id": "run-old",
+                "task_id": "task-wrong-run",
+                "status": "completed",
+            }
+        ]
+    }
+
+    loop_transport = FakeNatsTransport()
+    loop_nats = NatsClient(transport=loop_transport)
+    service.run_daemon_loop(
+        config,
+        as_json=True,
+        nats_client=loop_nats,
+        graph_client=graph,
+        sleep=lambda seconds: None,
+        max_iterations=1,
+    )
+
+    verified = SQLiteFleetLeaseStore(config.fleet_lease_store_path)
+    task = verified.get_task_record("task-wrong-run")
+    try:
+        assert verified.get_active_lease("task", "task-wrong-run") is not None
+        assert task is not None
+        assert task.status == "accepted"
     finally:
         verified.close()
 

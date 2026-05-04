@@ -652,12 +652,22 @@ def run_daemon_loop(
     iterations = 0
     try:
         while True:
+            active_agent_runs = tuple(active_run_provider())
+            if runtime is not None:
+                try:
+                    runtime.task_inbox.renew_active_task_leases(active_agent_runs)
+                except Exception as exc:
+                    _logger_warning(
+                        logger,
+                        "OpenClaw task lease renewal failed: %s",
+                        exc,
+                    )
             run_once(
                 config,
                 as_json=as_json,
                 probe_graph_server=probe_graph_server,
                 nats_client=runtime.nats_client if runtime is not None else None,
-                active_agent_runs=active_run_provider(),
+                active_agent_runs=active_agent_runs,
                 logger=logger,
             )
             if runtime is not None:

@@ -44,6 +44,67 @@ def test_two_hosts_cannot_acquire_same_exclusive_task_lease() -> None:
         )
 
 
+def test_same_host_different_owner_run_cannot_reuse_or_release_task_lease() -> None:
+    store = InMemoryFleetLeaseStore()
+    lease = store.acquire_lease(
+        "task",
+        "task-123",
+        owner_host_id="host-a",
+        owner_run_id="run-a",
+    )
+
+    with pytest.raises(LeaseConflictError, match="run-a"):
+        store.acquire_lease(
+            "task",
+            "task-123",
+            owner_host_id="host-a",
+            owner_run_id="run-b",
+        )
+    with pytest.raises(LeaseOwnerError, match="run-a"):
+        store.release_lease(
+            "task",
+            "task-123",
+            owner_host_id="host-a",
+            owner_run_id="run-b",
+            fencing_revision=lease.fencing_revision,
+        )
+
+    assert store.get_active_lease("task", "task-123") == lease
+
+
+def test_sqlite_same_host_different_owner_run_cannot_reuse_task_lease(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteFleetLeaseStore(tmp_path / "fleet-leases.db")
+    try:
+        lease = store.acquire_lease(
+            "task",
+            "task-123",
+            owner_host_id="host-a",
+            owner_run_id="run-a",
+        )
+
+        with pytest.raises(LeaseConflictError, match="run-a"):
+            store.acquire_lease(
+                "task",
+                "task-123",
+                owner_host_id="host-a",
+                owner_run_id="run-b",
+            )
+        with pytest.raises(LeaseOwnerError, match="run-a"):
+            store.release_lease(
+                "task",
+                "task-123",
+                owner_host_id="host-a",
+                owner_run_id="run-b",
+                fencing_revision=lease.fencing_revision,
+            )
+
+        assert store.get_active_lease("task", "task-123") == lease
+    finally:
+        store.close()
+
+
 def test_sqlite_fleet_lease_store_enforces_conflicts_across_instances(
     tmp_path: Path,
 ) -> None:
@@ -217,6 +278,52 @@ def test_fleet_controller_revokes_stale_no_progress_task_and_marks_reassignable(
     assert task.status == "reassignable"
     assert task.reassignable is True
     assert task.terminal_status is None
+
+
+def test_no_progress_ignores_malformed_or_wrong_host_run_agent_state_rows() -> None:
+    now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+    stale = now - DEFAULT_NO_PROGRESS_THRESHOLD - timedelta(seconds=1)
+    store = InMemoryFleetLeaseStore()
+    lease = store.acquire_lease(
+        "task",
+        "task-123",
+        owner_host_id="host-a",
+        owner_run_id="run-a",
+        now=now - timedelta(minutes=12),
+    )
+    store.record_task_status(
+        "task-123",
+        status="running",
+        host_id="host-a",
+        run_id="run-a",
+        now=now - timedelta(minutes=12),
+    )
+
+    revoked = revoke_no_progress_task_leases(
+        store,
+        [
+            {"task_id": "task-123", "last_action_at": stale.isoformat()},
+            {
+                "host_id": "host-b",
+                "task_id": "task-123",
+                "run_id": "run-a",
+                "last_action_at": stale.isoformat(),
+            },
+            {
+                "host_id": "host-a",
+                "task_id": "task-123",
+                "run_id": "run-old",
+                "last_action_at": stale.isoformat(),
+            },
+        ],
+        now=now,
+    )
+
+    task = store.get_task_record("task-123")
+    assert revoked == []
+    assert store.get_active_lease("task", "task-123", now=now) == lease
+    assert task is not None
+    assert task.reassignable is False
 
 
 def test_fleet_controller_service_reads_shared_agent_state_and_revokes_stale_task(

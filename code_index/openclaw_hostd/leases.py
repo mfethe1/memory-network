@@ -67,6 +67,7 @@ class FleetLeaseStore(Protocol):
         resource_id: str,
         *,
         owner_host_id: str,
+        owner_run_id: str | None = None,
         fencing_revision: int,
         ttl_seconds: int | float | None = 1800,
         now: datetime | None = None,
@@ -79,7 +80,22 @@ class FleetLeaseStore(Protocol):
         resource_id: str,
         *,
         owner_host_id: str,
+        owner_run_id: str | None = None,
         fencing_revision: int,
+        now: datetime | None = None,
+    ) -> "FleetLease":
+        ...
+
+    def bind_lease_owner_run(
+        self,
+        scope: str,
+        resource_id: str,
+        *,
+        owner_host_id: str,
+        current_owner_run_id: str | None = None,
+        new_owner_run_id: str,
+        fencing_revision: int,
+        ttl_seconds: int | float | None = None,
         now: datetime | None = None,
     ) -> "FleetLease":
         ...
@@ -208,6 +224,12 @@ class InMemoryFleetLeaseStore:
             active = self._active_lease_for_key(key, now=timestamp)
             if active is not None:
                 if active.owner_host_id == owner_host_id:
+                    _raise_if_owner_run_conflicts(
+                        key,
+                        active,
+                        owner_run_id=owner_run_id,
+                        error_type=LeaseConflictError,
+                    )
                     return active
                 raise LeaseConflictError(
                     f"{key[0]} lease conflict for {key[1]} held by "
@@ -243,6 +265,7 @@ class InMemoryFleetLeaseStore:
         resource_id: str,
         *,
         owner_host_id: str,
+        owner_run_id: str | None = None,
         fencing_revision: int,
         ttl_seconds: int | float | None = 1800,
         now: datetime | None = None,
@@ -256,11 +279,12 @@ class InMemoryFleetLeaseStore:
                 fencing_revision=fencing_revision,
                 now=timestamp,
             )
-            if active.owner_host_id != owner_host_id:
-                raise LeaseOwnerError(
-                    f"{key[0]} lease for {key[1]} is owned by "
-                    f"{active.owner_host_id}, not {owner_host_id}"
-                )
+            _require_lease_owner(
+                key,
+                active,
+                owner_host_id=owner_host_id,
+                owner_run_id=owner_run_id,
+            )
             renewed = _replace_lease(
                 active,
                 fencing_revision=self._next_revision(key),
@@ -276,6 +300,7 @@ class InMemoryFleetLeaseStore:
         resource_id: str,
         *,
         owner_host_id: str,
+        owner_run_id: str | None = None,
         fencing_revision: int,
         now: datetime | None = None,
     ) -> FleetLease:
@@ -288,11 +313,12 @@ class InMemoryFleetLeaseStore:
                 fencing_revision=fencing_revision,
                 now=timestamp,
             )
-            if active.owner_host_id != owner_host_id:
-                raise LeaseOwnerError(
-                    f"{key[0]} lease for {key[1]} is owned by "
-                    f"{active.owner_host_id}, not {owner_host_id}"
-                )
+            _require_lease_owner(
+                key,
+                active,
+                owner_host_id=owner_host_id,
+                owner_run_id=owner_run_id,
+            )
             released = _replace_lease(
                 active,
                 fencing_revision=self._next_revision(key),
@@ -302,6 +328,50 @@ class InMemoryFleetLeaseStore:
             )
             self._leases[key] = released
             return released
+
+    def bind_lease_owner_run(
+        self,
+        scope: str,
+        resource_id: str,
+        *,
+        owner_host_id: str,
+        current_owner_run_id: str | None = None,
+        new_owner_run_id: str,
+        fencing_revision: int,
+        ttl_seconds: int | float | None = None,
+        now: datetime | None = None,
+    ) -> FleetLease:
+        key = (_lease_scope(scope), _required_text(resource_id, "resource_id"))
+        owner_host_id = _required_text(owner_host_id, "owner_host_id")
+        new_owner_run_id = _required_text(new_owner_run_id, "new_owner_run_id")
+        timestamp = _utc(now)
+        with self._lock:
+            active = self._require_current_fence(
+                key,
+                fencing_revision=fencing_revision,
+                now=timestamp,
+            )
+            _require_lease_owner(
+                key,
+                active,
+                owner_host_id=owner_host_id,
+                owner_run_id=current_owner_run_id,
+            )
+            if active.owner_run_id == new_owner_run_id:
+                return active
+            rebound = _replace_lease(
+                active,
+                owner_run_id=new_owner_run_id,
+                fencing_revision=self._next_revision(key),
+                updated_at=timestamp,
+                expires_at=(
+                    active.expires_at
+                    if ttl_seconds is None
+                    else _expires_at(timestamp, ttl_seconds)
+                ),
+            )
+            self._leases[key] = rebound
+            return rebound
 
     def revoke_lease(
         self,
@@ -588,6 +658,12 @@ class SQLiteFleetLeaseStore:
             active = self._active_lease_for_key(key, now=timestamp)
             if active is not None:
                 if active.owner_host_id == owner_host_id:
+                    _raise_if_owner_run_conflicts(
+                        key,
+                        active,
+                        owner_run_id=owner_run_id,
+                        error_type=LeaseConflictError,
+                    )
                     return active
                 raise LeaseConflictError(
                     f"{key[0]} lease conflict for {key[1]} held by "
@@ -624,6 +700,7 @@ class SQLiteFleetLeaseStore:
         resource_id: str,
         *,
         owner_host_id: str,
+        owner_run_id: str | None = None,
         fencing_revision: int,
         ttl_seconds: int | float | None = 1800,
         now: datetime | None = None,
@@ -637,11 +714,12 @@ class SQLiteFleetLeaseStore:
                 fencing_revision=fencing_revision,
                 now=timestamp,
             )
-            if active.owner_host_id != owner_host_id:
-                raise LeaseOwnerError(
-                    f"{key[0]} lease for {key[1]} is owned by "
-                    f"{active.owner_host_id}, not {owner_host_id}"
-                )
+            _require_lease_owner(
+                key,
+                active,
+                owner_host_id=owner_host_id,
+                owner_run_id=owner_run_id,
+            )
             renewed = _replace_lease(
                 active,
                 fencing_revision=self._next_revision(key),
@@ -657,6 +735,7 @@ class SQLiteFleetLeaseStore:
         resource_id: str,
         *,
         owner_host_id: str,
+        owner_run_id: str | None = None,
         fencing_revision: int,
         now: datetime | None = None,
     ) -> FleetLease:
@@ -669,11 +748,12 @@ class SQLiteFleetLeaseStore:
                 fencing_revision=fencing_revision,
                 now=timestamp,
             )
-            if active.owner_host_id != owner_host_id:
-                raise LeaseOwnerError(
-                    f"{key[0]} lease for {key[1]} is owned by "
-                    f"{active.owner_host_id}, not {owner_host_id}"
-                )
+            _require_lease_owner(
+                key,
+                active,
+                owner_host_id=owner_host_id,
+                owner_run_id=owner_run_id,
+            )
             released = _replace_lease(
                 active,
                 fencing_revision=self._next_revision(key),
@@ -683,6 +763,50 @@ class SQLiteFleetLeaseStore:
             )
             self._upsert_lease(released)
             return released
+
+    def bind_lease_owner_run(
+        self,
+        scope: str,
+        resource_id: str,
+        *,
+        owner_host_id: str,
+        current_owner_run_id: str | None = None,
+        new_owner_run_id: str,
+        fencing_revision: int,
+        ttl_seconds: int | float | None = None,
+        now: datetime | None = None,
+    ) -> FleetLease:
+        key = (_lease_scope(scope), _required_text(resource_id, "resource_id"))
+        owner_host_id = _required_text(owner_host_id, "owner_host_id")
+        new_owner_run_id = _required_text(new_owner_run_id, "new_owner_run_id")
+        timestamp = _utc(now)
+        with self._transaction():
+            active = self._require_current_fence(
+                key,
+                fencing_revision=fencing_revision,
+                now=timestamp,
+            )
+            _require_lease_owner(
+                key,
+                active,
+                owner_host_id=owner_host_id,
+                owner_run_id=current_owner_run_id,
+            )
+            if active.owner_run_id == new_owner_run_id:
+                return active
+            rebound = _replace_lease(
+                active,
+                owner_run_id=new_owner_run_id,
+                fencing_revision=self._next_revision(key),
+                updated_at=timestamp,
+                expires_at=(
+                    active.expires_at
+                    if ttl_seconds is None
+                    else _expires_at(timestamp, ttl_seconds)
+                ),
+            )
+            self._upsert_lease(rebound)
+            return rebound
 
     def revoke_lease(
         self,
@@ -1068,6 +1192,44 @@ def _lease_scope(value: str) -> str:
     return scope
 
 
+def _require_lease_owner(
+    key: tuple[str, str],
+    lease: FleetLease,
+    *,
+    owner_host_id: str,
+    owner_run_id: str | None = None,
+) -> None:
+    if lease.owner_host_id != owner_host_id:
+        raise LeaseOwnerError(
+            f"{key[0]} lease for {key[1]} is owned by "
+            f"{lease.owner_host_id}, not {owner_host_id}"
+        )
+    _raise_if_owner_run_conflicts(
+        key,
+        lease,
+        owner_run_id=owner_run_id,
+        error_type=LeaseOwnerError,
+    )
+
+
+def _raise_if_owner_run_conflicts(
+    key: tuple[str, str],
+    lease: FleetLease,
+    *,
+    owner_run_id: str | None,
+    error_type: type[LeaseError],
+) -> None:
+    requested_run_id = _optional_text(owner_run_id)
+    if requested_run_id is None or lease.owner_run_id is None:
+        return
+    if lease.owner_run_id == requested_run_id:
+        return
+    raise error_type(
+        f"{key[0]} lease for {key[1]} is owned by run "
+        f"{lease.owner_run_id}, not {requested_run_id}"
+    )
+
+
 def release_task_lease_on_terminal_status(
     lease_store: FleetLeaseStore,
     *,
@@ -1076,6 +1238,7 @@ def release_task_lease_on_terminal_status(
     fencing_revision: int,
     terminal_status: str,
     run_id: str | None = None,
+    owner_run_id: str | None = None,
     now: datetime | None = None,
 ) -> FleetLease | None:
     status = _required_text(terminal_status, "terminal_status").lower()
@@ -1086,6 +1249,7 @@ def release_task_lease_on_terminal_status(
         "task",
         task_id,
         owner_host_id=owner_host_id,
+        owner_run_id=_optional_text(owner_run_id) or _optional_text(run_id),
         fencing_revision=fencing_revision,
         now=timestamp,
     )
@@ -1093,7 +1257,7 @@ def release_task_lease_on_terminal_status(
         task_id,
         status=status,
         host_id=owner_host_id,
-        run_id=run_id,
+        run_id=_optional_text(run_id) or _optional_text(owner_run_id),
         now=timestamp,
     )
     return released
@@ -1176,21 +1340,14 @@ def _matching_agent_state(
     *,
     lease: FleetLease,
 ) -> Mapping[str, Any] | None:
-    fallback: Mapping[str, Any] | None = None
+    if lease.owner_run_id is None:
+        return None
     for state in states:
-        host_id = _optional_text(state.get("host_id"))
-        run_id = _optional_text(state.get("run_id"))
-        if host_id and host_id != lease.owner_host_id:
+        if _optional_text(state.get("host_id")) != lease.owner_host_id:
             continue
-        if lease.owner_run_id and run_id and run_id != lease.owner_run_id:
-            continue
-        if host_id == lease.owner_host_id and (
-            not lease.owner_run_id or run_id == lease.owner_run_id
-        ):
+        if _optional_text(state.get("run_id")) == lease.owner_run_id:
             return state
-        if fallback is None:
-            fallback = state
-    return fallback
+    return None
 
 
 def _state_is_terminal(state: Mapping[str, Any]) -> bool:

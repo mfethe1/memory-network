@@ -146,12 +146,19 @@ class TaskInbox:
             conflict_replay is not None
             and str(conflict_replay.get("status") or "") == "lease_conflict"
         ):
+            ack_published = False
+            if not conflict_replay.get("ack_published_at"):
+                ack_published = self._publish_task_ack_once(
+                    message,
+                    run_id="",
+                    status="lease_conflict",
+                )
             return TaskInboxResult(
                 task_id=message["task_id"],
                 run_id="",
                 status="lease_conflict",
                 duplicate=True,
-                ack_published=False,
+                ack_published=ack_published,
             )
         planned_run_id = _planned_run_id(self.host_id, message["task_id"])
         task_lease = self._acquire_task_lease(
@@ -220,6 +227,11 @@ class TaskInbox:
                 )
                 raise RuntimeError(error)
             run_id = _run_id(response.payload)
+            self._bind_task_lease_owner_run(
+                message["task_id"],
+                current_run_id=planned_run_id,
+                accepted_run_id=run_id,
+            )
             self._finalize_task(message["task_id"], run_id=run_id, status="accepted")
             if self.lease_store is not None:
                 self.lease_store.record_task_status(
@@ -256,6 +268,11 @@ class TaskInbox:
         row = self._task_row(task_id)
         if row is None:
             return None
+        row_run_id = _optional_text(row.get("run_id"))
+        requested_run_id = _optional_text(run_id)
+        if requested_run_id is not None and requested_run_id != row_run_id:
+            return None
+        owner_run_id = row_run_id or requested_run_id
         fencing_revision = row.get("lease_fencing_revision")
         if fencing_revision is None:
             return None
@@ -265,15 +282,50 @@ class TaskInbox:
             owner_host_id=self.host_id,
             fencing_revision=int(fencing_revision),
             terminal_status=terminal_status,
-            run_id=run_id or str(row.get("run_id") or "").strip() or None,
+            run_id=owner_run_id,
+            owner_run_id=owner_run_id,
         )
         if released is not None:
             self._update_task_status(
                 task_id,
                 status=str(terminal_status or "").strip().lower(),
-                run_id=run_id,
+                run_id=owner_run_id,
             )
         return released
+
+    def renew_active_task_leases(
+        self,
+        active_runs: Any,
+    ) -> list[Any]:
+        if self.lease_store is None:
+            return []
+        renewed: list[Any] = []
+        seen: set[tuple[str, str]] = set()
+        for active_run in active_runs:
+            task_id = _active_run_text(active_run, "task_id")
+            run_id = _active_run_text(active_run, "run_id")
+            if not task_id or not run_id or (task_id, run_id) in seen:
+                continue
+            seen.add((task_id, run_id))
+            row = self._task_row(task_id)
+            if row is None:
+                continue
+            if _optional_text(row.get("run_id")) != run_id:
+                continue
+            fencing_revision = row.get("lease_fencing_revision")
+            if fencing_revision is None:
+                continue
+            task_lease = self.lease_store.renew_lease(
+                "task",
+                task_id,
+                owner_host_id=self.host_id,
+                owner_run_id=run_id,
+                fencing_revision=int(fencing_revision),
+                ttl_seconds=self.lease_ttl_seconds,
+            )
+            self._update_task_lease(task_id, task_lease)
+            renewed.append(task_lease)
+        return renewed
 
     def _task_row(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -393,6 +445,32 @@ class TaskInbox:
                     task_id,
                 ),
             )
+
+    def _bind_task_lease_owner_run(
+        self,
+        task_id: str,
+        *,
+        current_run_id: str,
+        accepted_run_id: str,
+    ) -> None:
+        if self.lease_store is None or current_run_id == accepted_run_id:
+            return
+        row = self._task_row(task_id)
+        if row is None:
+            return
+        fencing_revision = row.get("lease_fencing_revision")
+        if fencing_revision is None:
+            return
+        bind_owner_run = getattr(self.lease_store, "bind_lease_owner_run")
+        task_lease = bind_owner_run(
+            "task",
+            task_id,
+            owner_host_id=self.host_id,
+            current_owner_run_id=current_run_id,
+            new_owner_run_id=accepted_run_id,
+            fencing_revision=int(fencing_revision),
+        )
+        self._update_task_lease(task_id, task_lease)
 
     def _acquire_task_lease(self, task_id: str, *, run_id: str) -> Any | None:
         if self.lease_store is None:
@@ -869,6 +947,12 @@ def _run_id(payload: Mapping[str, Any]) -> str:
     run = payload.get("run") if isinstance(payload.get("run"), Mapping) else {}
     value = run.get("run_id") or payload.get("run_id")
     return _required_text(value, "run_id")
+
+
+def _active_run_text(active_run: Any, field_name: str) -> str:
+    if isinstance(active_run, Mapping):
+        return str(active_run.get(field_name) or "").strip()
+    return str(getattr(active_run, field_name, "") or "").strip()
 
 
 def _required_text(value: Any, field_name: str) -> str:

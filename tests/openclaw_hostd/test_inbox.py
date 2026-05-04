@@ -255,6 +255,67 @@ def test_task_inbox_releases_task_lease_for_terminal_local_status(
     assert task.status == "completed"
 
 
+def test_terminal_release_after_renewal_uses_updated_fencing_revision(
+    tmp_path: Path,
+) -> None:
+    graph = FakeGraphClient()
+    leases = InMemoryFleetLeaseStore()
+    inbox = TaskInbox(
+        tmp_path / "inbox.db",
+        host_id="host-a",
+        graph_client=graph,
+        lease_store=leases,
+    )
+    accepted = inbox.handle_task_assignment(_assignment())
+    first_fence = inbox._task_row("task-123")["lease_fencing_revision"]
+
+    renewed = inbox.renew_active_task_leases(
+        [{"task_id": "task-123", "run_id": accepted.run_id}]
+    )
+    released = inbox.release_task_lease_on_terminal_status(
+        "task-123",
+        terminal_status="completed",
+        run_id=accepted.run_id,
+    )
+
+    row = inbox._task_row("task-123")
+    assert [lease.fencing_revision for lease in renewed] == [
+        first_fence + 1
+    ]
+    assert row["lease_fencing_revision"] == first_fence + 1
+    assert released is not None
+    assert released.status == "released"
+    assert leases.get_active_lease("task", "task-123") is None
+
+
+def test_wrong_run_terminal_status_does_not_release_current_task_lease(
+    tmp_path: Path,
+) -> None:
+    graph = FakeGraphClient()
+    leases = InMemoryFleetLeaseStore()
+    inbox = TaskInbox(
+        tmp_path / "inbox.db",
+        host_id="host-a",
+        graph_client=graph,
+        lease_store=leases,
+    )
+    inbox.handle_task_assignment(_assignment())
+    active = leases.get_active_lease("task", "task-123")
+    assert active is not None
+
+    released = inbox.release_task_lease_on_terminal_status(
+        "task-123",
+        terminal_status="completed",
+        run_id="run-old",
+    )
+
+    task = leases.get_task_record("task-123")
+    assert released is None
+    assert leases.get_active_lease("task", "task-123") == active
+    assert task is not None
+    assert task.status == "accepted"
+
+
 def test_task_inbox_does_not_reacquire_lease_for_terminal_duplicate(
     tmp_path: Path,
 ) -> None:
@@ -496,6 +557,47 @@ def test_unpublished_task_ack_is_retried_on_replay(tmp_path: Path) -> None:
     assert replay.ack_published is True
     assert duplicate.ack_published is False
     assert [payload["task_id"] for _, payload in transport.published] == ["task-123"]
+
+
+def test_unpublished_lease_conflict_ack_is_retried_on_replay(tmp_path: Path) -> None:
+    db_path = tmp_path / "inbox.db"
+    leases = InMemoryFleetLeaseStore()
+    leases.acquire_lease(
+        "task",
+        "task-123",
+        owner_host_id="host-b",
+        owner_run_id="run-b",
+    )
+    inbox = TaskInbox(
+        db_path,
+        host_id="host-a",
+        graph_client=FakeGraphClient(),
+        lease_store=leases,
+    )
+    first = inbox.handle_task_assignment(_assignment())
+    assert first.status == "lease_conflict"
+    assert first.ack_published is False
+    inbox.close()
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    nats.connect()
+    recovered = TaskInbox(
+        db_path,
+        host_id="host-a",
+        graph_client=FakeGraphClient(),
+        nats_client=nats,
+        lease_store=leases,
+    )
+
+    replay = recovered.handle_task_assignment(_assignment())
+    duplicate = recovered.handle_task_assignment(_assignment())
+
+    assert replay.status == "lease_conflict"
+    assert replay.ack_published is True
+    assert duplicate.ack_published is False
+    assert [payload["status"] for _, payload in transport.published] == [
+        "lease_conflict"
+    ]
 
 
 def test_host_inbox_acks_duplicate_message_delivery_once(tmp_path: Path) -> None:

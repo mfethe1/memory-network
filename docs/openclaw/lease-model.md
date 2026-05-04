@@ -34,7 +34,9 @@ All three scopes use the same record shape:
 
 Acquisition fails closed. If an active non-expired lease already exists for the
 same `(scope, resource_id)` and belongs to another host, a new acquisition is
-denied and no local run should be dispatched.
+denied and no local run should be dispatched. Task leases also treat
+`owner_run_id` as part of the owner when it is available, so a second daemon for
+the same host cannot reuse or release a lease held by a different run.
 
 ## Fencing
 
@@ -43,22 +45,32 @@ renewal, revocation, and overwrite operations must use the current revision. A
 stale lower revision cannot release, renew, or replace a newer lease.
 
 The current host daemon implementation stores the task lease revision in
-`openclaw_task_inbox` when it accepts a task. That gives terminal-status cleanup
-the exact token needed to release the central task lease later.
+`openclaw_task_inbox` when it accepts a task and updates that row after every
+successful renewal or owner-run binding. That gives terminal-status cleanup the
+exact token needed to release the central task lease later.
 
 ## Renewal And Release
 
 Lease renewal validates both:
 
 - the owning host, and
+- the owning run when `owner_run_id` is present, and
 - the current `fencing_revision`.
+
+The daemon loop renews task leases for active graph-server runs before
+publishing the heartbeat/agent-state batch. Renewal returns a new
+`fencing_revision`, which is immediately persisted back to
+`openclaw_task_inbox`.
 
 Terminal local run statuses release task leases through
 `release_task_lease_on_terminal_status`. Terminal statuses include `completed`,
 `failed`, `cancelled`, `canceled`, `review`, `needs_review`, `needs-review`, and
 `done`.
 
-Non-terminal statuses do not release fleet leases.
+Non-terminal statuses do not release fleet leases. Terminal release is
+run-scoped: the graph row `run_id` must match the inbox row and the central
+task lease owner run. A stale terminal row for the same task but a different
+run leaves the active lease and task state unchanged.
 
 The host daemon creates the configured lease store during NATS runtime setup and
 passes it into `TaskInbox`. A task delivery that conflicts with an active task
@@ -83,6 +95,10 @@ For each active task lease:
 
 A normally completed task is never marked `reassignable`, even if an old agent
 state remains visible until KV TTL removes it.
+
+Malformed or incomplete agent-state rows are ignored. The no-progress path does
+not fall back to a row that only matches `task_id`; `host_id` and `run_id` must
+also match the active lease owner.
 
 Slice 5 exposes this as `FleetLeaseController.run_no_progress_check()`. It reads
 agent-state rows from the shared store, revokes stale active task leases, writes
