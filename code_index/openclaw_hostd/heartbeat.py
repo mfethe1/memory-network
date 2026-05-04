@@ -21,8 +21,8 @@ GraphServerProbe = Callable[[str], bool]
 
 
 def check_graph_server_available(url: str, *, timeout: float = 0.2) -> bool:
-    request = Request(url, method="GET")
     try:
+        request = Request(url, method="GET")
         with urlopen(request, timeout=timeout) as response:
             return 200 <= response.status < 500
     except (OSError, URLError, ValueError):
@@ -56,7 +56,7 @@ def _ssh_hostname(config: HostDaemonConfig) -> str:
     configured = (config.ssh_hostname or "").strip()
     if configured:
         return configured
-    return socket.getfqdn() or socket.gethostname()
+    return socket.gethostname()
 
 
 def detect_capabilities(

@@ -31,8 +31,8 @@ def redact_url(value: str | None) -> str | None:
         parts = urlsplit(value)
     except ValueError:
         return REDACTED
-    if not parts.scheme or not parts.netloc:
-        return value
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        return REDACTED
     netloc = parts.hostname or ""
     try:
         port = parts.port

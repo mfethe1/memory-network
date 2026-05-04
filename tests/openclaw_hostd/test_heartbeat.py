@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from code_index.openclaw_hostd import heartbeat
+from code_index.openclaw_hostd import service
 from code_index.openclaw_hostd.config import (
     GRAPH_SERVER_URL_ENV,
     HOST_IDENTITY_PATH_ENV,
@@ -16,6 +17,7 @@ from code_index.openclaw_hostd.config import (
 )
 from code_index.openclaw_hostd.heartbeat import build_heartbeat_payload
 from code_index.openclaw_hostd.identity import HostIdentity
+from code_index.openclaw_hostd.logging import REDACTED, redact_url
 
 
 def test_default_heartbeat_does_not_probe_graph_server_network(
@@ -39,6 +41,53 @@ def test_default_heartbeat_does_not_probe_graph_server_network(
     graph_server = payload["capabilities"]["graph_server"]
     assert graph_server["available"] is None
     assert graph_server["checked"] is False
+
+
+def test_default_heartbeat_uses_plain_hostname_without_fqdn_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_getfqdn(*args: object, **kwargs: object) -> None:
+        raise AssertionError("default heartbeat generation must not use FQDN lookup")
+
+    monkeypatch.setattr(heartbeat.socket, "getfqdn", fail_getfqdn)
+    monkeypatch.setattr(heartbeat.socket, "gethostname", lambda: "plain-hostname")
+    identity = HostIdentity(host_id="host_0123456789abcdef0123456789abcdef")
+    config = HostDaemonConfig(
+        state_dir=tmp_path / "state",
+        host_identity_path=tmp_path / "state" / "host-id.json",
+        repo_roots=(tmp_path,),
+        graph_server_url=None,
+    )
+
+    payload = build_heartbeat_payload(config, identity)
+
+    assert payload["ssh_hostname"] == "plain-hostname"
+
+
+def test_redact_url_fails_closed_for_missing_scheme_query_secret() -> None:
+    assert redact_url("127.0.0.1:8767/health?token=super-secret") == REDACTED
+
+
+def test_cli_once_json_redacts_graph_server_url_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("OPENCLAW_HOSTD_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("OPENCLAW_HOSTD_REPO_ROOTS", str(tmp_path))
+    monkeypatch.setenv(
+        "OPENCLAW_HOSTD_GRAPH_SERVER_URL",
+        "127.0.0.1:8767/health?token=cli-secret",
+    )
+
+    rc = service.main(["--once", "--json"])
+    rendered = capsys.readouterr().out
+    payload = json.loads(rendered)
+
+    assert rc == 0
+    assert payload["capabilities"]["graph_server"]["url"] == REDACTED
+    assert "cli-secret" not in rendered
 
 
 def test_heartbeat_reports_host_capabilities_without_secrets(tmp_path: Path) -> None:
