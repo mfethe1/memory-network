@@ -13,6 +13,7 @@ from code_index.openclaw_hostd.config import (
     GRAPH_SERVER_URL_ENV,
     HOST_IDENTITY_PATH_ENV,
     HostDaemonConfig,
+    NATS_URL_ENV,
     REPO_ROOTS_ENV,
     load_config,
 )
@@ -169,6 +170,7 @@ def test_config_loads_json_file_with_environment_overrides(tmp_path: Path) -> No
             REPO_ROOTS_ENV: str(env_root),
             GRAPH_SERVER_URL_ENV: "",
             GRAPH_SERVER_TOKEN_ENV: "env-token",
+            NATS_URL_ENV: "nats://user:nats-secret@example.invalid:4222",
             HOST_IDENTITY_PATH_ENV: str(tmp_path / "identity-from-env.json"),
         },
         cwd=tmp_path,
@@ -181,5 +183,7 @@ def test_config_loads_json_file_with_environment_overrides(tmp_path: Path) -> No
     assert config.graph_server_url is None
     assert config.graph_server_token == "env-token"
     assert "env-token" not in repr(config)
+    assert config.nats_url == "nats://user:nats-secret@example.invalid:4222"
+    assert "nats-secret" not in repr(config)
     assert config.ssh_hostname == "file-host"
     assert config.heartbeat_interval_seconds == 45

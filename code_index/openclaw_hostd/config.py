@@ -18,6 +18,7 @@ GRAPH_SERVER_URL_ENV = "OPENCLAW_HOSTD_GRAPH_SERVER_URL"
 GRAPH_SERVER_TOKEN_ENV = "OPENCLAW_HOSTD_GRAPH_SERVER_TOKEN"
 SSH_HOSTNAME_ENV = "OPENCLAW_HOSTD_SSH_HOSTNAME"
 HEARTBEAT_INTERVAL_ENV = "OPENCLAW_HOSTD_HEARTBEAT_INTERVAL_SECONDS"
+NATS_URL_ENV = "OPENCLAW_HOSTD_NATS_URL"
 
 DEFAULT_GRAPH_SERVER_URL = "http://127.0.0.1:8767/health"
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30
@@ -32,6 +33,7 @@ class HostDaemonConfig:
     graph_server_token: str | None = field(default=None, repr=False)
     ssh_hostname: str | None = None
     heartbeat_interval_seconds: int = DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+    nats_url: str | None = field(default=None, repr=False)
     config_path: Path | None = None
 
 
@@ -139,6 +141,7 @@ def load_config(
         ),
         default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
     )
+    nats_url = _text_or_none(environ.get(NATS_URL_ENV, data.get("nats_url")))
 
     return HostDaemonConfig(
         state_dir=state_dir,
@@ -148,5 +151,6 @@ def load_config(
         graph_server_token=graph_server_token,
         ssh_hostname=ssh_hostname,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
+        nats_url=nats_url,
         config_path=selected_config_path,
     )

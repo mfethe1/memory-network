@@ -31,12 +31,39 @@ class FakeNatsTransport:
         self.connected = False
 
 
+class ReentrantPublishTransport(FakeNatsTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.on_first_publish = None
+
+    def publish(self, subject: str, payload: bytes) -> None:
+        super().publish(subject, payload)
+        if len(self.published) == 1 and self.on_first_publish is not None:
+            self.on_first_publish()
+
+
 class FakeGraphClient:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
 
     def submit_task(self, **payload: Any) -> GraphServerResponse:
         self.requests.append(dict(payload))
+        return GraphServerResponse(
+            ok=True,
+            status_code=201,
+            payload={"run": {"run_id": f"run-{payload['task_id']}"}},
+        )
+
+
+class ReentrantGraphClient(FakeGraphClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.on_first_submit = None
+
+    def submit_task(self, **payload: Any) -> GraphServerResponse:
+        self.requests.append(dict(payload))
+        if len(self.requests) == 1 and self.on_first_submit is not None:
+            self.on_first_submit()
         return GraphServerResponse(
             ok=True,
             status_code=201,
@@ -128,6 +155,74 @@ def test_task_inbox_rejects_wrong_host_without_dispatch_or_ack(
     assert transport.published == []
 
 
+def test_task_inbox_reserves_task_before_graph_submission_for_reentrant_replay(
+    tmp_path: Path,
+) -> None:
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    nats.connect()
+    graph = ReentrantGraphClient()
+    inbox = TaskInbox(
+        tmp_path / "inbox.db",
+        host_id="host-a",
+        graph_client=graph,
+        nats_client=nats,
+    )
+    assignment = {
+        "kind": "openclaw.task_assignment",
+        "schema_version": 1,
+        "host_id": "host-a",
+        "task_id": "task-123",
+        "message_id": "msg-1",
+        "delivery_id": "delivery-1",
+        "message": "Inspect selected files.",
+    }
+    graph.on_first_submit = lambda: inbox.handle_task_assignment(
+        {
+            **assignment,
+            "message_id": "msg-replay",
+            "delivery_id": "delivery-replay",
+        }
+    )
+
+    result = inbox.handle_task_assignment(assignment)
+
+    assert result.status == "accepted"
+    assert [request["task_id"] for request in graph.requests] == ["task-123"]
+
+
+def test_task_ack_is_reserved_before_publish_so_reentrant_replay_does_not_ack_twice(
+    tmp_path: Path,
+) -> None:
+    transport = ReentrantPublishTransport()
+    nats = NatsClient(transport=transport)
+    nats.connect()
+    graph = FakeGraphClient()
+    inbox = TaskInbox(
+        tmp_path / "inbox.db",
+        host_id="host-a",
+        graph_client=graph,
+        nats_client=nats,
+    )
+    assignment = {
+        "kind": "openclaw.task_assignment",
+        "schema_version": 1,
+        "host_id": "host-a",
+        "task_id": "task-123",
+        "message_id": "msg-1",
+        "delivery_id": "delivery-1",
+        "message": "Inspect selected files.",
+    }
+    transport.on_first_publish = lambda: inbox.handle_task_assignment(assignment)
+
+    result = inbox.handle_task_assignment(assignment)
+
+    assert result.status == "accepted"
+    assert [subject for subject, _ in transport.published] == [
+        "openclaw.task.host-a.ack"
+    ]
+
+
 def test_host_inbox_acks_duplicate_message_delivery_once(tmp_path: Path) -> None:
     transport = FakeNatsTransport()
     nats = NatsClient(transport=transport)
@@ -167,6 +262,37 @@ def test_host_inbox_acks_duplicate_message_delivery_once(tmp_path: Path) -> None
                 "status": "acked",
             },
         )
+    ]
+
+
+def test_host_ack_is_reserved_before_publish_so_reentrant_replay_does_not_ack_twice(
+    tmp_path: Path,
+) -> None:
+    transport = ReentrantPublishTransport()
+    nats = NatsClient(transport=transport)
+    nats.connect()
+    inbox = HostInbox(
+        tmp_path / "host-inbox.db",
+        host_id="host-a",
+        nats_client=nats,
+    )
+    delivery = {
+        "kind": "openclaw.host_delivery",
+        "schema_version": 1,
+        "host_id": "host-a",
+        "message_id": "msg-1",
+        "delivery_id": "delivery-1",
+        "message_type": "chat",
+        "room_id": "room-1",
+        "body": "Heads up.",
+    }
+    transport.on_first_publish = lambda: inbox.handle_message_delivery(delivery)
+
+    result = inbox.handle_message_delivery(delivery)
+
+    assert result.status == "acked"
+    assert [subject for subject, _ in transport.published] == [
+        "openclaw.host.host-a.messages.ack"
     ]
 
 
