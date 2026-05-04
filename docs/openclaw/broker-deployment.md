@@ -7,12 +7,20 @@ interruptions.
 
 ## Selected Target
 
-Use one small dedicated Linux VM on the private fleet network:
+Use one provider-neutral persistent VM target named `openclaw-m1-broker-01`:
 
-- NATS Server with JetStream enabled.
-- Persistent disk mounted at `/var/lib/nats`.
+- Region: same cloud region as the first Fleet Controller test deployment; if
+  the controller region is not chosen yet, use the closest US region to the
+  Windows test hosts and record the final provider/region in deployment notes.
+- Network: private subnet or private overlay only, reachable from controller,
+  Messaging Service, Context Manager, and enrolled Windows hosts.
+- Compute: one Linux VM with a stable private address or private DNS name.
+- Disk: one persistent block volume, at least 20 GiB, mounted at
+  `/var/lib/nats`; the VM root disk may be replaced without replacing this
+  volume.
 - JetStream store directory at `/var/lib/nats/jetstream`.
-- Disk encryption and VM snapshots enabled by the infrastructure provider.
+- Persistence: provider disk encryption enabled, daily snapshots retained for
+  at least seven days, and a documented restore path to a replacement VM.
 - NATS client port `4222` exposed only on the private network.
 - NATS monitoring port `8222` exposed only to admin hosts on the private
   network.
@@ -22,6 +30,11 @@ Managed NATS is acceptable later if it provides the same JetStream persistence,
 NKey/account controls, monitoring, and restart evidence. Railway may host
 `fumemory` and control APIs, but it is not the broker for Milestone 1 until the
 restart verification below passes on Railway.
+
+This satisfies the plan because the first broker has explicit JetStream file
+storage, a disk lifecycle independent from the VM lifecycle, private-only
+network exposure, snapshot/restore expectations, and a restart test gate before
+host daemon work depends on it.
 
 ## Broker Role
 
@@ -110,3 +123,46 @@ Before any host daemon depends on this broker, run this on the selected VM:
 Acceptance: the restart test passes only if Agent Task assignment data, Agent
 Run event data, and KV data survive the VM restart without manual rebuild. If
 any canary is missing, do not use that deployment target for Milestone 1.
+
+Runnable-ish `nats` CLI shape for the same check:
+
+```powershell
+$env:NATS_URL = "nats://openclaw-m1-broker-01.internal:4222"
+$creds = ".\creds\openclaw-admin.creds"
+
+nats --server $env:NATS_URL --creds $creds stream add OPENCLAW_TASKS `
+  --subjects "openclaw.task.*.assigned,openclaw.task.*.ack" `
+  --storage file --retention limits --ack
+
+nats --server $env:NATS_URL --creds $creds stream add OPENCLAW_RUN_EVENTS `
+  --subjects "openclaw.run.*.*.events,openclaw.run.*.*.status,openclaw.run.*.*.verification" `
+  --storage file --retention limits --ack
+
+nats --server $env:NATS_URL --creds $creds kv add openclaw_hosts --storage file
+nats --server $env:NATS_URL --creds $creds kv add openclaw_agent_states --storage file
+
+nats --server $env:NATS_URL --creds $creds pub openclaw.task.oclh_canary.assigned `
+  '{"task_id":"canary-task"}'
+nats --server $env:NATS_URL --creds $creds pub openclaw.run.oclh_canary.run_canary.events `
+  '{"run_id":"run_canary","event":"canary"}'
+nats --server $env:NATS_URL --creds $creds kv put openclaw_hosts oclh_canary `
+  '{"host_id":"oclh_canary"}'
+nats --server $env:NATS_URL --creds $creds kv put openclaw_agent_states oclh_canary.run_canary `
+  '{"run_id":"run_canary","state":"canary"}'
+```
+
+Restart the NATS service and VM, then verify:
+
+```powershell
+nats --server $env:NATS_URL --creds $creds stream info OPENCLAW_TASKS
+# Expected: PASS, message count includes the canary task assignment.
+
+nats --server $env:NATS_URL --creds $creds stream info OPENCLAW_RUN_EVENTS
+# Expected: PASS, message count includes the canary Agent Run event.
+
+nats --server $env:NATS_URL --creds $creds kv get openclaw_hosts oclh_canary
+# Expected: PASS, value is still present after restart.
+
+nats --server $env:NATS_URL --creds $creds kv get openclaw_agent_states oclh_canary.run_canary
+# Expected: PASS, value is still present after restart.
+```

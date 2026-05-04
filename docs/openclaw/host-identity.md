@@ -59,13 +59,16 @@ authorization namespace used in NATS subjects such as
    `openclaw.host.<host_id>.heartbeat` and
    `openclaw.host.<host_id>.capabilities`.
 8. The controller publishes a canary Agent Task assignment to
-   `openclaw.task.<host_id>.assigned`; the host reads it and publishes
-   `openclaw.task.<host_id>.ack`.
+   `openclaw.task.<host_id>.assigned`; the host receives it through the
+   deployment-created `openclaw.deliver.<host_id>.tasks` push-consumer subject
+   and publishes `openclaw.task.<host_id>.ack`.
 
 If host-side NKey generation is not available in the first installer, the
 controller may generate the NKey seed and deliver it once over authenticated
-HTTPS. That fallback must be removed from logs immediately and stored before
-any host daemon process starts.
+HTTPS. That fallback material must never be logged by the installer,
+controller, reverse proxy, telemetry pipeline, or crash-reporting path. If the
+deployment cannot prove those paths redact or skip NKey seeds and credentials,
+host-side generation is required.
 
 ## Credential Rotation
 
@@ -94,7 +97,9 @@ Required posture:
   DPAPI and restrict the file ACL to the service account, `SYSTEM`, and local
   Administrators.
 - Do not pass secrets through environment variables for long-running services.
-- Redact NKey seeds, JWTs, controller tokens, and enrollment codes from logs.
+- Configure installer, controller, proxy, telemetry, and crash reporting to
+  treat NKey seeds, JWTs, controller tokens, and enrollment codes as
+  never-capture fields rather than log-and-redact fields.
 
 ## SSH Posture
 
@@ -120,7 +125,10 @@ Enrollment is acceptable when:
 
 1. A new host receives credentials scoped to its literal `host_id`.
 2. The host can publish its heartbeat and capabilities.
-3. The host can read `openclaw.task.<host_id>.assigned`.
-4. The same credential cannot read `openclaw.task.<other_host_id>.assigned`.
+3. The host can receive its own canary task on
+   `openclaw.deliver.<host_id>.tasks`.
+4. The same credential cannot read
+   `openclaw.task.<other_host_id>.assigned` or
+   `openclaw.deliver.<other_host_id>.tasks`.
 5. The same credential cannot publish controller config or broker admin
    subjects.
