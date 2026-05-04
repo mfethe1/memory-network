@@ -6,8 +6,8 @@ from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
-import re
 import sqlite3
 import threading
 from typing import Any, Iterator
@@ -663,9 +663,9 @@ def _recoverable_task_row(row: Mapping[str, Any] | None) -> bool:
     return status in {"processing", "failed", "recoverable"}
 
 
-def _planned_run_id(_host_id: str, task_id: str) -> str:
-    task_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(task_id or "")).strip(".-")
-    return f"run-{task_part}" if task_part else "run-openclaw-task"
+def _planned_run_id(host_id: str, task_id: str) -> str:
+    digest = hashlib.sha256(f"{host_id}\0{task_id}".encode("utf-8")).hexdigest()
+    return f"run-openclaw-{digest[:32]}"
 
 
 def _run_id(payload: Mapping[str, Any]) -> str:

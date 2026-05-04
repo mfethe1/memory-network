@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -73,6 +74,11 @@ def _assignment(**overrides: Any) -> dict[str, Any]:
     }
     message.update(overrides)
     return message
+
+
+def _expected_planned_run_id(host_id: str, task_id: str) -> str:
+    digest = hashlib.sha256(f"{host_id}\0{task_id}".encode("utf-8")).hexdigest()[:32]
+    return f"run-openclaw-{digest}"
 
 
 def _delivery(**overrides: Any) -> dict[str, Any]:
@@ -165,10 +171,11 @@ def test_task_inbox_validates_assignment_deduplicates_by_task_id_and_publishes_a
         }
     )
 
+    expected_run_id = _expected_planned_run_id("host-a", "task-123")
     assert first.status == "accepted"
-    assert first.run_id == "run-task-123"
+    assert first.run_id == expected_run_id
     assert duplicate.status == "duplicate"
-    assert duplicate.run_id == "run-task-123"
+    assert duplicate.run_id == expected_run_id
     assert len(graph.requests) == 1
     assert graph.requests[0]["task_id"] == "task-123"
     assert graph.requests[0]["selected_paths"] == [
@@ -251,6 +258,38 @@ def test_task_inbox_reserves_task_before_graph_submission_for_reentrant_replay(
     assert [request["task_id"] for request in graph.requests] == ["task-123"]
 
 
+def test_task_ids_that_sanitize_to_same_text_get_distinct_planned_run_ids(
+    tmp_path: Path,
+) -> None:
+    graph = FakeGraphClient()
+    inbox = TaskInbox(
+        tmp_path / "inbox.db",
+        host_id="host-a",
+        graph_client=graph,
+    )
+
+    slash = inbox.handle_task_assignment(
+        _assignment(
+            task_id="task/a",
+            message_id="msg-slash",
+            delivery_id="delivery-slash",
+        )
+    )
+    space = inbox.handle_task_assignment(
+        _assignment(
+            task_id="task a",
+            message_id="msg-space",
+            delivery_id="delivery-space",
+        )
+    )
+
+    assert slash.run_id == _expected_planned_run_id("host-a", "task/a")
+    assert space.run_id == _expected_planned_run_id("host-a", "task a")
+    assert slash.run_id != space.run_id
+    assert [request["task_id"] for request in graph.requests] == ["task/a", "task a"]
+    assert graph.requests[0]["run_id"] != graph.requests[1]["run_id"]
+
+
 def test_processing_task_without_run_id_is_recovered_after_crash(
     tmp_path: Path,
 ) -> None:
@@ -273,7 +312,7 @@ def test_processing_task_without_run_id_is_recovered_after_crash(
     second_replay = recovered.handle_task_assignment(_assignment(message_id="msg-2"))
 
     assert first_replay.status == "accepted"
-    assert first_replay.run_id == "run-task-123"
+    assert first_replay.run_id == _expected_planned_run_id("host-a", "task-123")
     assert second_replay.status == "duplicate"
     assert [request["task_id"] for request in graph.requests] == ["task-123"]
 
@@ -291,13 +330,14 @@ def test_crash_after_graph_accept_replay_uses_same_planned_run_id(
 
     replay = recovered.handle_task_assignment(_assignment())
 
+    expected_run_id = _expected_planned_run_id("host-a", "task-123")
     assert replay.status == "accepted"
-    assert replay.run_id == "run-task-123"
+    assert replay.run_id == expected_run_id
     assert [request["run_id"] for request in graph.requests] == [
-        "run-task-123",
-        "run-task-123",
+        expected_run_id,
+        expected_run_id,
     ]
-    assert graph.created_run_ids == ["run-task-123"]
+    assert graph.created_run_ids == [expected_run_id]
 
 
 def test_task_ack_is_reserved_before_publish_so_reentrant_replay_does_not_ack_twice(

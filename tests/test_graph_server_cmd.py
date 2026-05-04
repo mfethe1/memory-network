@@ -1382,6 +1382,43 @@ def test_graph_server_starts_agent_swarm_as_child_runs(tmp_path: Path, capsys, m
         thread.join(timeout=5)
 
 
+def test_graph_server_agent_runs_dedupes_same_supplied_run_id(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+):
+    with _make_server(tmp_path, capsys, monkeypatch) as server:
+        supplied_run_id = "run-openclaw-dedupe-test"
+        payload = {
+            "run_id": supplied_run_id,
+            "task_id": "task-1",
+            "message": "Inspect selected files.",
+        }
+
+        first = server.post_json("/api/agent-runs", payload)
+        replay = server.post_json(
+            "/api/agent-runs",
+            {**payload, "message": "Replay should not create a new run."},
+        )
+
+        assert first["ok"] is True
+        assert first["run"]["run_id"] == supplied_run_id
+        assert replay["ok"] is True
+        assert replay["duplicate"] is True
+        assert replay["run"]["run_id"] == supplied_run_id
+        assert replay["run"]["prompt"] == "Inspect selected files."
+        config = cfg_mod.load(tmp_path)
+        conn = db_mod.connect(config.db_path)
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM agent_runs WHERE run_id = ?",
+                (supplied_run_id,),
+            ).fetchone()[0]
+        finally:
+            db_mod.close(conn)
+        assert count == 1
+
+
 def test_graph_server_reconciles_swarm_parent_when_children_stop(
     tmp_path: Path, capsys, monkeypatch
 ):
