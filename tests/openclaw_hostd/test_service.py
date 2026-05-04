@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 from typing import Any
 
 import pytest
@@ -21,9 +22,11 @@ HOST_ID = "host_0123456789abcdef0123456789abcdef"
 class FakeNatsTransport:
     def __init__(self) -> None:
         self.connected = False
+        self.closed = False
         self.subscriptions: dict[str, Any] = {}
         self.published: list[tuple[str, dict[str, Any]]] = []
         self.kv_entries: list[tuple[str, str, dict[str, Any], int | float | None]] = []
+        self.supports_kv_ttl = True
 
     def connect(self) -> None:
         self.connected = True
@@ -47,6 +50,7 @@ class FakeNatsTransport:
         )
 
     def close(self) -> None:
+        self.closed = True
         self.connected = False
 
 
@@ -76,9 +80,35 @@ class FakeGraphClient:
 class RecordingOutbox:
     def __init__(self) -> None:
         self.drain_calls = 0
+        self.closed = False
 
     def drain(self, nats_client: Any) -> None:
         self.drain_calls += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FailingKvTransport(FakeNatsTransport):
+    def kv_put(
+        self,
+        bucket: str,
+        key: str,
+        payload: bytes,
+        *,
+        ttl_seconds: int | float | None = None,
+    ) -> None:
+        raise RuntimeError("kv unavailable")
+
+
+class FakeNatsMessage:
+    def __init__(self, payload: dict[str, Any], *, reply: str = "") -> None:
+        self.data = json.dumps(payload).encode("utf-8")
+        self.reply = reply
+        self.ack_count = 0
+
+    def ack(self) -> None:
+        self.ack_count += 1
 
 
 def _config(tmp_path: Path) -> HostDaemonConfig:
@@ -100,9 +130,13 @@ def _config(tmp_path: Path) -> HostDaemonConfig:
 class RecordingLogger:
     def __init__(self) -> None:
         self.warnings: list[str] = []
+        self.errors: list[str] = []
 
     def warning(self, message: str, *args: object) -> None:
         self.warnings.append(message % args if args else message)
+
+    def error(self, message: str, *args: object) -> None:
+        self.errors.append(message % args if args else message)
 
 
 def _active_run_board_payload() -> dict[str, Any]:
@@ -203,9 +237,10 @@ def test_daemon_loop_uses_connected_nats_for_subscriptions_outbox_and_agent_stat
         max_iterations=1,
     )
 
-    assert transport.connected is True
+    assert transport.closed is True
+    assert transport.connected is False
     assert set(transport.subscriptions) == {
-        f"openclaw.task.{HOST_ID}.assigned",
+        f"openclaw.deliver.{HOST_ID}.tasks",
         f"openclaw.host.{HOST_ID}.inbox",
     }
     assert outbox.drain_calls >= 1
@@ -262,7 +297,7 @@ def test_configured_nats_transport_factory_subscribes_drains_and_publishes_agent
 
     assert factory_urls == ["nats://127.0.0.1:4222"]
     assert set(transport.subscriptions) == {
-        f"openclaw.task.{HOST_ID}.assigned",
+        f"openclaw.deliver.{HOST_ID}.tasks",
         f"openclaw.host.{HOST_ID}.inbox",
     }
     assert outbox.drain_calls >= 1
@@ -291,7 +326,7 @@ def test_configured_nats_runs_with_empty_graph_server_url(
 
     assert factory_urls == ["nats://127.0.0.1:4222"]
     assert set(transport.subscriptions) == {
-        f"openclaw.task.{HOST_ID}.assigned",
+        f"openclaw.deliver.{HOST_ID}.tasks",
         f"openclaw.host.{HOST_ID}.inbox",
     }
     assert outbox.drain_calls >= 1
@@ -364,6 +399,98 @@ def test_daemon_loop_default_active_run_provider_reads_graph_server_agent_board(
     ]
 
 
+def test_default_active_run_provider_ignores_non_active_kanban_columns(
+    tmp_path: Path,
+) -> None:
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    graph = FakeGraphClient(
+        agent_board_payload={
+            "columns": {
+                "ready": {
+                    "runs": [
+                        {
+                            "run_id": "run-ready",
+                            "task_id": "task-ready",
+                            "agent_id": "agent-ready",
+                            "status": "ready",
+                        }
+                    ]
+                },
+                "active": {
+                    "runs": [
+                        {
+                            "run_id": "run-active",
+                            "task_id": "task-active",
+                            "agent_id": "agent-active",
+                            "status": "working",
+                        }
+                    ]
+                },
+            }
+        }
+    )
+
+    service.run_daemon_loop(
+        _config_with_nats(tmp_path),
+        as_json=True,
+        nats_client=nats,
+        graph_client=graph,
+        sleep=lambda seconds: None,
+        max_iterations=1,
+    )
+
+    assert [key for _, key, _, _ in transport.kv_entries] == [
+        f"{HOST_ID}.run-active"
+    ]
+
+
+def test_daemon_loop_closes_runtime_resources_on_limited_return(
+    tmp_path: Path,
+) -> None:
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    outbox = RecordingOutbox()
+
+    service.run_daemon_loop(
+        _config_with_nats(tmp_path),
+        as_json=True,
+        nats_client=nats,
+        graph_client=FakeGraphClient(),
+        outbox=outbox,
+        active_run_provider=tuple,
+        sleep=lambda seconds: None,
+        max_iterations=1,
+    )
+
+    assert transport.closed is True
+    assert nats.connected is False
+    assert outbox.closed is True
+
+
+def test_agent_state_publish_failure_does_not_kill_heartbeat_loop(
+    tmp_path: Path,
+) -> None:
+    transport = FailingKvTransport()
+    nats = NatsClient(transport=transport)
+    logger = RecordingLogger()
+
+    service.run_daemon_loop(
+        _config_with_nats(tmp_path),
+        as_json=True,
+        nats_client=nats,
+        graph_client=FakeGraphClient(),
+        active_run_provider=lambda: [
+            AgentRunState(agent_id="agent-1", task_id="task-1", run_id="run-1")
+        ],
+        logger=logger,
+        sleep=lambda seconds: None,
+        max_iterations=1,
+    )
+
+    assert any("agent state" in message for message in logger.warnings)
+
+
 def test_cli_once_uses_configured_nats_and_default_graph_active_run_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -399,17 +526,16 @@ def test_daemon_loop_nats_callbacks_route_task_and_host_inbox_messages(
     transport = FakeNatsTransport()
     nats = NatsClient(transport=transport)
     graph = FakeGraphClient()
-    service.run_daemon_loop(
+    identity = HostIdentity(host_id=HOST_ID)
+    runtime = service.setup_nats_runtime(
         _config(tmp_path),
-        as_json=True,
+        identity,
         nats_client=nats,
         graph_client=graph,
-        active_run_provider=tuple,
-        sleep=lambda seconds: None,
-        max_iterations=1,
     )
+    assert runtime is not None
 
-    transport.subscriptions[f"openclaw.task.{HOST_ID}.assigned"](
+    transport.subscriptions[f"openclaw.deliver.{HOST_ID}.tasks"](
         {
             "kind": "openclaw.task.assigned",
             "schema_version": 1,
@@ -429,6 +555,7 @@ def test_daemon_loop_nats_callbacks_route_task_and_host_inbox_messages(
             "delivery_id": "delivery-host",
             "message_type": "chat",
             "body": "FYI",
+            "room_id": "room-1",
         }
     )
 
@@ -436,6 +563,83 @@ def test_daemon_loop_nats_callbacks_route_task_and_host_inbox_messages(
     assert [subject for subject, _ in transport.published] == [
         f"openclaw.task.{HOST_ID}.ack",
         f"openclaw.host.{HOST_ID}.messages.ack",
+    ]
+    runtime.close()
+
+
+def test_nats_subscription_callbacks_are_processed_off_callback_thread(
+    tmp_path: Path,
+) -> None:
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    graph = FakeGraphClient()
+    runtime = service.setup_nats_runtime(
+        _config(tmp_path),
+        HostIdentity(host_id=HOST_ID),
+        nats_client=nats,
+        graph_client=graph,
+    )
+    assert runtime is not None
+    errors: list[BaseException] = []
+
+    def invoke_callback() -> None:
+        try:
+            transport.subscriptions[f"openclaw.deliver.{HOST_ID}.tasks"](
+                {
+                    "kind": "openclaw.task.assigned",
+                    "schema_version": 1,
+                    "host_id": HOST_ID,
+                    "task_id": "task-thread",
+                    "message_id": "msg-thread",
+                    "delivery_id": "delivery-thread",
+                    "message": "Run from callback thread.",
+                }
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=invoke_callback)
+    thread.start()
+    thread.join(timeout=5)
+    runtime.close()
+
+    assert errors == []
+    assert [request["task_id"] for request in graph.requests] == ["task-thread"]
+
+
+def test_nats_message_ack_and_reply_are_sent_after_delivery_processing(
+    tmp_path: Path,
+) -> None:
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    runtime = service.setup_nats_runtime(
+        _config(tmp_path),
+        HostIdentity(host_id=HOST_ID),
+        nats_client=nats,
+        graph_client=FakeGraphClient(),
+    )
+    assert runtime is not None
+    message = FakeNatsMessage(
+        {
+            "kind": "openclaw.host_delivery",
+            "schema_version": 1,
+            "host_id": HOST_ID,
+            "message_id": "msg-reply",
+            "delivery_id": "delivery-reply",
+            "message_type": "chat",
+            "room_id": "room-1",
+            "body": "FYI",
+        },
+        reply="_INBOX.ack",
+    )
+
+    transport.subscriptions[f"openclaw.host.{HOST_ID}.inbox"](message)
+    runtime.close()
+
+    assert message.ack_count == 1
+    assert [subject for subject, _ in transport.published] == [
+        f"openclaw.host.{HOST_ID}.messages.ack",
+        "_INBOX.ack",
     ]
 
 

@@ -31,6 +31,18 @@ class FakeNatsTransport:
         self.connected = False
 
 
+class KvTransportWithoutTtlSupport(FakeNatsTransport):
+    def kv_put(
+        self,
+        bucket: str,
+        key: str,
+        payload: bytes,
+        *,
+        ttl_seconds: int | float | None = None,
+    ) -> None:
+        return None
+
+
 def test_outbox_persists_failed_events_and_drains_after_reconnect(
     tmp_path: Path,
 ) -> None:
@@ -80,3 +92,16 @@ def test_outbox_persists_failed_events_and_drains_after_reconnect(
 def test_nats_client_requires_injected_transport_for_connect() -> None:
     with pytest.raises(NatsUnavailableError, match="inject a transport"):
         NatsClient().connect()
+
+
+def test_nats_client_rejects_ttl_kv_write_without_explicit_ttl_support() -> None:
+    client = NatsClient(transport=KvTransportWithoutTtlSupport())
+    client.connect()
+
+    with pytest.raises(NatsUnavailableError, match="TTL"):
+        client.kv_put(
+            "openclaw_agent_states",
+            "host.run",
+            {"run_id": "run"},
+            ttl_seconds=30,
+        )

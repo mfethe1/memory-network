@@ -85,6 +85,14 @@ class NatsClient:
         self._ensure_connected()
         bucket = _text(bucket, field_name="bucket")
         key = _text(key, field_name="key")
+        if ttl_seconds is not None and not getattr(
+            self._transport,
+            "supports_kv_ttl",
+            False,
+        ):
+            raise NatsUnavailableError(
+                "configured NATS transport does not explicitly support KV TTL"
+            )
         kv_put = getattr(self._transport, "kv_put", None)
         if kv_put is not None:
             return kv_put(
@@ -298,6 +306,7 @@ class NatsPyTransport:
         self._thread: threading.Thread | None = None
         self._client: Any | None = None
         self._subscriptions: list[Any] = []
+        self.supports_kv_ttl = True
 
     def connect(self) -> None:
         if self._client is not None:
@@ -329,7 +338,7 @@ class NatsPyTransport:
         client = self._require_client()
 
         async def _wrapped(message: Any) -> None:
-            result = callback(message)
+            result = await asyncio.to_thread(callback, message)
             if inspect.isawaitable(result):
                 await result
 

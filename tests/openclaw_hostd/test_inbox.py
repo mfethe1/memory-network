@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 from typing import Any
 
 import pytest
@@ -20,6 +21,7 @@ class FakeNatsTransport:
     def __init__(self) -> None:
         self.connected = False
         self.published: list[tuple[str, dict[str, Any]]] = []
+        self.supports_kv_ttl = True
 
     def connect(self) -> None:
         self.connected = True
@@ -53,6 +55,35 @@ class FakeGraphClient:
             status_code=201,
             payload={"run": {"run_id": f"run-{payload['task_id']}"}},
         )
+
+
+def _assignment(**overrides: Any) -> dict[str, Any]:
+    message = {
+        "kind": "openclaw.task_assignment",
+        "schema_version": 1,
+        "host_id": "host-a",
+        "task_id": "task-123",
+        "message_id": "msg-1",
+        "delivery_id": "delivery-1",
+        "message": "Inspect selected files.",
+    }
+    message.update(overrides)
+    return message
+
+
+def _delivery(**overrides: Any) -> dict[str, Any]:
+    message = {
+        "kind": "openclaw.host_delivery",
+        "schema_version": 1,
+        "host_id": "host-a",
+        "message_id": "msg-1",
+        "delivery_id": "delivery-1",
+        "message_type": "chat",
+        "room_id": "room-1",
+        "body": "Heads up.",
+    }
+    message.update(overrides)
+    return message
 
 
 class ReentrantGraphClient(FakeGraphClient):
@@ -191,6 +222,33 @@ def test_task_inbox_reserves_task_before_graph_submission_for_reentrant_replay(
     assert [request["task_id"] for request in graph.requests] == ["task-123"]
 
 
+def test_processing_task_without_run_id_is_recovered_after_crash(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "inbox.db"
+    crashed = TaskInbox(db_path, host_id="host-a", graph_client=FakeGraphClient())
+    crashed._reserve_task(_assignment())
+    crashed.close()
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    nats.connect()
+    graph = FakeGraphClient()
+    recovered = TaskInbox(
+        db_path,
+        host_id="host-a",
+        graph_client=graph,
+        nats_client=nats,
+    )
+
+    first_replay = recovered.handle_task_assignment(_assignment())
+    second_replay = recovered.handle_task_assignment(_assignment(message_id="msg-2"))
+
+    assert first_replay.status == "accepted"
+    assert first_replay.run_id == "run-task-123"
+    assert second_replay.status == "duplicate"
+    assert [request["task_id"] for request in graph.requests] == ["task-123"]
+
+
 def test_task_ack_is_reserved_before_publish_so_reentrant_replay_does_not_ack_twice(
     tmp_path: Path,
 ) -> None:
@@ -221,6 +279,41 @@ def test_task_ack_is_reserved_before_publish_so_reentrant_replay_does_not_ack_tw
     assert [subject for subject, _ in transport.published] == [
         "openclaw.task.host-a.ack"
     ]
+
+
+def test_unpublished_task_ack_is_retried_on_replay(tmp_path: Path) -> None:
+    db_path = tmp_path / "inbox.db"
+    inbox = TaskInbox(db_path, host_id="host-a", graph_client=FakeGraphClient())
+    result = inbox.handle_task_assignment(_assignment())
+    assert result.ack_published is False
+    inbox.close()
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        UPDATE openclaw_task_ack_log
+           SET ack_published_at = NULL
+         WHERE message_id = 'msg-1'
+           AND delivery_id = 'delivery-1'
+        """
+    )
+    conn.commit()
+    conn.close()
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    nats.connect()
+    recovered = TaskInbox(
+        db_path,
+        host_id="host-a",
+        graph_client=FakeGraphClient(),
+        nats_client=nats,
+    )
+
+    replay = recovered.handle_task_assignment(_assignment())
+    duplicate = recovered.handle_task_assignment(_assignment())
+
+    assert replay.ack_published is True
+    assert duplicate.ack_published is False
+    assert [payload["task_id"] for _, payload in transport.published] == ["task-123"]
 
 
 def test_host_inbox_acks_duplicate_message_delivery_once(tmp_path: Path) -> None:
@@ -296,6 +389,25 @@ def test_host_ack_is_reserved_before_publish_so_reentrant_replay_does_not_ack_tw
     ]
 
 
+def test_unpublished_message_ack_is_retried_on_replay(tmp_path: Path) -> None:
+    db_path = tmp_path / "host-inbox.db"
+    inbox = HostInbox(db_path, host_id="host-a")
+    result = inbox.handle_message_delivery(_delivery())
+    assert result.ack_published is False
+    inbox.close()
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    nats.connect()
+    recovered = HostInbox(db_path, host_id="host-a", nats_client=nats)
+
+    replay = recovered.handle_message_delivery(_delivery())
+    duplicate = recovered.handle_message_delivery(_delivery())
+
+    assert replay.ack_published is True
+    assert duplicate.ack_published is False
+    assert [payload["message_id"] for _, payload in transport.published] == ["msg-1"]
+
+
 def test_host_inbox_requires_valid_signed_command_ref_for_mutating_delivery(
     tmp_path: Path,
 ) -> None:
@@ -332,10 +444,18 @@ def test_host_inbox_requires_valid_signed_command_ref_for_mutating_delivery(
     ]
 
 
+def test_host_inbox_requires_room_id_for_non_mutating_delivery(tmp_path: Path) -> None:
+    inbox = HostInbox(tmp_path / "host-inbox.db", host_id="host-a")
+
+    with pytest.raises(InboxValidationError, match="room_id"):
+        inbox.handle_message_delivery(_delivery(room_id=""))
+
+
 class ControlledClockKvTransport:
     def __init__(self) -> None:
         self.now = 100.0
         self.store: dict[tuple[str, str], dict[str, Any]] = {}
+        self.supports_kv_ttl = True
 
     def connect(self) -> None:
         return None

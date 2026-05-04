@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import inspect
 import json
+import queue
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -40,6 +44,16 @@ _STOPPED_ACTIVE_RUN_STATUSES = frozenset(
         "done",
     }
 )
+_ACTIVE_RUN_STATUSES = frozenset(
+    {
+        "active",
+        "running",
+        "working",
+        "in_progress",
+        "in-progress",
+        "processing",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +62,78 @@ class HostDaemonNatsRuntime:
     outbox: Any
     task_inbox: TaskInbox
     host_inbox: HostInbox
+    dispatcher: NatsMessageDispatcher | None = None
+
+    def close(self) -> None:
+        if self.dispatcher is not None:
+            self.dispatcher.close()
+        _close_quietly(self.task_inbox)
+        _close_quietly(self.host_inbox)
+        _close_quietly(self.outbox)
+        _close_quietly(self.nats_client)
+
+
+@dataclass
+class _DispatchItem:
+    message: Any
+    handler: Callable[[Mapping[str, Any]], Any]
+    done: threading.Event
+    error: BaseException | None = None
+
+
+class NatsMessageDispatcher:
+    def __init__(self, *, logger: Any | None = None) -> None:
+        self._logger = logger
+        self._queue: queue.Queue[_DispatchItem | None] = queue.Queue()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="openclaw-hostd-nats-dispatcher",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(
+        self,
+        message: Any,
+        handler: Callable[[Mapping[str, Any]], Any],
+    ) -> None:
+        if self._closed:
+            raise RuntimeError("NATS message dispatcher is closed")
+        item = _DispatchItem(
+            message=message,
+            handler=handler,
+            done=threading.Event(),
+        )
+        self._queue.put(item)
+        item.done.wait()
+        if item.error is not None:
+            raise item.error
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._queue.put(None)
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            try:
+                payload = _message_payload(item.message)
+                item.handler(payload)
+            except BaseException as exc:
+                item.error = exc
+                _logger_error(
+                    self._logger,
+                    "OpenClaw NATS message handling failed: %s",
+                    exc,
+                )
+            finally:
+                item.done.set()
 
 
 class DisabledGraphServerClient:
@@ -200,11 +286,11 @@ def _graph_payload_runs(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     columns = payload.get("columns")
     if isinstance(columns, Mapping):
         for column_name, column in columns.items():
-            if str(column_name).strip().lower() == "done":
+            if str(column_name).strip().lower() != "active":
                 continue
             if isinstance(column, Mapping):
                 add_many(column.get("runs"))
-    return runs
+    return [run for run in runs if _active_graph_run(run)]
 
 
 def _agent_run_state_from_graph_run(run: Mapping[str, Any]) -> AgentRunState | None:
@@ -212,7 +298,9 @@ def _agent_run_state_from_graph_run(run: Mapping[str, Any]) -> AgentRunState | N
     if not run_id:
         return None
     status = _run_text(run.get("status")).lower()
-    if status in _STOPPED_ACTIVE_RUN_STATUSES:
+    if status in _STOPPED_ACTIVE_RUN_STATUSES or (
+        status and status not in _ACTIVE_RUN_STATUSES
+    ):
         return None
     metadata = run.get("metadata") if isinstance(run.get("metadata"), Mapping) else {}
     assert isinstance(metadata, Mapping)
@@ -318,6 +406,25 @@ def _logger_debug(logger: Any | None, message: str, *args: object) -> None:
         debug(message, *args)
 
 
+def _logger_warning(logger: Any | None, message: str, *args: object) -> None:
+    warning = getattr(logger, "warning", None)
+    if warning is not None:
+        warning(message, *args)
+
+
+def _logger_error(logger: Any | None, message: str, *args: object) -> None:
+    error = getattr(logger, "error", None)
+    if error is not None:
+        error(message, *args)
+
+
+def _active_graph_run(run: Mapping[str, Any]) -> bool:
+    status = _run_text(run.get("status")).lower()
+    if status in _STOPPED_ACTIVE_RUN_STATUSES:
+        return False
+    return not status or status in _ACTIVE_RUN_STATUSES
+
+
 def setup_nats_runtime(
     config: HostDaemonConfig,
     identity: HostIdentity,
@@ -359,13 +466,24 @@ def setup_nats_runtime(
         outbox=outbox,
         command_ref_verifier=command_ref_verifier,
     )
+    dispatcher = NatsMessageDispatcher(logger=logger)
     nats_client.subscribe(
-        f"openclaw.task.{identity.host_id}.assigned",
-        lambda message: task_inbox.handle_task_assignment(_message_payload(message)),
+        f"openclaw.deliver.{identity.host_id}.tasks",
+        lambda message: _dispatch_nats_message(
+            dispatcher,
+            message,
+            task_inbox.handle_task_assignment,
+            nats_client=nats_client,
+        ),
     )
     nats_client.subscribe(
         f"openclaw.host.{identity.host_id}.inbox",
-        lambda message: host_inbox.handle_message_delivery(_message_payload(message)),
+        lambda message: _dispatch_nats_message(
+            dispatcher,
+            message,
+            host_inbox.handle_message_delivery,
+            nats_client=nats_client,
+        ),
     )
     outbox.drain(nats_client)
     return HostDaemonNatsRuntime(
@@ -373,6 +491,7 @@ def setup_nats_runtime(
         outbox=outbox,
         task_inbox=task_inbox,
         host_inbox=host_inbox,
+        dispatcher=dispatcher,
     )
 
 
@@ -414,20 +533,25 @@ def run_daemon_loop(
     if active_run_provider is None:
         active_run_provider = empty_active_run_provider
     iterations = 0
-    while True:
-        run_once(
-            config,
-            as_json=as_json,
-            probe_graph_server=probe_graph_server,
-            nats_client=runtime.nats_client if runtime is not None else None,
-            active_agent_runs=active_run_provider(),
-        )
+    try:
+        while True:
+            run_once(
+                config,
+                as_json=as_json,
+                probe_graph_server=probe_graph_server,
+                nats_client=runtime.nats_client if runtime is not None else None,
+                active_agent_runs=active_run_provider(),
+                logger=logger,
+            )
+            if runtime is not None:
+                runtime.outbox.drain(runtime.nats_client)
+            iterations += 1
+            if max_iterations is not None and iterations >= max_iterations:
+                return
+            sleep(config.heartbeat_interval_seconds)
+    finally:
         if runtime is not None:
-            runtime.outbox.drain(runtime.nats_client)
-        iterations += 1
-        if max_iterations is not None and iterations >= max_iterations:
-            return
-        sleep(config.heartbeat_interval_seconds)
+            runtime.close()
 
 
 def _graph_client_for_config(config: HostDaemonConfig) -> Any:
@@ -454,6 +578,59 @@ def _message_payload(message: Any) -> dict[str, Any]:
     return payload
 
 
+def _ack_nats_delivery(message: Any, *, nats_client: Any) -> Any:
+    ack = getattr(message, "ack", None)
+    reply = str(getattr(message, "reply", "") or "").strip()
+    ack_result: Any = None
+    if callable(ack):
+        ack_result = ack()
+    if inspect.isawaitable(ack_result):
+
+        async def _ack_and_reply() -> None:
+            await ack_result
+            await asyncio.to_thread(
+                _publish_nats_reply,
+                reply,
+                nats_client=nats_client,
+            )
+
+        return _ack_and_reply()
+    _publish_nats_reply(reply, nats_client=nats_client)
+
+
+def _publish_nats_reply(reply: str, *, nats_client: Any) -> None:
+    if reply:
+        nats_client.publish(
+            reply,
+            {
+                "kind": "openclaw.nats_delivery_ack",
+                "schema_version": 1,
+                "status": "acked",
+            },
+        )
+
+
+def _dispatch_nats_message(
+    dispatcher: NatsMessageDispatcher,
+    message: Any,
+    handler: Callable[[Mapping[str, Any]], Any],
+    *,
+    nats_client: Any,
+) -> Any:
+    dispatcher.submit(message, handler)
+    return _ack_nats_delivery(message, nats_client=nats_client)
+
+
+def _close_quietly(resource: Any) -> None:
+    close = getattr(resource, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception:
+        return
+
+
 def run_once(
     config: HostDaemonConfig,
     *,
@@ -461,6 +638,7 @@ def run_once(
     probe_graph_server: bool = False,
     nats_client: Any | None = None,
     active_agent_runs: Iterable[AgentRunState | Mapping[str, Any]] = (),
+    logger: Any | None = None,
 ) -> dict[str, object]:
     identity = load_or_create_host_identity(config.host_identity_path)
     graph_server_probe = None
@@ -476,12 +654,19 @@ def run_once(
         probe_graph_server=probe_graph_server,
     )
     if nats_client is not None:
-        publish_agent_state_entries(
-            nats_client,
-            host_id=identity.host_id,
-            active_agent_runs=active_agent_runs,
-            heartbeat_interval_seconds=config.heartbeat_interval_seconds,
-        )
+        try:
+            publish_agent_state_entries(
+                nats_client,
+                host_id=identity.host_id,
+                active_agent_runs=active_agent_runs,
+                heartbeat_interval_seconds=config.heartbeat_interval_seconds,
+            )
+        except Exception as exc:
+            _logger_warning(
+                logger or get_logger(),
+                "OpenClaw agent state publish failed; continuing heartbeat loop: %s",
+                exc,
+            )
     _emit_payload(payload, as_json=as_json)
     return payload
 

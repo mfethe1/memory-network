@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
+import threading
 from typing import Any, Iterator
 
 
@@ -60,43 +61,56 @@ class TaskInbox:
         self.graph_client = graph_client
         self.nats_client = nats_client
         self.outbox = outbox
-        self.conn = sqlite3.connect(str(self.db_path))
+        self._lock = threading.RLock()
+        self._inflight_task_ids: set[str] = set()
+        self._inflight_task_acks: set[tuple[str, str]] = set()
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        _configure_sqlite(self.conn)
         self.apply_schema()
 
     def close(self) -> None:
         self.conn.close()
 
     def apply_schema(self) -> None:
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS openclaw_task_inbox (
-              task_id TEXT PRIMARY KEY,
-              message_id TEXT NOT NULL,
-              delivery_id TEXT NOT NULL,
-              run_id TEXT NOT NULL,
-              status TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
+        with self._lock:
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS openclaw_task_inbox (
+                  task_id TEXT PRIMARY KEY,
+                  message_id TEXT NOT NULL,
+                  delivery_id TEXT NOT NULL,
+                  run_id TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS openclaw_task_ack_log (
-              message_id TEXT NOT NULL,
-              delivery_id TEXT NOT NULL,
-              task_id TEXT NOT NULL,
-              status TEXT NOT NULL,
-              ack_published_at TEXT,
-              created_at TEXT NOT NULL,
-              PRIMARY KEY(message_id, delivery_id)
-            );
-            """
-        )
-        self.conn.commit()
+                CREATE TABLE IF NOT EXISTS openclaw_task_ack_log (
+                  message_id TEXT NOT NULL,
+                  delivery_id TEXT NOT NULL,
+                  task_id TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  ack_published_at TEXT,
+                  created_at TEXT NOT NULL,
+                  PRIMARY KEY(message_id, delivery_id)
+                );
+                """
+            )
+            self.conn.commit()
 
     def handle_task_assignment(self, raw_message: Mapping[str, Any]) -> TaskInboxResult:
         message = _normalise_task_assignment(raw_message, host_id=self.host_id)
-        existing = self._reserve_task(message)
-        if existing is not None:
+        existing, should_submit = self._reserve_task_submission(message)
+        if not should_submit:
+            if _recoverable_task_row(existing):
+                return TaskInboxResult(
+                    task_id=message["task_id"],
+                    run_id="",
+                    status="processing",
+                    duplicate=True,
+                    ack_published=False,
+                )
             run_id = str(existing["run_id"] or "")
             ack_published = self._publish_task_ack_once(
                 message,
@@ -111,43 +125,55 @@ class TaskInbox:
                 ack_published=ack_published,
             )
 
-        response = self.graph_client.submit_task(
-            task_id=message["task_id"],
-            host_id=self.host_id,
-            message=message["message"],
-            selected_paths=message["selected_paths"],
-            provider=message.get("provider"),
-            selected_nodes=message["selected_nodes"],
-            node=message.get("node"),
-            agent_name=message.get("agent_name"),
-        )
-        if not response.ok:
-            error = response.error or "graph-server task dispatch failed"
-            self._update_task_status(message["task_id"], status="failed")
-            raise RuntimeError(error)
-        run_id = _run_id(response.payload)
-        self._finalize_task(message["task_id"], run_id=run_id, status="accepted")
-        ack_published = self._publish_task_ack_once(
-            message,
-            run_id=run_id,
-            status="accepted",
-        )
-        return TaskInboxResult(
-            task_id=message["task_id"],
-            run_id=run_id,
-            status="accepted",
-            duplicate=False,
-            ack_published=ack_published,
-        )
+        try:
+            response = self.graph_client.submit_task(
+                task_id=message["task_id"],
+                host_id=self.host_id,
+                message=message["message"],
+                selected_paths=message["selected_paths"],
+                provider=message.get("provider"),
+                selected_nodes=message["selected_nodes"],
+                node=message.get("node"),
+                agent_name=message.get("agent_name"),
+            )
+            if not response.ok:
+                error = response.error or "graph-server task dispatch failed"
+                self._update_task_status(message["task_id"], status="failed")
+                raise RuntimeError(error)
+            run_id = _run_id(response.payload)
+            self._finalize_task(message["task_id"], run_id=run_id, status="accepted")
+            ack_published = self._publish_task_ack_once(
+                message,
+                run_id=run_id,
+                status="accepted",
+            )
+            return TaskInboxResult(
+                task_id=message["task_id"],
+                run_id=run_id,
+                status="accepted",
+                duplicate=False,
+                ack_published=ack_published,
+            )
+        finally:
+            with self._lock:
+                self._inflight_task_ids.discard(message["task_id"])
 
     def _task_row(self, task_id: str) -> dict[str, Any] | None:
-        row = self.conn.execute(
-            "SELECT * FROM openclaw_task_inbox WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM openclaw_task_inbox WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
         return dict(row) if row else None
 
     def _reserve_task(self, message: Mapping[str, Any]) -> dict[str, Any] | None:
+        existing, _should_submit = self._reserve_task_submission(message)
+        return existing
+
+    def _reserve_task_submission(
+        self,
+        message: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
         now = _now()
         try:
             with self._transaction():
@@ -166,12 +192,20 @@ class TaskInbox:
                         now,
                     ),
                 )
+                self._inflight_task_ids.add(message["task_id"])
         except sqlite3.IntegrityError:
             existing = self._task_row(message["task_id"])
-            if existing is not None:
-                return existing
-            raise
-        return None
+            if existing is None:
+                raise
+            if _recoverable_task_row(existing):
+                with self._lock:
+                    if message["task_id"] in self._inflight_task_ids:
+                        return existing, False
+                    self._inflight_task_ids.add(message["task_id"])
+                self._update_task_status(message["task_id"], status="processing")
+                return existing, True
+            return existing, False
+        return {}, True
 
     def _finalize_task(self, task_id: str, *, run_id: str, status: str) -> None:
         with self._transaction():
@@ -205,8 +239,14 @@ class TaskInbox:
         run_id: str,
         status: str,
     ) -> bool:
-        if not self._reserve_task_ack(message, status=status):
+        ack_key = (message["message_id"], message["delivery_id"])
+        with self._lock:
+            if ack_key in self._inflight_task_acks:
+                return False
+        ack_row = self._reserve_task_ack(message, status=status)
+        if ack_row.get("ack_published_at"):
             return False
+        ack_status = str(ack_row.get("status") or status)
         payload = {
             "kind": "openclaw.task_ack",
             "schema_version": 1,
@@ -214,32 +254,38 @@ class TaskInbox:
             "task_id": message["task_id"],
             "message_id": message["message_id"],
             "delivery_id": message["delivery_id"],
-            "status": status,
+            "status": ack_status,
             "run_id": run_id,
         }
         subject = f"openclaw.task.{self.host_id}.ack"
-        ack_published = _publish_or_enqueue(
-            subject,
-            payload,
-            nats_client=self.nats_client,
-            outbox=self.outbox,
-        )
-        if ack_published:
-            self._mark_task_ack_published(
-                message["message_id"],
-                message["delivery_id"],
+        with self._lock:
+            self._inflight_task_acks.add(ack_key)
+        try:
+            ack_published = _publish_or_enqueue(
+                subject,
+                payload,
+                nats_client=self.nats_client,
+                outbox=self.outbox,
             )
-        return ack_published
+            if ack_published:
+                self._mark_task_ack_published(
+                    message["message_id"],
+                    message["delivery_id"],
+                )
+            return ack_published
+        finally:
+            with self._lock:
+                self._inflight_task_acks.discard(ack_key)
 
     def _reserve_task_ack(
         self,
         message: Mapping[str, Any],
         *,
         status: str,
-    ) -> bool:
+    ) -> dict[str, Any]:
         now = _now()
         with self._transaction():
-            cursor = self.conn.execute(
+            self.conn.execute(
                 """
                 INSERT OR IGNORE INTO openclaw_task_ack_log (
                   message_id, delivery_id, task_id, status, ack_published_at,
@@ -254,7 +300,9 @@ class TaskInbox:
                     now,
                 ),
             )
-        return cursor.rowcount == 1
+        row = self._task_ack_row(message["message_id"], message["delivery_id"])
+        assert row is not None
+        return row
 
     def _mark_task_ack_published(self, message_id: str, delivery_id: str) -> None:
         with self._transaction():
@@ -269,25 +317,27 @@ class TaskInbox:
             )
 
     def _task_ack_row(self, message_id: str, delivery_id: str) -> dict[str, Any] | None:
-        row = self.conn.execute(
-            """
-            SELECT * FROM openclaw_task_ack_log
-             WHERE message_id = ?
-               AND delivery_id = ?
-            """,
-            (message_id, delivery_id),
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT * FROM openclaw_task_ack_log
+                 WHERE message_id = ?
+                   AND delivery_id = ?
+                """,
+                (message_id, delivery_id),
+            ).fetchone()
         return dict(row) if row else None
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
-        try:
-            yield
-        except BaseException:
-            self.conn.rollback()
-            raise
-        else:
-            self.conn.commit()
+        with self._lock:
+            try:
+                yield
+            except BaseException:
+                self.conn.rollback()
+                raise
+            else:
+                self.conn.commit()
 
 
 class HostInbox:
@@ -308,27 +358,31 @@ class HostInbox:
         self.nats_client = nats_client
         self.outbox = outbox
         self.command_ref_verifier = command_ref_verifier
-        self.conn = sqlite3.connect(str(self.db_path))
+        self._lock = threading.RLock()
+        self._inflight_message_acks: set[tuple[str, str]] = set()
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        _configure_sqlite(self.conn)
         self.apply_schema()
 
     def close(self) -> None:
         self.conn.close()
 
     def apply_schema(self) -> None:
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS openclaw_message_inbox_acks (
-              message_id TEXT NOT NULL,
-              delivery_id TEXT NOT NULL,
-              status TEXT NOT NULL,
-              ack_published_at TEXT,
-              created_at TEXT NOT NULL,
-              PRIMARY KEY(message_id, delivery_id)
-            );
-            """
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS openclaw_message_inbox_acks (
+                  message_id TEXT NOT NULL,
+                  delivery_id TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  ack_published_at TEXT,
+                  created_at TEXT NOT NULL,
+                  PRIMARY KEY(message_id, delivery_id)
+                );
+                """
+            )
+            self.conn.commit()
 
     def handle_message_delivery(
         self,
@@ -339,16 +393,30 @@ class HostInbox:
             host_id=self.host_id,
             command_ref_verifier=self.command_ref_verifier,
         )
-        if not self._reserve_message_ack(message["message_id"], message["delivery_id"]):
-            existing = self._message_ack_row(
-                message["message_id"],
-                message["delivery_id"],
-            )
-            status = "acked" if existing is None else existing["status"]
+        ack_key = (message["message_id"], message["delivery_id"])
+        with self._lock:
+            if ack_key in self._inflight_message_acks:
+                existing = self._message_ack_row(
+                    message["message_id"],
+                    message["delivery_id"],
+                )
+                status = "acked" if existing is None else existing["status"]
+                return MessageInboxResult(
+                    message_id=message["message_id"],
+                    delivery_id=message["delivery_id"],
+                    status=status,
+                    duplicate=True,
+                    ack_published=False,
+                )
+        ack_row, inserted = self._reserve_message_ack(
+            message["message_id"],
+            message["delivery_id"],
+        )
+        if ack_row.get("ack_published_at"):
             return MessageInboxResult(
                 message_id=message["message_id"],
                 delivery_id=message["delivery_id"],
-                status=status,
+                status=ack_row["status"],
                 duplicate=True,
                 ack_published=False,
             )
@@ -361,26 +429,36 @@ class HostInbox:
             "status": "acked",
         }
         subject = f"openclaw.host.{self.host_id}.messages.ack"
-        ack_published = _publish_or_enqueue(
-            subject,
-            payload,
-            nats_client=self.nats_client,
-            outbox=self.outbox,
-        )
-        if ack_published:
-            self._mark_message_ack_published(
-                message["message_id"],
-                message["delivery_id"],
+        with self._lock:
+            self._inflight_message_acks.add(ack_key)
+        try:
+            ack_published = _publish_or_enqueue(
+                subject,
+                payload,
+                nats_client=self.nats_client,
+                outbox=self.outbox,
             )
+            if ack_published:
+                self._mark_message_ack_published(
+                    message["message_id"],
+                    message["delivery_id"],
+                )
+        finally:
+            with self._lock:
+                self._inflight_message_acks.discard(ack_key)
         return MessageInboxResult(
             message_id=message["message_id"],
             delivery_id=message["delivery_id"],
             status="acked",
-            duplicate=False,
+            duplicate=not inserted,
             ack_published=ack_published,
         )
 
-    def _reserve_message_ack(self, message_id: str, delivery_id: str) -> bool:
+    def _reserve_message_ack(
+        self,
+        message_id: str,
+        delivery_id: str,
+    ) -> tuple[dict[str, Any], bool]:
         now = _now()
         with self._transaction():
             cursor = self.conn.execute(
@@ -395,7 +473,9 @@ class HostInbox:
                     now,
                 ),
             )
-        return cursor.rowcount == 1
+        row = self._message_ack_row(message_id, delivery_id)
+        assert row is not None
+        return row, cursor.rowcount == 1
 
     def _mark_message_ack_published(self, message_id: str, delivery_id: str) -> None:
         with self._transaction():
@@ -414,25 +494,27 @@ class HostInbox:
         message_id: str,
         delivery_id: str,
     ) -> dict[str, Any] | None:
-        row = self.conn.execute(
-            """
-            SELECT * FROM openclaw_message_inbox_acks
-             WHERE message_id = ?
-               AND delivery_id = ?
-            """,
-            (message_id, delivery_id),
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT * FROM openclaw_message_inbox_acks
+                 WHERE message_id = ?
+                   AND delivery_id = ?
+                """,
+                (message_id, delivery_id),
+            ).fetchone()
         return dict(row) if row else None
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
-        try:
-            yield
-        except BaseException:
-            self.conn.rollback()
-            raise
-        else:
-            self.conn.commit()
+        with self._lock:
+            try:
+                yield
+            except BaseException:
+                self.conn.rollback()
+                raise
+            else:
+                self.conn.commit()
 
 
 def _normalise_task_assignment(
@@ -501,11 +583,15 @@ def _normalise_host_delivery(
         )
     elif command_ref is not None:
         raise InboxValidationError("non-mutating deliveries cannot include command_ref")
+    room_id = None
+    if message_type != "command":
+        room_id = _required_text(raw_message.get("room_id"), "room_id")
     return {
         "message_id": _required_text(raw_message.get("message_id"), "message_id"),
         "delivery_id": _required_text(raw_message.get("delivery_id"), "delivery_id"),
         "message_type": message_type,
         "command_ref": command_ref,
+        "room_id": room_id,
     }
 
 
@@ -525,7 +611,21 @@ def _publish_or_enqueue(
                 return False
     if outbox is not None:
         outbox.enqueue(subject, dict(payload))
+        return True
     return False
+
+
+def _configure_sqlite(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+
+
+def _recoverable_task_row(row: Mapping[str, Any] | None) -> bool:
+    if not row:
+        return False
+    run_id = str(row.get("run_id") or "").strip()
+    status = str(row.get("status") or "").strip().lower()
+    return not run_id and status in {"processing", "failed", "recoverable"}
 
 
 def _run_id(payload: Mapping[str, Any]) -> str:

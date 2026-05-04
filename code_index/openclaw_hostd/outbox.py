@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sqlite3
+import threading
 from typing import Any, Iterator
 
 
@@ -34,29 +35,33 @@ class EventOutbox:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path))
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.apply_schema()
 
     def close(self) -> None:
         self.conn.close()
 
     def apply_schema(self) -> None:
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS openclaw_event_outbox (
-              event_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-              subject TEXT NOT NULL,
-              payload_json TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              published_at TEXT
-            );
+        with self._lock:
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS openclaw_event_outbox (
+                  event_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                  subject TEXT NOT NULL,
+                  payload_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  published_at TEXT
+                );
 
-            CREATE INDEX IF NOT EXISTS idx_openclaw_event_outbox_pending
-              ON openclaw_event_outbox(published_at, event_sequence);
-            """
-        )
-        self.conn.commit()
+                CREATE INDEX IF NOT EXISTS idx_openclaw_event_outbox_pending
+                  ON openclaw_event_outbox(published_at, event_sequence);
+                """
+            )
+            self.conn.commit()
 
     def enqueue(self, subject: str, payload: Mapping[str, Any]) -> OutboxEvent:
         subject = _required_text(subject, "subject")
@@ -86,13 +91,14 @@ class EventOutbox:
         return self.get_event(sequence)
 
     def get_event(self, sequence: int) -> OutboxEvent:
-        row = self.conn.execute(
-            """
-            SELECT * FROM openclaw_event_outbox
-             WHERE event_sequence = ?
-            """,
-            (int(sequence),),
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT * FROM openclaw_event_outbox
+                 WHERE event_sequence = ?
+                """,
+                (int(sequence),),
+            ).fetchone()
         if row is None:
             raise KeyError(f"unknown outbox event_sequence: {sequence}")
         return _event(row)
@@ -107,7 +113,8 @@ class EventOutbox:
         if limit is not None:
             sql += " LIMIT ?"
             params = (max(0, int(limit)),)
-        return [_event(row) for row in self.conn.execute(sql, params)]
+        with self._lock:
+            return [_event(row) for row in self.conn.execute(sql, params)]
 
     def drain(self, nats_client: Any, *, limit: int | None = None) -> OutboxDrainResult:
         published_count = 0
@@ -137,13 +144,14 @@ class EventOutbox:
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
-        try:
-            yield
-        except BaseException:
-            self.conn.rollback()
-            raise
-        else:
-            self.conn.commit()
+        with self._lock:
+            try:
+                yield
+            except BaseException:
+                self.conn.rollback()
+                raise
+            else:
+                self.conn.commit()
 
 
 def _event(row: sqlite3.Row) -> OutboxEvent:
