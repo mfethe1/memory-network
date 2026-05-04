@@ -46,6 +46,14 @@ reply field. The only ACK publish pattern a host may use is:
 $JS.ACK.OPENCLAW_TASKS.HOST_<host_id>.>
 ```
 
+Host daemons consume only their scoped delivery subjects:
+
+- `openclaw.deliver.<host_id>.tasks`
+- `openclaw.host.<host_id>.inbox`
+
+They do not subscribe directly to another host's delivery subjects, and they do
+not subscribe to `openclaw.task.<host_id>.assigned` directly.
+
 Do not add these broad permissions to host credentials:
 
 ```text
@@ -189,6 +197,12 @@ reports, and updates controller-owned KV. It does not need host credentials.
 Broker deployment automation may use a separate admin credential with exact
 JetStream setup subjects only during provisioning. Generate one consumer API
 subject pair per host; the sample below includes host `oclh_devbox01`.
+
+Controller consumers reconcile:
+
+- `openclaw.task.*.ack` back into canonical task-delivery ACK state
+- `openclaw.host.*.messages.ack` back into canonical host-message delivery ACK state
+- `openclaw.host.*.heartbeat` and `openclaw.host.*.capabilities` into host inventory
 
 ```conf
 {

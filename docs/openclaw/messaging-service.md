@@ -4,6 +4,13 @@ The OpenClaw Messaging Service is the durable room, message, delivery, and
 command-reference layer for Milestone 1. It is embedded by the minimal
 controller app in this slice and uses a self-contained SQLite store.
 
+Telegram is only an adapter at this layer. Lenny and Rosie do not run separate
+Telegram bots, direct Telegram command parsers, or host-to-host Telegram
+bridges. Every inbound Telegram event is stored once as a canonical OpenClaw
+message, and every mutating action still flows through signed command refs,
+Fleet Controller eligibility checks, central leases, scoped NATS delivery, and
+persistent ACK state.
+
 ## Responsibilities
 
 - Store rooms for fleet, repo, task, run, host, and swarm conversations.
@@ -26,7 +33,7 @@ When embedded in `OpenClawControllerApp`, a newly created Telegram
 `assign_task` command reference is handed to the Fleet Controller immediately.
 That app-level handoff keeps scheduling and leases in the Fleet Controller
 while allowing one Telegram intake chat to submit work without a second manual
-API call.
+API call. The same handoff runs for webhook ingestion and long-poll ingestion.
 
 ## Storage
 
@@ -40,6 +47,7 @@ openclaw_command_refs
 openclaw_messaging_adapters
 openclaw_platform_room_mappings
 openclaw_external_identities
+openclaw_adapter_cursors
 ```
 
 `openclaw_messages.idempotency_key` is unique. Adapter events derive it from
@@ -54,6 +62,12 @@ monotonic; a late `delivered` report cannot downgrade an already `acked`
 delivery. When a message has multiple deliveries with the same recipient
 kind/ID, ACK calls must identify the exact row with `delivery_id` or
 `delivery_key`; recipient kind/ID alone is rejected as ambiguous.
+
+`openclaw_adapter_cursors` stores adapter-owned replay cursors such as Telegram
+`getUpdates` offsets. The adapter may return the next offset to the caller,
+persist it in the store, or do both. Replay safety still depends on the
+message idempotency key, so repeated webhook updates, repeated poll batches,
+and repeated ACK reports all resolve back to the existing canonical rows.
 
 ## Rooms And Projections
 
@@ -161,10 +175,16 @@ POST /messages/{message_id}/ack
 GET  /messages/stream
 POST /messages/preview
 POST /adapters/telegram/webhook
+POST /adapters/telegram/poll
 ```
 
 The dispatcher is intentionally framework-free. A future HTTP server can wrap
 the same router without changing store behavior.
+
+`POST /adapters/telegram/poll` uses an injected HTTP transport plus a
+configured bot token. It calls the same Telegram normalization and persistence
+path as the webhook handler and can persist the next Telegram update offset in
+`openclaw_adapter_cursors`.
 
 `POST /messages` signs commands only when the trusted route context includes a
 principal with `command:write`. A JSON body field named `principal` is ignored
@@ -186,3 +206,26 @@ External adapters cannot create command refs unless adapter policy allows
 promotion, the platform user is linked to a verified OpenClaw identity with
 `command:write`, the event maps to the room through an explicit platform-room
 mapping, and that mapping allows the command type and target kind.
+
+## Controller ACK Reconciliation
+
+The Fleet Controller consumes:
+
+- `openclaw.host.*.heartbeat`
+- `openclaw.host.*.capabilities`
+- `openclaw.task.*.ack`
+- `openclaw.host.*.messages.ack`
+
+Host task ACKs and host message ACKs reconcile back onto
+`openclaw_message_deliveries`. The controller does not create a second durable
+ACK table for cross-host delivery state. A host may acknowledge only its own
+delivery row; mismatched `host_id` and `delivery_id` pairs are rejected.
+
+## Configuration
+
+Telegram bot tokens and webhook secret tokens live in configuration, injected
+app setup, or environment such as `OPENCLAW_TELEGRAM_BOT_TOKEN` and
+`OPENCLAW_TELEGRAM_SECRET_TOKEN`.
+
+Do not commit tokens or secrets to the repo, include them in tests, or embed
+them in task prompts or message bodies.

@@ -321,6 +321,55 @@ def test_host_alias_assignment_resolves_to_alias_host_without_fallback(
         store.close()
 
 
+def test_host_alias_assignment_rejects_unknown_alias_without_fallback(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        controller, nats, _leases = _controller(store)
+        _host(controller, "host-a", host_aliases=["rosie"])
+        _host(controller, "host-z", host_aliases=["lenny"])
+        command_ref = _command(store, host_id="host-a", host_alias="unknown")
+
+        result = controller.assign_task_from_command_ref(command_ref, now=NOW)
+
+        assert result.status == "rejected"
+        assert result.rejection is not None
+        assert result.rejection.reason == "host_alias_unknown"
+        assert nats.published == []
+    finally:
+        store.close()
+
+
+def test_host_alias_assignment_rejects_stale_alias_host_without_fallback(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        controller, nats, _leases = _controller(store)
+        _host(
+            controller,
+            "host-a",
+            host_aliases=["lenny"],
+            now=NOW - timedelta(seconds=31),
+        )
+        _host(controller, "host-z", host_aliases=["rosie"])
+        command_ref = _command(store, host_id="host-z", host_alias="lenny")
+
+        result = controller.assign_task_from_command_ref(command_ref, now=NOW)
+
+        assert result.status == "rejected"
+        assert result.rejection is not None
+        assert result.rejection.reason == "host_health"
+        assert result.rejection.details == {
+            "host_id": "host-a",
+            "host_alias": "lenny",
+        }
+        assert nats.published == []
+    finally:
+        store.close()
+
+
 def test_racing_claimable_message_claims_publish_one_task(tmp_path: Path) -> None:
     store = _store(tmp_path)
     try:

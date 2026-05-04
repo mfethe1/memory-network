@@ -9,6 +9,7 @@ from urllib.parse import unquote, urlsplit
 from code_index.openclaw_messaging.models import MessagingError
 from code_index.openclaw_messaging.store import MessagingStore
 from code_index.openclaw_messaging.telegram import handle_telegram_webhook
+from code_index.openclaw_messaging.telegram import poll_telegram_updates
 
 
 @dataclass(frozen=True)
@@ -29,9 +30,13 @@ class MessagingRouter:
         store: MessagingStore,
         *,
         telegram_secret_token: str | None = None,
+        telegram_bot_token: str | None = None,
+        telegram_http_client: Any | None = None,
     ) -> None:
         self.store = store
         self.telegram_secret_token = _string_or_none(telegram_secret_token)
+        self.telegram_bot_token = _string_or_none(telegram_bot_token)
+        self.telegram_http_client = telegram_http_client
 
     def handle(
         self,
@@ -102,6 +107,30 @@ class MessagingRouter:
                     ),
                 )
                 return ApiResponse(201 if result["created"] else 200, result)
+            if method == "POST" and parts == ["adapters", "telegram", "poll"]:
+                if self.telegram_http_client is None:
+                    return ApiResponse(
+                        503,
+                        {"error": "Telegram poll transport is not configured"},
+                    )
+                if self.telegram_bot_token is None:
+                    return ApiResponse(
+                        503,
+                        {"error": "Telegram bot token is not configured"},
+                    )
+                result = poll_telegram_updates(
+                    self.store,
+                    bot_token=self.telegram_bot_token,
+                    http_client=self.telegram_http_client,
+                    offset=_int_or_none(payload.get("offset")),
+                    timeout_seconds=_int_or_default(payload.get("timeout_seconds"), 0),
+                    limit=_int_or_none(payload.get("limit")),
+                    allowed_updates=_string_list_or_none(payload.get("allowed_updates")),
+                    cursor_key=_string_or_none(payload.get("cursor_key"))
+                    or "telegram:getUpdates",
+                    persist_update_offset=bool(payload.get("persist_update_offset")),
+                )
+                return ApiResponse(200, result)
         except KeyError as exc:
             return ApiResponse(404, {"error": str(exc)})
         except PermissionError as exc:
@@ -134,6 +163,28 @@ def _list_or_none(value: Any) -> list[Any] | None:
 def _string_or_none(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise MessagingError("expected integer") from exc
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    parsed = _int_or_none(value)
+    return default if parsed is None else parsed
+
+
+def _string_list_or_none(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise MessagingError("expected list")
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _principal_can_sign_command(

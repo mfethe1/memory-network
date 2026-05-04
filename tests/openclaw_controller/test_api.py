@@ -375,6 +375,103 @@ def test_host_task_claim_route_assigns_the_claimant_for_untagged_telegram_work(
         app.close()
 
 
+def test_telegram_poll_route_uses_same_assignment_path_as_webhook(
+    tmp_path: Path,
+) -> None:
+    nats = FakeNats()
+    http_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_telegram_poll(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        http_calls.append((url, dict(payload)))
+        return {
+            "ok": True,
+            "result": [
+                _telegram_update(
+                    update_id=101,
+                    message_id=201,
+                    text="/assign task-123 @lenny repair the inbox test",
+                )
+            ],
+        }
+
+    app = create_app(
+        tmp_path / "messages.db",
+        signing_secret=SIGNING_SECRET,
+        telegram_secret_token=TELEGRAM_SECRET,
+        telegram_bot_token="telegram-bot-token",
+        telegram_http_client=fake_telegram_poll,
+        lease_store=InMemoryFleetLeaseStore(),
+        nats_client=nats,
+    )
+    try:
+        app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            {**_heartbeat("host-z"), "host_aliases": ["lenny"]},
+            principal=FLEET_INGEST_PRINCIPAL,
+        )
+        app.store.set_adapter_command_promotion("telegram", enabled=True)
+        task_room = app.store.create_room(
+            room_kind="task",
+            display_name="Task 123",
+            task_id="task-123",
+            metadata={
+                "default_delivery_targets": [
+                    {"recipient_kind": "host", "recipient_id": "host-z"}
+                ],
+                "assignment": {
+                    "repo_root": r"E:\Projects\repo-a",
+                    "provider": "codex",
+                    "selected_paths": ["code_index/openclaw_controller/app.py"],
+                },
+            },
+        )
+        app.store.map_platform_room(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            room_id=task_room["room_id"],
+            route_policy={
+                "command_promotion": {
+                    "enabled": True,
+                    "allowed_command_types": ["assign_task"],
+                    "allowed_target_kinds": ["task"],
+                }
+            },
+        )
+        app.store.link_external_identity(
+            adapter_id="telegram",
+            platform_user_id="42",
+            openclaw_identity_id="operator-1",
+            scopes=("message:write", "command:write"),
+            display_name="Operator",
+        )
+
+        response = app.handle_request(
+            "POST",
+            "/adapters/telegram/poll",
+            {"persist_update_offset": True},
+        )
+
+        assert response.status_code == 200
+        assert http_calls == [
+            (
+                "https://api.telegram.org/bottelegram-bot-token/getUpdates",
+                {"timeout": 0},
+            )
+        ]
+        assert response.body["results"][0]["message"]["body"] == (
+            "/assign task-123 @lenny repair the inbox test"
+        )
+        assert response.body["auto_assignments"][0]["status"] == "assigned"
+        assert response.body["auto_assignments"][0]["assignment"]["host_id"] == "host-z"
+        assert response.body["cursor"]["cursor_value"] == "102"
+        assert [subject for subject, _payload in nats.published] == [
+            "openclaw.task.host-z.assigned"
+        ]
+    finally:
+        app.close()
+
+
 def test_fleet_task_route_returns_rejected_assignment_shape_for_repo_lease_conflict(
     tmp_path: Path,
 ) -> None:
@@ -706,6 +803,168 @@ def test_controller_assignment_reaches_hostd_task_inbox_through_broker_bridge(
         assert [request["task_id"] for request in graph.requests] == ["task-123"]
     finally:
         runtime.close()
+        app.close()
+
+
+def test_controller_nats_callbacks_persist_heartbeat_capabilities_and_ack_events(
+    tmp_path: Path,
+) -> None:
+    transport = BridgedNatsTransport()
+    nats = NatsClient(transport=transport)
+    app = create_app(
+        tmp_path / "messages.db",
+        signing_secret=SIGNING_SECRET,
+        nats_client=nats,
+        lease_store=InMemoryFleetLeaseStore(),
+    )
+    try:
+        command_ref = _command_ref(app)
+        task_delivery = app.store.list_deliveries(command_ref["message_id"])[0]
+        host_room = app.store.create_room(
+            room_kind="host",
+            display_name="Host A Inbox",
+            host_id="host-a",
+            metadata={
+                "default_delivery_targets": [
+                    {"recipient_kind": "host", "recipient_id": "host-a"}
+                ]
+            },
+        )
+        host_message = app.store.create_message(
+            room_id=host_room["room_id"],
+            sender_kind="controller",
+            sender_id="controller",
+            body="FYI",
+            target_scope={"kind": "host", "host_id": "host-a"},
+        )["message"]
+        host_delivery = app.store.list_deliveries(host_message["message_id"])[0]
+
+        transport.subscriptions["openclaw.host.*.heartbeat"](_heartbeat("host-a"))
+        transport.subscriptions["openclaw.host.*.capabilities"](
+            {
+                "kind": "openclaw.host_capabilities",
+                "schema_version": 1,
+                "host_id": "host-a",
+                "capabilities": {
+                    "repo_roots": [{"path": r"E:\Projects\repo-a", "exists": True}],
+                    "providers": [
+                        {
+                            "id": "kimi",
+                            "display_name": "Kimi",
+                            "capabilities": ["task_run"],
+                        }
+                    ],
+                },
+            }
+        )
+        transport.subscriptions["openclaw.task.*.ack"](
+            {
+                "kind": "openclaw.task_ack",
+                "schema_version": 1,
+                "host_id": "host-a",
+                "task_id": "task-123",
+                "message_id": command_ref["message_id"],
+                "delivery_id": task_delivery["delivery_id"],
+                "status": "accepted",
+                "run_id": "run-123",
+            }
+        )
+        transport.subscriptions["openclaw.host.*.messages.ack"](
+            {
+                "kind": "openclaw.message_delivery_ack",
+                "schema_version": 1,
+                "host_id": "host-a",
+                "message_id": host_message["message_id"],
+                "delivery_id": host_delivery["delivery_id"],
+                "status": "acked",
+            }
+        )
+
+        projection = app.handle_request("GET", "/fleet")
+        host = projection.body["hosts"][0]
+        acked_task_delivery = app.store.list_deliveries(command_ref["message_id"])[0]
+        acked_host_delivery = app.store.list_deliveries(host_message["message_id"])[0]
+
+        assert transport.connected is True
+        assert set(transport.subscriptions) >= {
+            "openclaw.host.*.heartbeat",
+            "openclaw.host.*.capabilities",
+            "openclaw.task.*.ack",
+            "openclaw.host.*.messages.ack",
+        }
+        assert host["host_id"] == "host-a"
+        assert [provider["id"] for provider in host["providers"]] == ["kimi"]
+        assert acked_task_delivery["delivery_status"] == "acked"
+        assert acked_task_delivery["metadata"]["task_ack"]["status"] == "accepted"
+        assert acked_task_delivery["metadata"]["task_ack"]["run_id"] == "run-123"
+        assert acked_host_delivery["delivery_status"] == "acked"
+        assert acked_host_delivery["metadata"]["host_message_ack"]["host_id"] == (
+            "host-a"
+        )
+    finally:
+        app.close()
+
+
+def test_host_scoped_principal_cannot_ack_another_hosts_delivery(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        tmp_path / "messages.db",
+        signing_secret=SIGNING_SECRET,
+        lease_store=InMemoryFleetLeaseStore(),
+        nats_client=FakeNats(),
+    )
+    try:
+        host_room = app.store.create_room(
+            room_kind="host",
+            display_name="Host B Inbox",
+            host_id="host-b",
+            metadata={
+                "default_delivery_targets": [
+                    {"recipient_kind": "host", "recipient_id": "host-b"}
+                ]
+            },
+        )
+        message = app.store.create_message(
+            room_id=host_room["room_id"],
+            sender_kind="controller",
+            sender_id="controller",
+            body="FYI",
+            target_scope={"kind": "host", "host_id": "host-b"},
+        )["message"]
+        delivery = app.store.list_deliveries(message["message_id"])[0]
+
+        spoofed = app.handle_request(
+            "POST",
+            "/fleet/messages/ack",
+            {
+                "host_id": "host-a",
+                "message_id": message["message_id"],
+                "delivery_id": delivery["delivery_id"],
+                "status": "acked",
+            },
+            principal=HOST_A_INGEST_PRINCIPAL,
+        )
+        valid = app.handle_request(
+            "POST",
+            "/fleet/messages/ack",
+            {
+                "host_id": "host-b",
+                "message_id": message["message_id"],
+                "delivery_id": delivery["delivery_id"],
+                "status": "acked",
+            },
+            principal=Principal(
+                principal_id="host-b",
+                scopes=frozenset({"host:ingest"}),
+            ),
+        )
+
+        assert spoofed.status_code == 400
+        assert valid.status_code == 200
+        assert valid.body["delivery"]["recipient_id"] == "host-b"
+        assert valid.body["delivery"]["delivery_status"] == "acked"
+    finally:
         app.close()
 
 

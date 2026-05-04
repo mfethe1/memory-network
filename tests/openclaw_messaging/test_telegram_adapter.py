@@ -7,9 +7,26 @@ from code_index.openclaw_messaging.routes import MessagingRouter
 from code_index.openclaw_messaging.store import MessagingStore
 from code_index.openclaw_messaging.telegram import TelegramAdapter
 from code_index.openclaw_messaging.telegram import handle_telegram_webhook
+from code_index.openclaw_messaging.telegram import poll_telegram_updates
 
 SIGNING_SECRET = "test-secret"
 TELEGRAM_SECRET = "telegram-secret"
+
+
+class FakeTelegramHttpClient:
+    def __init__(self, responses: list[dict[str, object]]) -> None:
+        self.responses = list(responses)
+        self.requests: list[tuple[str, dict[str, object]]] = []
+
+    def __call__(
+        self,
+        url: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        self.requests.append((url, dict(payload)))
+        if not self.responses:
+            raise AssertionError("unexpected Telegram poll request")
+        return dict(self.responses.pop(0))
 
 
 def _store(tmp_path: Path) -> MessagingStore:
@@ -444,3 +461,86 @@ def test_telegram_adapter_renders_outbound_notification_payload() -> None:
             "disable_web_page_preview": True,
         },
     }
+
+
+def test_telegram_long_poll_reuses_ingest_path_and_persists_next_offset(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        AdapterRegistry(store).register_defaults()
+        room = store.create_room(
+            room_kind="fleet",
+            display_name="Fleet",
+            metadata={
+                "assignment": {
+                    "repo_root": r"E:\Projects\repo-a",
+                    "provider": "codex",
+                }
+            },
+        )
+        store.map_platform_room(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            room_id=room["room_id"],
+        )
+        store.link_external_identity(
+            adapter_id="telegram",
+            platform_user_id="42",
+            openclaw_identity_id="operator-1",
+            scopes=("message:write",),
+            display_name="Operator",
+        )
+        transport = FakeTelegramHttpClient(
+            [
+                {
+                    "ok": True,
+                    "result": [
+                        _telegram_update(
+                            update_id=105,
+                            message_id=205,
+                            text="@lenny please check my email",
+                        )
+                    ],
+                },
+                {"ok": True, "result": []},
+            ]
+        )
+
+        first = poll_telegram_updates(
+            store,
+            bot_token="test-bot-token",
+            http_client=transport,
+            offset=100,
+            persist_update_offset=True,
+        )
+        second = poll_telegram_updates(
+            store,
+            bot_token="test-bot-token",
+            http_client=transport,
+            persist_update_offset=True,
+        )
+
+        assert transport.requests[0] == (
+            "https://api.telegram.org/bottest-bot-token/getUpdates",
+            {"offset": 100, "timeout": 0},
+        )
+        assert transport.requests[1] == (
+            "https://api.telegram.org/bottest-bot-token/getUpdates",
+            {"offset": 106, "timeout": 0},
+        )
+        assert first["results"][0]["message"]["body"] == "@lenny please check my email"
+        assert first["results"][0]["message"]["metadata"]["routing"]["host_alias"] == (
+            "lenny"
+        )
+        assert first["next_update_offset"] == 106
+        assert first["cursor"]["cursor_value"] == "106"
+        assert second["requested_offset"] == 106
+        assert second["results"] == []
+        assert store.get_adapter_cursor(
+            adapter_id="telegram",
+            cursor_key="telegram:getUpdates",
+        )["cursor_value"] == "106"
+        assert len(store.list_messages(room["room_id"])) == 1
+    finally:
+        store.close()

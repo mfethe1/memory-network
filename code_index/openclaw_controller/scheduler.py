@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -10,6 +11,7 @@ from code_index.openclaw_controller.models import AssignmentDetails
 from code_index.openclaw_controller.models import AssignmentResult
 from code_index.openclaw_controller.models import HandoffResult
 from code_index.openclaw_controller.models import HOST_HEALTHY
+from code_index.openclaw_controller.models import HOST_UNKNOWN
 from code_index.openclaw_controller.models import HostInventoryRecord
 from code_index.openclaw_controller.models import Rejection
 from code_index.openclaw_controller.models import TaskAssignment
@@ -60,6 +62,111 @@ class FleetController:
             context_health=self._host_context_health(host.host_id),
             handoff_state=self._host_handoff_state(host.host_id),
         )
+
+    def record_host_capabilities(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        timestamp = _utc(now)
+        host_id = _required_text(payload.get("host_id"), "host_id")
+        existing = self._hosts.get(host_id)
+        heartbeat_payload: dict[str, Any] = {}
+        if existing is not None and isinstance(existing.metadata, Mapping):
+            heartbeat = existing.metadata.get("heartbeat")
+            if isinstance(heartbeat, Mapping):
+                heartbeat_payload.update(dict(heartbeat))
+        heartbeat_payload["host_id"] = host_id
+        capabilities = (
+            payload.get("capabilities")
+            if isinstance(payload.get("capabilities"), Mapping)
+            else {}
+        )
+        heartbeat_payload["capabilities"] = dict(capabilities)
+        if "heartbeat_interval_seconds" not in heartbeat_payload:
+            heartbeat_payload["heartbeat_interval_seconds"] = 10
+        if payload.get("host_aliases") is not None:
+            heartbeat_payload["host_aliases"] = payload.get("host_aliases")
+        elif payload.get("host_alias") is not None:
+            heartbeat_payload["host_alias"] = payload.get("host_alias")
+        updated = HostInventoryRecord.from_heartbeat(heartbeat_payload, now=timestamp)
+        if existing is None:
+            updated = replace(updated, last_heartbeat_at=None, status=HOST_UNKNOWN)
+        else:
+            updated = replace(
+                updated,
+                last_heartbeat_at=existing.last_heartbeat_at,
+                status=existing.status,
+            )
+        self._hosts[host_id] = updated
+        return updated.to_projection(
+            now=timestamp,
+            context_health=self._host_context_health(host_id),
+            handoff_state=self._host_handoff_state(host_id),
+        )
+
+    def record_task_ack(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        timestamp = _utc(now)
+        host_id = _required_text(payload.get("host_id"), "host_id")
+        message_id = _required_text(payload.get("message_id"), "message_id")
+        delivery_id = _required_text(payload.get("delivery_id"), "delivery_id")
+        task_ack_status = _required_text(payload.get("status"), "status")
+        delivery = self._host_delivery_by_id(
+            message_id,
+            delivery_id=delivery_id,
+            host_id=host_id,
+        )
+        metadata = _merged_task_ack_metadata(
+            delivery.get("metadata"),
+            payload,
+            recorded_at=timestamp.isoformat(),
+        )
+        acked = self.messaging_store.ack_delivery(
+            message_id=message_id,
+            delivery_id=delivery_id,
+            status="acked",
+            metadata_updates={"task_ack": metadata},
+        )
+        return {
+            "delivery": acked,
+            "task_ack": metadata,
+            "acknowledged_status": task_ack_status,
+        }
+
+    def record_host_message_ack(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        timestamp = _utc(now)
+        host_id = _required_text(payload.get("host_id"), "host_id")
+        message_id = _required_text(payload.get("message_id"), "message_id")
+        delivery_id = _required_text(payload.get("delivery_id"), "delivery_id")
+        self._host_delivery_by_id(
+            message_id,
+            delivery_id=delivery_id,
+            host_id=host_id,
+        )
+        acked = self.messaging_store.ack_delivery(
+            message_id=message_id,
+            delivery_id=delivery_id,
+            status="acked",
+            metadata_updates={
+                "host_message_ack": {
+                    "host_id": host_id,
+                    "status": _optional_text(payload.get("status")) or "acked",
+                    "recorded_at": timestamp.isoformat(),
+                }
+            },
+        )
+        return {"delivery": acked}
 
     def record_agent_state(
         self,
@@ -720,6 +827,21 @@ class FleetController:
                 return delivery
         return None
 
+    def _host_delivery_by_id(
+        self,
+        message_id: str,
+        *,
+        delivery_id: str,
+        host_id: str,
+    ) -> dict[str, Any]:
+        for delivery in self.messaging_store.list_deliveries(message_id):
+            if delivery["delivery_id"] != delivery_id:
+                continue
+            if delivery["recipient_kind"] != "host" or delivery["recipient_id"] != host_id:
+                raise ValueError("delivery does not belong to the acknowledging host")
+            return delivery
+        raise KeyError(f"unknown delivery_id: {delivery_id}")
+
     def _host_delivery_ids(self, message_id: str) -> frozenset[str]:
         return frozenset(
             str(delivery["recipient_id"])
@@ -1032,6 +1154,48 @@ def _host_failure_rejection(
         message=messages.get(reason, "host is not eligible for this task"),
         details=payload,
     )
+
+
+def _merged_task_ack_metadata(
+    existing_metadata: Any,
+    payload: Mapping[str, Any],
+    *,
+    recorded_at: str,
+) -> dict[str, Any]:
+    existing = (
+        existing_metadata.get("task_ack")
+        if isinstance(existing_metadata, Mapping)
+        and isinstance(existing_metadata.get("task_ack"), Mapping)
+        else {}
+    )
+    incoming = {
+        "host_id": _required_text(payload.get("host_id"), "host_id"),
+        "task_id": _optional_text(payload.get("task_id")),
+        "run_id": _optional_text(payload.get("run_id")),
+        "status": _required_text(payload.get("status"), "status"),
+        "recorded_at": recorded_at,
+    }
+    current_status = _optional_text(existing.get("status"))
+    incoming_status = incoming["status"]
+    if (
+        current_status is not None
+        and _task_ack_status_rank(current_status)
+        > _task_ack_status_rank(incoming_status)
+    ):
+        merged = dict(existing)
+        merged.setdefault("recorded_at", recorded_at)
+        return merged
+    merged = dict(existing)
+    merged.update({key: value for key, value in incoming.items() if value is not None})
+    return merged
+
+
+def _task_ack_status_rank(status: str) -> int:
+    return {
+        "lease_conflict": 1,
+        "duplicate": 2,
+        "accepted": 3,
+    }.get(str(status or "").strip().lower(), 0)
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:

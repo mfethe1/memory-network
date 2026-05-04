@@ -63,10 +63,13 @@ If any condition is missing, the inbound event is stored as chat with
 
 ## Telegram
 
-The Telegram adapter handles inbound webhook updates and outbound notification
-payloads. Inbound webhook handling requires the configured Telegram secret
-token to match the `X-Telegram-Bot-Api-Secret-Token` header before identity
-lookup or command promotion runs. It derives idempotency from:
+The Telegram adapter handles inbound webhook updates, inbound long-poll
+updates, and outbound notification payloads. Webhook handling requires the
+configured Telegram secret token to match the
+`X-Telegram-Bot-Api-Secret-Token` header before identity lookup or command
+promotion runs. Polling uses an injected HTTP transport plus a configured bot
+token. Both modes call the same Telegram normalization and persistence path and
+share the same idempotency logic. It derives idempotency from:
 
 ```text
 telegram:<platform_room_id>:<platform_thread_id>:<platform_event_id>
@@ -75,6 +78,12 @@ telegram:<platform_room_id>:<platform_thread_id>:<platform_event_id>
 For Telegram, `platform_event_id` is the update ID when available, falling
 back to the message ID. A replayed update returns the existing message,
 deliveries, and command ref.
+
+Telegram webhook and Telegram polling are just two ingestion modes for the
+same adapter. They do not create separate bot identities, host-specific
+parsers, or parallel controller paths. Polling may persist the next Telegram
+offset in the canonical messaging store so a caller can resume without relying
+on process-local memory.
 
 The host-claim routing extension must recognize:
 
@@ -96,6 +105,10 @@ verification.
 Host aliases are resolved by the Fleet Controller after identity and route
 policy validation. The Telegram adapter must not turn `@rosie` or `@lenny` into
 host IDs by itself, and it must not create separate command paths per host.
+
+Secrets and tokens stay in configuration or environment. Do not commit a bot
+token, webhook secret, chat ID, or NATS credential to the repo or embed them in
+task prompts, tests, or examples.
 
 An untagged, actionable message in a mapped fleet or task room is claimable
 work. The adapter stores it as one OpenClaw message and leaves claiming to the

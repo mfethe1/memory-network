@@ -159,6 +159,15 @@ class MessagingStore:
               UNIQUE(adapter_id, platform_user_id)
             );
 
+            CREATE TABLE IF NOT EXISTS openclaw_adapter_cursors (
+              adapter_id TEXT NOT NULL,
+              cursor_key TEXT NOT NULL,
+              cursor_value TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              metadata_json TEXT NOT NULL,
+              PRIMARY KEY(adapter_id, cursor_key)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_openclaw_rooms_kind_task
               ON openclaw_rooms(room_kind, task_id);
             CREATE INDEX IF NOT EXISTS idx_openclaw_rooms_kind_run
@@ -569,6 +578,7 @@ class MessagingStore:
         delivery_key: str | None = None,
         status: str = "acked",
         error: str | None = None,
+        metadata_updates: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         status = str(status or "acked").strip().lower()
         if status not in {"delivered", "acked", "failed", "expired"}:
@@ -586,6 +596,10 @@ class MessagingStore:
         current_status = str(existing["delivery_status"] or "queued")
         if _delivery_status_rank(status) < _delivery_status_rank(current_status):
             return existing
+        merged_metadata = _deep_merge_dicts(
+            existing["metadata"],
+            dict(metadata_updates or {}),
+        )
         if status in {"delivered", "acked"} and not delivered_at:
             delivered_at = now
         if status == "acked":
@@ -597,12 +611,89 @@ class MessagingStore:
                    SET delivery_status = ?,
                        delivered_at = ?,
                        acked_at = ?,
-                       error = ?
+                       error = ?,
+                       metadata_json = ?
                  WHERE delivery_id = ?
                 """,
-                (status, delivered_at, acked_at, _clean(error), existing["delivery_id"]),
+                (
+                    status,
+                    delivered_at,
+                    acked_at,
+                    _clean(error),
+                    _dump(merged_metadata),
+                    existing["delivery_id"],
+                ),
             )
         return self._get_delivery(existing["delivery_id"])
+
+    def get_adapter_cursor(
+        self,
+        *,
+        adapter_id: str,
+        cursor_key: str = "default",
+    ) -> dict[str, Any] | None:
+        adapter_id = str(adapter_id or "").strip()
+        cursor_key = str(cursor_key or "default").strip()
+        if not adapter_id or not cursor_key:
+            return None
+        row = self.conn.execute(
+            """
+            SELECT * FROM openclaw_adapter_cursors
+             WHERE adapter_id = ?
+               AND cursor_key = ?
+            """,
+            (adapter_id, cursor_key),
+        ).fetchone()
+        return _adapter_cursor(row) if row else None
+
+    def set_adapter_cursor(
+        self,
+        *,
+        adapter_id: str,
+        cursor_key: str = "default",
+        cursor_value: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        adapter_id = str(adapter_id or "").strip()
+        cursor_key = str(cursor_key or "default").strip()
+        cursor_value = str(cursor_value or "").strip()
+        if not adapter_id:
+            raise MessagingError("adapter_id is required")
+        if not cursor_key:
+            raise MessagingError("cursor_key is required")
+        if not cursor_value:
+            raise MessagingError("cursor_value is required")
+        now = _now()
+        with self._transaction():
+            self.conn.execute(
+                """
+                INSERT INTO openclaw_adapter_cursors (
+                  adapter_id, cursor_key, cursor_value, updated_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(adapter_id, cursor_key) DO UPDATE SET
+                  cursor_value = excluded.cursor_value,
+                  updated_at = excluded.updated_at,
+                  metadata_json = excluded.metadata_json
+                """,
+                (
+                    adapter_id,
+                    cursor_key,
+                    cursor_value,
+                    now,
+                    _dump(dict(metadata or {})),
+                ),
+            )
+        row = self.conn.execute(
+            """
+            SELECT * FROM openclaw_adapter_cursors
+             WHERE adapter_id = ?
+               AND cursor_key = ?
+            """,
+            (adapter_id, cursor_key),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("adapter cursor was not persisted")
+        return _adapter_cursor(row)
 
     def get_command_ref_for_message(self, message_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -1568,6 +1659,16 @@ def _identity(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _adapter_cursor(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "adapter_id": row["adapter_id"],
+        "cursor_key": row["cursor_key"],
+        "cursor_value": row["cursor_value"],
+        "updated_at": row["updated_at"],
+        "metadata": _load(row["metadata_json"], {}),
+    }
+
+
 def _metadata_participants(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [
         dict(item)
@@ -1759,6 +1860,19 @@ def _load(raw: str, default: Any) -> Any:
         return json.loads(raw or "")
     except json.JSONDecodeError:
         return default
+
+
+def _deep_merge_dicts(base: Any, updates: Any) -> dict[str, Any]:
+    left = dict(base) if isinstance(base, Mapping) else {}
+    right = dict(updates) if isinstance(updates, Mapping) else {}
+    merged = dict(left)
+    for key, value in right.items():
+        existing = merged.get(key)
+        if isinstance(existing, Mapping) and isinstance(value, Mapping):
+            merged[str(key)] = _deep_merge_dicts(existing, value)
+        else:
+            merged[str(key)] = value
+    return merged
 
 
 def _clean(value: Any) -> str | None:

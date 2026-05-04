@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import hmac
-from typing import Any, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 from code_index.openclaw_messaging.adapters import AdapterCapabilities
 from code_index.openclaw_messaging.adapters import MessagingAdapter
@@ -13,6 +14,8 @@ from code_index.openclaw_messaging.store import adapter_idempotency_key
 
 
 HOST_ALIAS_MENTIONS = frozenset({"rosie", "lenny"})
+TELEGRAM_UPDATE_CURSOR_KEY = "telegram:getUpdates"
+TelegramHttpClient = Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
 
 
 class TelegramAdapter(MessagingAdapter):
@@ -114,6 +117,19 @@ def handle_telegram_webhook(
         expected=secret_token,
         provided=provided_secret_token,
     )
+    return ingest_telegram_update(
+        store,
+        update,
+        adapter_id=adapter_id,
+    )
+
+
+def ingest_telegram_update(
+    store: MessagingStore,
+    update: Mapping[str, Any],
+    *,
+    adapter_id: str = "telegram",
+) -> dict[str, Any]:
     adapter = TelegramAdapter()
     if adapter_id != adapter.adapter_id:
         raise ValueError("only the built-in telegram adapter is supported")
@@ -144,6 +160,94 @@ def handle_telegram_webhook(
         trace_id=draft.trace_id,
         correlation_id=draft.correlation_id,
     )
+
+
+def poll_telegram_updates(
+    store: MessagingStore,
+    *,
+    bot_token: str,
+    http_client: TelegramHttpClient,
+    adapter_id: str = "telegram",
+    api_base_url: str = "https://api.telegram.org",
+    offset: int | None = None,
+    timeout_seconds: int = 0,
+    limit: int | None = None,
+    allowed_updates: Sequence[str] | None = None,
+    cursor_key: str = TELEGRAM_UPDATE_CURSOR_KEY,
+    persist_update_offset: bool = False,
+) -> dict[str, Any]:
+    token = str(bot_token or "").strip()
+    if not token:
+        raise ValueError("bot_token is required for Telegram polling")
+    requested_offset = _coerce_offset(offset)
+    cursor = None
+    if requested_offset is None:
+        cursor = store.get_adapter_cursor(
+            adapter_id=adapter_id,
+            cursor_key=cursor_key,
+        )
+        if cursor is not None:
+            requested_offset = _coerce_offset(cursor.get("cursor_value"))
+    payload: dict[str, Any] = {"timeout": max(0, int(timeout_seconds))}
+    if requested_offset is not None:
+        payload["offset"] = requested_offset
+    if limit is not None:
+        payload["limit"] = max(1, int(limit))
+    if allowed_updates is not None:
+        payload["allowed_updates"] = [
+            str(item).strip() for item in allowed_updates if str(item).strip()
+        ]
+    response = http_client(
+        f"{str(api_base_url).rstrip('/')}/bot{token}/getUpdates",
+        payload,
+    )
+    if not isinstance(response, Mapping):
+        raise ValueError("Telegram poll response must be an object")
+    if not bool(response.get("ok")):
+        raise ValueError("Telegram poll response was not ok")
+    raw_updates = response.get("result")
+    if not isinstance(raw_updates, list):
+        raise ValueError("Telegram poll result must be a list")
+
+    results: list[dict[str, Any]] = []
+    max_update_id: int | None = None
+    for raw_update in raw_updates:
+        if not isinstance(raw_update, Mapping):
+            raise ValueError("Telegram poll update entries must be objects")
+        result = ingest_telegram_update(
+            store,
+            raw_update,
+            adapter_id=adapter_id,
+        )
+        results.append(result)
+        update_id = _coerce_offset(raw_update.get("update_id"))
+        if update_id is not None:
+            max_update_id = update_id if max_update_id is None else max(
+                max_update_id,
+                update_id,
+            )
+    next_update_offset = (
+        max_update_id + 1
+        if max_update_id is not None
+        else requested_offset
+    )
+    persisted_cursor = None
+    if persist_update_offset and next_update_offset is not None:
+        persisted_cursor = store.set_adapter_cursor(
+            adapter_id=adapter_id,
+            cursor_key=cursor_key,
+            cursor_value=str(next_update_offset),
+            metadata={
+                "source": "telegram_get_updates",
+                "batch_size": len(results),
+            },
+        )
+    return {
+        "requested_offset": requested_offset,
+        "next_update_offset": next_update_offset,
+        "results": results,
+        "cursor": persisted_cursor,
+    }
 
 
 def _require_secret_token(*, expected: str | None, provided: str | None) -> None:
@@ -257,3 +361,11 @@ def _is_claimable_text(
 
 def _object(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _coerce_offset(value: Any) -> int | None:
+    try:
+        parsed = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None

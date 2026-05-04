@@ -24,6 +24,7 @@ class OpenClawControllerApp:
     store: MessagingStore
     router: MessagingRouter
     fleet_controller: FleetController | None = None
+    controller_nats_runtime: "ControllerNatsRuntime | None" = None
 
     def handle_request(
         self,
@@ -49,7 +50,7 @@ class OpenClawControllerApp:
             headers=headers,
             principal=principal,
         )
-        if self.fleet_controller is not None and _is_telegram_webhook_path(
+        if self.fleet_controller is not None and _is_telegram_ingest_path(
             method,
             path,
         ):
@@ -61,7 +62,18 @@ class OpenClawControllerApp:
         return response
 
     def close(self) -> None:
+        if self.controller_nats_runtime is not None:
+            self.controller_nats_runtime.close()
         self.store.close()
+
+
+@dataclass(frozen=True)
+class ControllerNatsRuntime:
+    nats_client: Any
+    subscriptions: tuple[str, ...]
+
+    def close(self) -> None:
+        return
 
 
 def create_app(
@@ -69,10 +81,13 @@ def create_app(
     *,
     signing_secret: str,
     telegram_secret_token: str | None = None,
+    telegram_bot_token: str | None = None,
+    telegram_http_client: Any | None = None,
     register_default_adapters: bool = True,
     lease_store: Any | None = None,
     nats_client: Any | None = None,
     fleet_controller: FleetController | None = None,
+    attach_nats_subscriptions: bool = True,
 ) -> OpenClawControllerApp:
     store = MessagingStore(db_path, signing_secret=signing_secret)
     if register_default_adapters:
@@ -83,10 +98,26 @@ def create_app(
             lease_store=lease_store or InMemoryFleetLeaseStore(),
             nats_client=nats_client,
         )
+    controller_nats_runtime = None
+    if (
+        attach_nats_subscriptions
+        and nats_client is not None
+        and callable(getattr(nats_client, "subscribe", None))
+    ):
+        controller_nats_runtime = _attach_controller_nats_runtime(
+            fleet_controller,
+            nats_client=nats_client,
+        )
     return OpenClawControllerApp(
         store=store,
-        router=MessagingRouter(store, telegram_secret_token=telegram_secret_token),
+        router=MessagingRouter(
+            store,
+            telegram_secret_token=telegram_secret_token,
+            telegram_bot_token=telegram_bot_token,
+            telegram_http_client=telegram_http_client,
+        ),
         fleet_controller=fleet_controller,
+        controller_nats_runtime=controller_nats_runtime,
     )
 
 
@@ -120,6 +151,11 @@ class FleetRouter:
                 if not _principal_can_ingest_host(principal, payload):
                     return _forbidden()
                 host = self.controller.record_host_heartbeat(_object(payload))
+                return ApiResponse(200, {"host": host})
+            if method == "POST" and parts == ["fleet", "hosts", "capabilities"]:
+                if not _principal_can_ingest_host(principal, payload):
+                    return _forbidden()
+                host = self.controller.record_host_capabilities(_object(payload))
                 return ApiResponse(200, {"host": host})
             if method == "POST" and parts == ["fleet", "agent-states"]:
                 if not _principal_can_ingest_host(principal, payload):
@@ -170,6 +206,16 @@ class FleetRouter:
                         self.controller.messaging_store.list_deliveries(message_id)
                     )
                 return ApiResponse(_assignment_status_code(result), response_body)
+            if method == "POST" and parts == ["fleet", "tasks", "ack"]:
+                if not _principal_can_ingest_host(principal, payload):
+                    return _forbidden()
+                result = self.controller.record_task_ack(_object(payload))
+                return ApiResponse(200, result)
+            if method == "POST" and parts == ["fleet", "messages", "ack"]:
+                if not _principal_can_ingest_host(principal, payload):
+                    return _forbidden()
+                result = self.controller.record_host_message_ack(_object(payload))
+                return ApiResponse(200, result)
             if method == "POST" and parts == ["fleet", "handoffs"]:
                 if not _principal_has_scope(
                     principal,
@@ -207,6 +253,11 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("OPENCLAW_TELEGRAM_SECRET_TOKEN"),
         help="Telegram webhook secret token. May also use OPENCLAW_TELEGRAM_SECRET_TOKEN.",
     )
+    parser.add_argument(
+        "--telegram-bot-token",
+        default=os.environ.get("OPENCLAW_TELEGRAM_BOT_TOKEN"),
+        help="Telegram bot token for long-poll ingestion. May also use OPENCLAW_TELEGRAM_BOT_TOKEN.",
+    )
     args = parser.parse_args(argv)
     try:
         body = json.loads(args.body_json)
@@ -221,6 +272,7 @@ def main(argv: list[str] | None = None) -> int:
         args.db,
         signing_secret=args.signing_secret,
         telegram_secret_token=args.telegram_secret_token,
+        telegram_bot_token=args.telegram_bot_token,
     )
     try:
         response = app.handle_request(args.method, args.path, body)
@@ -240,9 +292,12 @@ def _is_fleet_path(path: str) -> bool:
     return bool(parts and parts[0] == "fleet")
 
 
-def _is_telegram_webhook_path(method: str, path: str) -> bool:
-    parts = [part for part in urlsplit(path).path.strip("/").split("/") if part]
-    return method.upper() == "POST" and parts == ["adapters", "telegram", "webhook"]
+def _is_telegram_ingest_path(method: str, path: str) -> bool:
+    parts = tuple(part for part in urlsplit(path).path.strip("/").split("/") if part)
+    return method.upper() == "POST" and parts in {
+        ("adapters", "telegram", "webhook"),
+        ("adapters", "telegram", "poll"),
+    }
 
 
 def _with_auto_assignment(
@@ -251,27 +306,110 @@ def _with_auto_assignment(
     controller: FleetController,
     store: MessagingStore,
 ) -> ApiResponse:
-    if response.status_code >= 400 or not response.body.get("created"):
+    if response.status_code >= 400:
         return response
-    command_ref = response.body.get("command_ref")
-    if not isinstance(command_ref, Mapping):
+    if "results" in response.body and isinstance(response.body.get("results"), list):
+        body = dict(response.body)
+        auto_assignments = [
+            _auto_assignment_for_result(result, controller=controller, store=store)
+            for result in body["results"]
+            if isinstance(result, Mapping)
+        ]
+        auto_assignments = [item for item in auto_assignments if item is not None]
+        if auto_assignments:
+            body["auto_assignments"] = auto_assignments
+        return ApiResponse(response.status_code, body)
+    auto_assignment = _auto_assignment_for_result(
+        response.body,
+        controller=controller,
+        store=store,
+    )
+    if auto_assignment is None:
         return response
-    if str(command_ref.get("command_type") or "").strip() != "assign_task":
-        return response
-    result = controller.assign_task_from_command_ref(command_ref)
     body = dict(response.body)
-    auto_assignment = result.to_dict()
-    message_id = _optional_text(command_ref.get("message_id"))
-    if message_id is not None:
-        auto_assignment["deliveries"] = store.list_deliveries(message_id)
     body["auto_assignment"] = auto_assignment
     return ApiResponse(response.status_code, body)
+
+
+def _auto_assignment_for_result(
+    result: Mapping[str, Any],
+    *,
+    controller: FleetController,
+    store: MessagingStore,
+) -> dict[str, Any] | None:
+    if not bool(result.get("created")):
+        return None
+    command_ref = result.get("command_ref")
+    if not isinstance(command_ref, Mapping):
+        return None
+    if str(command_ref.get("command_type") or "").strip() != "assign_task":
+        return None
+    assignment = controller.assign_task_from_command_ref(command_ref).to_dict()
+    message_id = _optional_text(command_ref.get("message_id"))
+    if message_id is not None:
+        assignment["deliveries"] = store.list_deliveries(message_id)
+    return assignment
+
+
+def _attach_controller_nats_runtime(
+    controller: FleetController,
+    *,
+    nats_client: Any,
+) -> ControllerNatsRuntime:
+    if not getattr(nats_client, "connected", False):
+        connect = getattr(nats_client, "connect", None)
+        if callable(connect):
+            connect()
+    subscriptions = (
+        "openclaw.host.*.heartbeat",
+        "openclaw.host.*.capabilities",
+        "openclaw.task.*.ack",
+        "openclaw.host.*.messages.ack",
+    )
+    subscribe = getattr(nats_client, "subscribe", None)
+    if not callable(subscribe):
+        raise RuntimeError("NATS client has no subscribe()")
+    subscribe(
+        subscriptions[0],
+        lambda message: controller.record_host_heartbeat(_message_payload(message)),
+    )
+    subscribe(
+        subscriptions[1],
+        lambda message: controller.record_host_capabilities(_message_payload(message)),
+    )
+    subscribe(
+        subscriptions[2],
+        lambda message: controller.record_task_ack(_message_payload(message)),
+    )
+    subscribe(
+        subscriptions[3],
+        lambda message: controller.record_host_message_ack(_message_payload(message)),
+    )
+    return ControllerNatsRuntime(
+        nats_client=nats_client,
+        subscriptions=subscriptions,
+    )
 
 
 def _object(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
     raise ValueError("expected object")
+
+
+def _message_payload(message: Any) -> dict[str, Any]:
+    if isinstance(message, Mapping):
+        return dict(message)
+    data = getattr(message, "data", message)
+    if isinstance(data, bytes):
+        payload = json.loads(data.decode("utf-8"))
+    elif isinstance(data, str):
+        payload = json.loads(data)
+    else:
+        raise ValueError("controller NATS message must be a JSON object")
+    if not isinstance(payload, dict):
+        raise ValueError("controller NATS message must be a JSON object")
+    return payload
 
 
 def _principal_has_scope(

@@ -1453,6 +1453,9 @@ Tasks:
       promotion path that creates one pending `assign_task` command reference
       for the existing `message_id` when a valid host claims it.
 - [ ] Add Telegram inbound webhook handling and outbound notification delivery.
+- [x] Route Telegram webhook and long-poll ingestion through the same canonical
+      Messaging Service persistence path, keep adapter replay offsets in the
+      central store, and avoid per-host Telegram control planes.
 - [ ] Add stub adapter registrations for Slack, Discord, Matrix, email, and
       generic webhook with no command-promotion permissions by default.
 - [ ] Add idempotency keys based on adapter ID, platform room/thread ID, and
@@ -1591,6 +1594,9 @@ Tasks:
       runs only after host eligibility, leases, and restart cooldown checks.
 - [ ] Expose context health and handoff state in fleet API projections.
 - [ ] Add API tests for host selection and rejected assignments.
+- [x] Consume host heartbeat/capability updates plus host task/message ACKs
+      through controller-side NATS callbacks or equivalent route hooks and
+      reconcile them into controller and messaging store state.
 
 Verification:
 
