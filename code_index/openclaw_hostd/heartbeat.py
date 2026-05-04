@@ -105,6 +105,7 @@ def build_heartbeat_payload(
         "schema_version": 1,
         "generated_at": generated_at.isoformat(),
         "host_id": identity.host_id,
+        "host_aliases": list(config.host_aliases),
         "ssh_hostname": _ssh_hostname(config),
         "heartbeat_interval_seconds": config.heartbeat_interval_seconds,
         "capabilities": detect_capabilities(

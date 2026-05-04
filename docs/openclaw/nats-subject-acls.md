@@ -14,7 +14,7 @@ Selected first-test model:
 - One NKey user for the Messaging Service.
 - One NKey user for the OpenClaw Context Manager Agent.
 - One NKey user per external adapter identity.
-- One NKey user per Windows host, bound to exactly one `host_id`.
+- One NKey user per host, bound to exactly one `host_id`.
 
 Per-host NATS accounts can be added later for stronger account-level isolation,
 but the Milestone 1 control surface starts with per-host NKey users and strict
@@ -86,6 +86,10 @@ The host daemon's NATS client configuration must set its custom inbox prefix to
 library cannot set the prefix, the credential must use bounded response
 permissions with a short expiry and low max-response count instead. Never grant
 hosts `_INBOX.>`.
+
+Aliases such as `lenny` and `rosie` never replace `host_id` in ACL generation,
+durable consumer names, or NATS subjects. They remain controller-side routing
+labels only.
 
 ## Host ACL Template
 

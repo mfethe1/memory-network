@@ -844,6 +844,7 @@ def publish_host_snapshot(
             "schema_version": 1,
             "generated_at": payload.get("generated_at"),
             "host_id": host_id,
+            "host_aliases": list(payload.get("host_aliases") or []),
             "ssh_hostname": payload.get("ssh_hostname"),
             "capabilities": dict(payload.get("capabilities") or {}),
         },

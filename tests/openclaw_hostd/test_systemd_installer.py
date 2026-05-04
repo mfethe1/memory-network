@@ -39,11 +39,13 @@ def test_systemd_installer_writes_lenny_host_config_for_rosie_broker(
         identity_path=install["hostd_state"] / "host-identity.json",
         nats_url="nats://openclaw-system-2026@100.72.176.67:4222",
         host_display_name="lenny",
+        host_alias="lenny",
         graph_port=8767,
         heartbeat_seconds=30,
     )
 
     payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["host_aliases"] == ["lenny"]
     assert payload["ssh_hostname"] == "lenny"
     assert payload["repo_roots"] == [str(repo)]
     assert payload["graph_server_url"] == "http://127.0.0.1:8767"
@@ -51,6 +53,15 @@ def test_systemd_installer_writes_lenny_host_config_for_rosie_broker(
     assert payload["context_store_path"] == str(
         tmp_path / "home/.openclaw/state/memory-claude-openclaw-m1/context-store.db"
     )
+
+
+def test_systemd_installer_does_not_provision_broker_by_default() -> None:
+    installer = _load_installer()
+
+    args = installer.build_parser().parse_args(["--nats-url", "nats://example:4222"])
+
+    assert args.provision_broker is False
+    assert args.no_start is False
 
 
 def test_systemd_installer_writes_user_units_for_graph_hostd_and_fleet_mcp(

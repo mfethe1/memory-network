@@ -13,6 +13,7 @@ from code_index.openclaw_hostd.config import (
     GRAPH_SERVER_TOKEN_ENV,
     GRAPH_SERVER_URL_ENV,
     FLEET_LEASE_STORE_PATH_ENV,
+    HOST_ALIASES_ENV,
     HOST_IDENTITY_PATH_ENV,
     HostDaemonConfig,
     NATS_URL_ENV,
@@ -91,12 +92,14 @@ def test_cli_once_json_redacts_graph_server_url_secret(
         "OPENCLAW_HOSTD_GRAPH_SERVER_URL",
         "127.0.0.1:8767/health?token=cli-secret",
     )
+    monkeypatch.setenv("OPENCLAW_HOSTD_HOST_ALIASES", "Rosie, lenny ,, ROSIE")
 
     rc = service.main(["--once", "--json"])
     rendered = capsys.readouterr().out
     payload = json.loads(rendered)
 
     assert rc == 0
+    assert payload["host_aliases"] == ["rosie", "lenny"]
     assert payload["capabilities"]["graph_server"]["url"] == REDACTED
     assert "cli-secret" not in rendered
 
@@ -111,6 +114,7 @@ def test_heartbeat_reports_host_capabilities_without_secrets(tmp_path: Path) -> 
         host_identity_path=tmp_path / "state" / "host-id.json",
         repo_roots=(root,),
         graph_server_url="http://user:super-secret@127.0.0.1:8767/health?token=super-secret",
+        host_aliases=("lenny", "rosie"),
         ssh_hostname="openclaw-test-host",
         heartbeat_interval_seconds=30,
     )
@@ -126,6 +130,7 @@ def test_heartbeat_reports_host_capabilities_without_secrets(tmp_path: Path) -> 
     assert payload["schema_version"] == 1
     assert payload["generated_at"] == "2026-05-03T01:02:03+00:00"
     assert payload["host_id"] == identity.host_id
+    assert payload["host_aliases"] == ["lenny", "rosie"]
     assert payload["ssh_hostname"] == "openclaw-test-host"
     assert payload["capabilities"]["graph_server"]["available"] is False
     assert payload["capabilities"]["graph_server"]["checked"] is True
@@ -169,6 +174,7 @@ def test_config_loads_json_file_with_environment_overrides(tmp_path: Path) -> No
                 "repo_roots": [str(file_root)],
                 "graph_server_url": "http://127.0.0.1:1111/health",
                 "graph_server_token": "file-token",
+                "host_aliases": ["Lenny", "  rosie  ", "", "lenny"],
                 "fleet_lease_store_path": str(tmp_path / "leases-from-file.db"),
                 "context_store_path": str(tmp_path / "context-from-file.db"),
                 "ssh_hostname": "file-host",
@@ -184,6 +190,7 @@ def test_config_loads_json_file_with_environment_overrides(tmp_path: Path) -> No
             REPO_ROOTS_ENV: str(env_root),
             GRAPH_SERVER_URL_ENV: "",
             GRAPH_SERVER_TOKEN_ENV: "env-token",
+            HOST_ALIASES_ENV: " ROSIE, lenny ,, rosie ",
             NATS_URL_ENV: "nats://user:nats-secret@example.invalid:4222",
             FLEET_LEASE_STORE_PATH_ENV: str(tmp_path / "leases-from-env.db"),
             CONTEXT_STORE_PATH_ENV: str(tmp_path / "context-from-env.db"),
@@ -196,6 +203,7 @@ def test_config_loads_json_file_with_environment_overrides(tmp_path: Path) -> No
     assert config.state_dir == tmp_path / "state-from-file"
     assert config.host_identity_path == tmp_path / "identity-from-env.json"
     assert config.repo_roots == (env_root,)
+    assert config.host_aliases == ("rosie", "lenny")
     assert config.graph_server_url is None
     assert config.graph_server_token == "env-token"
     assert "env-token" not in repr(config)
@@ -205,3 +213,31 @@ def test_config_loads_json_file_with_environment_overrides(tmp_path: Path) -> No
     assert config.context_store_path == tmp_path / "context-from-env.db"
     assert config.ssh_hostname == "file-host"
     assert config.heartbeat_interval_seconds == 45
+
+
+@pytest.mark.parametrize(
+    ("source", "value"),
+    [
+        ("json", ["lenny/dev"]),
+        ("json", ["lenny rosie"]),
+        ("json", ["lenny*"]),
+        ("env", "lenny@ops"),
+        ("env", "rosie,invalid>alias"),
+    ],
+)
+def test_config_rejects_invalid_host_aliases(
+    tmp_path: Path,
+    source: str,
+    value: object,
+) -> None:
+    config_path = tmp_path / "openclaw-hostd.json"
+    payload = {"repo_roots": [str(tmp_path)]}
+    env: dict[str, str] = {}
+    if source == "json":
+        payload["host_aliases"] = value
+    else:
+        env[HOST_ALIASES_ENV] = str(value)
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="host_aliases|OPENCLAW_HOSTD_HOST_ALIASES"):
+        load_config(config_path, env=env, cwd=tmp_path)

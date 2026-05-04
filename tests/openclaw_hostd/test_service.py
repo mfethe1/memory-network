@@ -135,6 +135,7 @@ def _config(tmp_path: Path) -> HostDaemonConfig:
         state_dir=state_dir,
         host_identity_path=state_dir / "host-id.json",
         repo_roots=(tmp_path,),
+        host_aliases=("lenny",),
         graph_server_url="http://127.0.0.1:8767/health",
         heartbeat_interval_seconds=10,
     )
@@ -198,6 +199,7 @@ def _config_with_nats(tmp_path: Path) -> HostDaemonConfig:
         state_dir=config.state_dir,
         host_identity_path=config.host_identity_path,
         repo_roots=config.repo_roots,
+        host_aliases=config.host_aliases,
         graph_server_url=config.graph_server_url,
         graph_server_token=config.graph_server_token,
         ssh_hostname=config.ssh_hostname,
@@ -214,6 +216,7 @@ def _config_with_nats_and_leases(tmp_path: Path) -> HostDaemonConfig:
         state_dir=config.state_dir,
         host_identity_path=config.host_identity_path,
         repo_roots=config.repo_roots,
+        host_aliases=config.host_aliases,
         graph_server_url=config.graph_server_url,
         graph_server_token=config.graph_server_token,
         ssh_hostname=config.ssh_hostname,
@@ -230,6 +233,7 @@ def _config_with_nats_without_graph(tmp_path: Path) -> HostDaemonConfig:
         state_dir=config.state_dir,
         host_identity_path=config.host_identity_path,
         repo_roots=config.repo_roots,
+        host_aliases=config.host_aliases,
         graph_server_url=None,
         graph_server_token=config.graph_server_token,
         ssh_hostname=config.ssh_hostname,
@@ -282,11 +286,13 @@ def test_daemon_loop_uses_connected_nats_for_subscriptions_outbox_and_agent_stat
     capabilities_payload = transport.published[1][1]
     assert heartbeat_payload["kind"] == "openclaw.host_heartbeat"
     assert heartbeat_payload["host_id"] == HOST_ID
+    assert heartbeat_payload["host_aliases"] == ["lenny"]
     assert capabilities_payload == {
         "kind": "openclaw.host_capabilities",
         "schema_version": 1,
         "generated_at": heartbeat_payload["generated_at"],
         "host_id": HOST_ID,
+        "host_aliases": ["lenny"],
         "ssh_hostname": heartbeat_payload["ssh_hostname"],
         "capabilities": heartbeat_payload["capabilities"],
     }
@@ -757,7 +763,7 @@ def test_daemon_loop_releases_task_lease_when_graph_reports_terminal_run(
         verified.close()
 
 
-def test_daemon_loop_renews_active_task_lease_before_original_ttl_expires(
+def test_daemon_loop_renews_active_task_lease_for_matching_active_run(
     tmp_path: Path,
 ) -> None:
     config = _config_with_nats_and_leases(tmp_path)
@@ -771,7 +777,7 @@ def test_daemon_loop_renews_active_task_lease_before_original_ttl_expires(
         graph_client=graph,
     )
     assert runtime is not None
-    runtime.task_inbox.lease_ttl_seconds = 0.08
+    runtime.task_inbox.lease_ttl_seconds = 60
     transport.subscriptions[f"openclaw.deliver.{HOST_ID}.tasks"](
         {
             "kind": "openclaw.task.assigned",
@@ -784,8 +790,12 @@ def test_daemon_loop_renews_active_task_lease_before_original_ttl_expires(
         }
     )
     run_id = graph.requests[0]["run_id"]
+    initial_lease = runtime.task_inbox.lease_store.get_active_lease(
+        "task",
+        "task-renew",
+    )
+    assert initial_lease is not None
     runtime.close()
-    time.sleep(0.03)
     graph.agent_board_payload = {
         "runs": [
             {
@@ -807,9 +817,16 @@ def test_daemon_loop_renews_active_task_lease_before_original_ttl_expires(
         sleep=lambda seconds: None,
         max_iterations=1,
     )
-    time.sleep(0.08)
     other_host = SQLiteFleetLeaseStore(config.fleet_lease_store_path)
     try:
+        renewed_lease = other_host.get_active_lease("task", "task-renew")
+        assert renewed_lease is not None
+        assert renewed_lease.owner_host_id == HOST_ID
+        assert renewed_lease.owner_run_id == run_id
+        assert renewed_lease.fencing_revision > initial_lease.fencing_revision
+        assert renewed_lease.expires_at is not None
+        assert initial_lease.expires_at is not None
+        assert renewed_lease.expires_at > initial_lease.expires_at
         with pytest.raises(LeaseConflictError, match=HOST_ID):
             other_host.acquire_lease(
                 "task",
@@ -1060,6 +1077,7 @@ def test_configured_context_store_unavailable_emits_degraded_context_health(
         state_dir=base.state_dir,
         host_identity_path=base.host_identity_path,
         repo_roots=base.repo_roots,
+        host_aliases=base.host_aliases,
         graph_server_url=base.graph_server_url,
         graph_server_token=base.graph_server_token,
         ssh_hostname=base.ssh_hostname,

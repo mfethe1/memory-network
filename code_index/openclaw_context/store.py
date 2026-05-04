@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
@@ -30,6 +31,7 @@ class SQLiteContextStore:
 
     def __init__(self, path: str | Path | sqlite3.Connection = ":memory:") -> None:
         self.path: str | None = None
+        self._lock = threading.RLock()
         if isinstance(path, sqlite3.Connection):
             self._conn = path
             self._owns_conn = False
@@ -40,7 +42,7 @@ class SQLiteContextStore:
                     parents=True,
                     exist_ok=True,
                 )
-            self._conn = sqlite3.connect(self.path)
+            self._conn = sqlite3.connect(self.path, check_same_thread=False)
             self._owns_conn = True
         self._conn.row_factory = sqlite3.Row
         self._configure_connection()
@@ -48,10 +50,12 @@ class SQLiteContextStore:
 
     def close(self) -> None:
         if self._owns_conn:
-            self._conn.close()
+            with self._lock:
+                self._conn.close()
 
     def ping(self) -> None:
-        self._conn.execute("SELECT 1").fetchone()
+        with self._lock:
+            self._conn.execute("SELECT 1").fetchone()
 
     def sqlite_pragmas(self) -> dict[str, Any]:
         """Return operational SQLite pragmas used for local durability checks."""

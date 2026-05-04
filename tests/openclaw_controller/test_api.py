@@ -472,6 +472,110 @@ def test_telegram_poll_route_uses_same_assignment_path_as_webhook(
         app.close()
 
 
+def test_unified_telegram_routes_lenny_and_rosie_aliases_to_distinct_hosts(
+    tmp_path: Path,
+) -> None:
+    nats = FakeNats()
+    lease_store = InMemoryFleetLeaseStore()
+    app = create_app(
+        tmp_path / "messages.db",
+        signing_secret=SIGNING_SECRET,
+        telegram_secret_token=TELEGRAM_SECRET,
+        lease_store=lease_store,
+        nats_client=nats,
+    )
+    try:
+        for host_id, alias in (("host-lenny", "lenny"), ("host-rosie", "rosie")):
+            response = app.handle_request(
+                "POST",
+                "/fleet/hosts/heartbeat",
+                {
+                    **_heartbeat(host_id),
+                    "host_aliases": [alias],
+                    "capabilities": {
+                        **_heartbeat(host_id)["capabilities"],
+                        "repo_roots": [
+                            {"path": r"E:\Projects\openclaw", "exists": True}
+                        ],
+                    },
+                },
+                principal=FLEET_INGEST_PRINCIPAL,
+            )
+            assert response.status_code == 200
+
+        app.store.set_adapter_command_promotion("telegram", enabled=True)
+        fleet_room = app.store.create_room(
+            room_kind="fleet",
+            display_name="OpenClaw Fleet",
+            metadata={
+                "assignment": {
+                    "repo_root": r"E:\Projects\openclaw",
+                    "provider": "codex",
+                    "selected_paths": ["."],
+                }
+            },
+        )
+        app.store.map_platform_room(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            room_id=fleet_room["room_id"],
+            route_policy={
+                "command_promotion": {
+                    "enabled": True,
+                    "allowed_command_types": ["assign_task"],
+                    "allowed_target_kinds": ["task"],
+                }
+            },
+        )
+        app.store.link_external_identity(
+            adapter_id="telegram",
+            platform_user_id="42",
+            openclaw_identity_id="operator-1",
+            scopes=("message:write", "command:write"),
+            display_name="Operator",
+        )
+
+        lenny = app.handle_request(
+            "POST",
+            "/adapters/telegram/webhook",
+            _telegram_update(
+                update_id=610,
+                message_id=710,
+                text="/task task-lenny @lenny summarize repo status",
+            ),
+            headers={"X-Telegram-Bot-Api-Secret-Token": TELEGRAM_SECRET},
+        )
+        repo_lease = lease_store.get_active_lease("repo", r"E:\Projects\openclaw")
+        assert repo_lease is not None
+        lease_store.release_lease(
+            "repo",
+            r"E:\Projects\openclaw",
+            owner_host_id="host-lenny",
+            fencing_revision=repo_lease.fencing_revision,
+        )
+        rosie = app.handle_request(
+            "POST",
+            "/adapters/telegram/webhook",
+            _telegram_update(
+                update_id=611,
+                message_id=711,
+                text="/assign task-rosie @rosie check graph server health",
+            ),
+            headers={"X-Telegram-Bot-Api-Secret-Token": TELEGRAM_SECRET},
+        )
+
+        assert lenny.status_code == 201
+        assert rosie.status_code == 201
+        assert lenny.body["auto_assignment"]["assignment"]["host_id"] == "host-lenny"
+        assert rosie.body["auto_assignment"]["assignment"]["host_id"] == "host-rosie"
+        assert [subject for subject, _payload in nats.published] == [
+            "openclaw.task.host-lenny.assigned",
+            "openclaw.task.host-rosie.assigned",
+        ]
+    finally:
+        app.close()
+
+
 def test_fleet_task_route_returns_rejected_assignment_shape_for_repo_lease_conflict(
     tmp_path: Path,
 ) -> None:

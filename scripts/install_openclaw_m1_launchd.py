@@ -10,15 +10,15 @@ import os
 import plistlib
 import re
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any
 
-import nats
-from nats.js.api import ConsumerConfig
-from nats.js.api import KeyValueConfig
-from nats.js.api import RetentionPolicy
-from nats.js.api import StorageType
-from nats.js.api import StreamConfig
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
+from code_index.openclaw_hostd.config import normalize_host_aliases
 from code_index.openclaw_hostd.identity import load_or_create_host_identity
 
 
@@ -70,13 +70,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Human fleet label and SSH hostname to report.",
     )
     parser.add_argument(
+        "--host-alias",
+        help="Optional fleet routing alias to publish in host heartbeats.",
+    )
+    parser.add_argument(
         "--nats-conf",
         default=str(Path.home() / ".openclaw/workspace/infra/nats/nats-server.conf"),
-        help="Existing NATS server config containing token auth.",
+        help="Existing local NATS server config containing token auth.",
+    )
+    parser.add_argument(
+        "--nats-url",
+        default=os.environ.get("OPENCLAW_NATS_URL"),
+        help=(
+            "Shared OpenClaw NATS URL, including token auth. "
+            "May also be supplied as OPENCLAW_NATS_URL. Overrides --nats-conf."
+        ),
     )
     parser.add_argument("--graph-port", type=int, default=8767)
     parser.add_argument("--fleet-mcp-port", type=int, default=8766)
     parser.add_argument("--heartbeat-seconds", type=int, default=30)
+    parser.add_argument(
+        "--no-start",
+        action="store_true",
+        help="Write config and plist files without bootstrapping launchd services.",
+    )
+    parser.add_argument(
+        "--provision-broker",
+        action="store_true",
+        help=(
+            "Provision shared NATS streams, KV buckets, and this host consumer. "
+            "Use only from an admin deployment context, not routine host install."
+        ),
+    )
     return parser
 
 
@@ -95,26 +120,31 @@ def main(argv: list[str] | None = None) -> int:
     ):
         directory.mkdir(parents=True, exist_ok=True)
 
-    nats_token = read_nats_token(Path(args.nats_conf).expanduser())
+    nats_url = str(args.nats_url or "").strip()
+    if not nats_url:
+        nats_token = read_nats_token(Path(args.nats_conf).expanduser())
+        nats_url = f"nats://{nats_token}@127.0.0.1:4222"
     identity_path = install["hostd_state"] / "host-identity.json"
     identity = load_or_create_host_identity(identity_path)
     config_path = write_hostd_config(
         install=install,
         repo=repo,
         identity_path=identity_path,
-        nats_token=nats_token,
+        nats_url=nats_url,
         host_display_name=args.host_display_name,
+        host_alias=args.host_alias,
         graph_port=args.graph_port,
         heartbeat_seconds=args.heartbeat_seconds,
     )
-    asyncio.run(
-        provision_nats(
-            nats_url=f"nats://{nats_token}@127.0.0.1:4222",
-            host_id=identity.host_id,
-            host_display_name=args.host_display_name,
-            repo=repo,
+    if args.provision_broker:
+        asyncio.run(
+            provision_nats(
+                nats_url=nats_url,
+                host_id=identity.host_id,
+                host_display_name=args.host_display_name,
+                repo=repo,
+            )
         )
-    )
     services = write_launchd_plists(
         install=install,
         repo=repo,
@@ -122,12 +152,16 @@ def main(argv: list[str] | None = None) -> int:
         graph_port=args.graph_port,
         fleet_mcp_port=args.fleet_mcp_port,
     )
+    if not args.no_start:
+        bootstrap_services(services, install=install)
     print(
         json.dumps(
             {
                 "host_id": identity.host_id,
                 "hostd_config": str(config_path),
                 "services": services,
+                "started": not args.no_start,
+                "broker_provisioned": bool(args.provision_broker),
             },
             sort_keys=True,
         )
@@ -135,16 +169,16 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def install_paths(repo: Path) -> dict[str, Path]:
-    home = Path.home()
-    state_root = home / ".openclaw" / "state" / "memory-claude-openclaw-m1"
+def install_paths(repo: Path, *, home: Path | None = None) -> dict[str, Path]:
+    root = (home or Path.home()).expanduser()
+    state_root = root / ".openclaw" / "state" / "memory-claude-openclaw-m1"
     return {
         "state_root": state_root,
         "hostd_state": state_root / "hostd",
         "context_store": state_root / "context-store.db",
-        "config_dir": home / ".openclaw" / "config",
-        "logs_dir": home / ".openclaw" / "logs",
-        "launch_agents": home / "Library" / "LaunchAgents",
+        "config_dir": root / ".openclaw" / "config",
+        "logs_dir": root / ".openclaw" / "logs",
+        "launch_agents": root / "Library" / "LaunchAgents",
         "venv_python": repo / ".venv" / "bin" / "python",
         "hostd_bin": repo / ".venv" / "bin" / "code-index-openclaw-hostd",
     }
@@ -163,8 +197,9 @@ def write_hostd_config(
     install: dict[str, Path],
     repo: Path,
     identity_path: Path,
-    nats_token: str,
+    nats_url: str,
     host_display_name: str,
+    host_alias: str | None = None,
     graph_port: int,
     heartbeat_seconds: int,
 ) -> Path:
@@ -176,10 +211,13 @@ def write_hostd_config(
         "graph_server_url": f"http://127.0.0.1:{graph_port}",
         "ssh_hostname": host_display_name,
         "heartbeat_interval_seconds": heartbeat_seconds,
-        "nats_url": f"nats://{nats_token}@127.0.0.1:4222",
+        "nats_url": str(nats_url).strip(),
         "fleet_lease_store_path": str(install["hostd_state"] / "fleet-leases.db"),
         "context_store_path": str(install["context_store"]),
     }
+    aliases = normalize_host_aliases(host_alias)
+    if aliases:
+        payload["host_aliases"] = list(aliases)
     config_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -195,6 +233,13 @@ async def provision_nats(
     host_display_name: str,
     repo: Path,
 ) -> None:
+    import nats
+    from nats.js.api import ConsumerConfig
+    from nats.js.api import KeyValueConfig
+    from nats.js.api import RetentionPolicy
+    from nats.js.api import StorageType
+    from nats.js.api import StreamConfig
+
     nc = await nats.connect(
         servers=[nats_url],
         connect_timeout=2,
@@ -204,10 +249,27 @@ async def provision_nats(
     js = nc.jetstream()
     try:
         for name, subjects in STREAMS.items():
-            await ensure_stream(js, name, subjects)
+            await ensure_stream(
+                js,
+                name,
+                subjects,
+                stream_config_factory=StreamConfig,
+                storage_type=StorageType,
+                retention_policy=RetentionPolicy,
+            )
         for bucket, ttl in KV_BUCKETS.items():
-            await ensure_kv(js, bucket, ttl)
-        await ensure_host_consumer(js, host_id)
+            await ensure_kv(
+                js,
+                bucket,
+                ttl,
+                key_value_config_factory=KeyValueConfig,
+                storage_type=StorageType,
+            )
+        await ensure_host_consumer(
+            js,
+            host_id,
+            consumer_config_factory=ConsumerConfig,
+        )
         hosts = await js.key_value("openclaw_hosts")
         await hosts.put(
             host_id,
@@ -224,12 +286,20 @@ async def provision_nats(
         await nc.close()
 
 
-async def ensure_stream(js: Any, name: str, subjects: list[str]) -> None:
-    cfg = StreamConfig(
+async def ensure_stream(
+    js: Any,
+    name: str,
+    subjects: list[str],
+    *,
+    stream_config_factory: Any,
+    storage_type: Any,
+    retention_policy: Any,
+) -> None:
+    cfg = stream_config_factory(
         name=name,
         subjects=subjects,
-        storage=StorageType.FILE,
-        retention=RetentionPolicy.LIMITS,
+        storage=storage_type.FILE,
+        retention=retention_policy.LIMITS,
     )
     try:
         info = await js.stream_info(name)
@@ -241,15 +311,22 @@ async def ensure_stream(js: Any, name: str, subjects: list[str]) -> None:
         return
     if set(info.config.subjects or []) != set(subjects):
         info.config.subjects = subjects
-        info.config.storage = StorageType.FILE
-        info.config.retention = RetentionPolicy.LIMITS
+        info.config.storage = storage_type.FILE
+        info.config.retention = retention_policy.LIMITS
         await js.update_stream(info.config)
         print(f"updated stream {name}")
         return
     print(f"stream ok {name}")
 
 
-async def ensure_kv(js: Any, bucket: str, ttl: float | None) -> None:
+async def ensure_kv(
+    js: Any,
+    bucket: str,
+    ttl: float | None,
+    *,
+    key_value_config_factory: Any,
+    storage_type: Any,
+) -> None:
     try:
         kv = await js.key_value(bucket)
         status = await kv.status()
@@ -257,7 +334,11 @@ async def ensure_kv(js: Any, bucket: str, ttl: float | None) -> None:
         if not looks_missing(exc):
             raise
         await js.create_key_value(
-            config=KeyValueConfig(bucket=bucket, storage=StorageType.FILE, ttl=ttl)
+            config=key_value_config_factory(
+                bucket=bucket,
+                storage=storage_type.FILE,
+                ttl=ttl,
+            )
         )
         print(f"created kv {bucket}")
         return
@@ -271,7 +352,12 @@ async def ensure_kv(js: Any, bucket: str, ttl: float | None) -> None:
     print(f"kv ok {bucket}")
 
 
-async def ensure_host_consumer(js: Any, host_id: str) -> None:
+async def ensure_host_consumer(
+    js: Any,
+    host_id: str,
+    *,
+    consumer_config_factory: Any,
+) -> None:
     durable = f"HOST_{host_id}"
     try:
         await js.consumer_info("OPENCLAW_TASKS", durable)
@@ -280,7 +366,7 @@ async def ensure_host_consumer(js: Any, host_id: str) -> None:
             raise
         await js.add_consumer(
             "OPENCLAW_TASKS",
-            config=ConsumerConfig(
+            config=consumer_config_factory(
                 durable_name=durable,
                 deliver_subject=f"openclaw.deliver.{host_id}.tasks",
                 filter_subject=f"openclaw.task.{host_id}.assigned",
@@ -366,6 +452,30 @@ def write_launchd_plists(
             )
         os.chmod(path, 0o600)
     return list(labels)
+
+
+def bootstrap_services(services: list[str], *, install: dict[str, Path]) -> None:
+    domain = _launchd_domain()
+    for label in services:
+        plist_path = install["launch_agents"] / f"{label}.plist"
+        subprocess.run(
+            ["launchctl", "bootout", domain, str(plist_path)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True)
+        subprocess.run(
+            ["launchctl", "kickstart", "-k", f"{domain}/{label}"],
+            check=False,
+        )
+
+
+def _launchd_domain() -> str:
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        raise RuntimeError("launchd bootstrap requires os.getuid()")
+    return f"gui/{getuid()}"
 
 
 def launchd_payload(

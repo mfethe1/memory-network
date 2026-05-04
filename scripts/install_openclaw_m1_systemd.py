@@ -12,10 +12,14 @@ import subprocess
 import sys
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from install_openclaw_m1_launchd import provision_nats
 
+from code_index.openclaw_hostd.config import normalize_host_aliases
 from code_index.openclaw_hostd.identity import load_or_create_host_identity
 
 
@@ -33,6 +37,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Human fleet label and SSH hostname to report.",
     )
     parser.add_argument(
+        "--host-alias",
+        help="Optional fleet routing alias to publish in host heartbeats.",
+    )
+    parser.add_argument(
         "--nats-url",
         default=os.environ.get("OPENCLAW_NATS_URL"),
         help=(
@@ -47,6 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-start",
         action="store_true",
         help="Write config and unit files without starting systemd services.",
+    )
+    parser.add_argument(
+        "--provision-broker",
+        action="store_true",
+        help=(
+            "Provision shared NATS streams, KV buckets, and this host consumer. "
+            "Use only from an admin deployment context, not routine host install."
+        ),
     )
     return parser
 
@@ -78,17 +94,19 @@ def main(argv: list[str] | None = None) -> int:
         identity_path=identity_path,
         nats_url=nats_url,
         host_display_name=args.host_display_name,
+        host_alias=args.host_alias,
         graph_port=args.graph_port,
         heartbeat_seconds=args.heartbeat_seconds,
     )
-    asyncio.run(
-        provision_nats(
-            nats_url=nats_url,
-            host_id=identity.host_id,
-            host_display_name=args.host_display_name,
-            repo=repo,
+    if args.provision_broker:
+        asyncio.run(
+            provision_nats(
+                nats_url=nats_url,
+                host_id=identity.host_id,
+                host_display_name=args.host_display_name,
+                repo=repo,
+            )
         )
-    )
     services = write_systemd_units(
         install=install,
         repo=repo,
@@ -105,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
                 "hostd_config": str(config_path),
                 "services": services,
                 "started": not args.no_start,
+                "broker_provisioned": bool(args.provision_broker),
             },
             sort_keys=True,
         )
@@ -134,6 +153,7 @@ def write_hostd_config(
     identity_path: Path,
     nats_url: str,
     host_display_name: str,
+    host_alias: str | None = None,
     graph_port: int,
     heartbeat_seconds: int,
 ) -> Path:
@@ -149,6 +169,9 @@ def write_hostd_config(
         "fleet_lease_store_path": str(install["hostd_state"] / "fleet-leases.db"),
         "context_store_path": str(install["context_store"]),
     }
+    aliases = normalize_host_aliases(host_alias)
+    if aliases:
+        payload["host_aliases"] = list(aliases)
     config_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

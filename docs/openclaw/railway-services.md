@@ -69,7 +69,7 @@ Startup fails before serving traffic when:
 - Use Railway private DNS names such as `http://openclaw-controller.railway.internal`.
 - Bind internal listeners to `::` so the service is reachable on Railway private networking.
 - Use `http://`, not public domains, for controller-to-Fleet MCP or future fumemory calls inside the Railway environment.
-- Do not assume Windows fleet hosts can reach `*.railway.internal` directly. Windows hosts still need a reachable external broker/API path or a VPN/private overlay that you operate.
+- Do not assume Linux/macOS fleet hosts can reach `*.railway.internal` directly. Hosts still need a reachable external broker/API path or a VPN/private overlay that you operate.
 
 ## Start Commands
 

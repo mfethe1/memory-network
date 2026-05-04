@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
+from urllib.request import urlopen
 
 import pytest
 
+from code_index.openclaw_controller.app import _ControllerHTTPServer
 from code_index.openclaw_controller.app import OpenClawControllerService
 from code_index.openclaw_controller.app import build_service_runtime
 from code_index.openclaw_controller.service_config import (
@@ -146,4 +149,36 @@ def test_controller_service_routes_health_ready_messaging_and_fleet(
         assert heartbeat.status_code == 200
         assert heartbeat.body["host"]["host_id"] == "host-a"
     finally:
+        runtime.close()
+
+
+def test_controller_http_server_can_read_sqlite_stores_from_request_thread(
+    tmp_path: Path,
+) -> None:
+    runtime = build_service_runtime(environ=_development_env(tmp_path))
+    service = OpenClawControllerService(runtime)
+    runtime.app.store.create_room(
+        room_kind="fleet",
+        display_name="OpenClaw Fleet",
+    )
+    server = _ControllerHTTPServer(
+        ("127.0.0.1", 0),
+        service=service,
+        use_ipv6=False,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+        with urlopen(f"{base_url}/health", timeout=5) as response:
+            health = json.loads(response.read().decode("utf-8"))
+        with urlopen(f"{base_url}/rooms", timeout=5) as response:
+            rooms = json.loads(response.read().decode("utf-8"))
+
+        assert health["status"] == "ok"
+        assert rooms["rooms"][0]["display_name"] == "OpenClaw Fleet"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
         runtime.close()

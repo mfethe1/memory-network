@@ -19,6 +19,7 @@ GRAPH_SERVER_TOKEN_ENV = "OPENCLAW_HOSTD_GRAPH_SERVER_TOKEN"
 SSH_HOSTNAME_ENV = "OPENCLAW_HOSTD_SSH_HOSTNAME"
 HEARTBEAT_INTERVAL_ENV = "OPENCLAW_HOSTD_HEARTBEAT_INTERVAL_SECONDS"
 NATS_URL_ENV = "OPENCLAW_HOSTD_NATS_URL"
+HOST_ALIASES_ENV = "OPENCLAW_HOSTD_HOST_ALIASES"
 FLEET_LEASE_STORE_PATH_ENV = "OPENCLAW_HOSTD_FLEET_LEASE_STORE_PATH"
 CONTEXT_STORE_PATH_ENV = "OPENCLAW_HOSTD_CONTEXT_STORE_PATH"
 
@@ -31,6 +32,7 @@ class HostDaemonConfig:
     state_dir: Path
     host_identity_path: Path
     repo_roots: tuple[Path, ...]
+    host_aliases: tuple[str, ...] = ()
     graph_server_url: str | None = DEFAULT_GRAPH_SERVER_URL
     graph_server_token: str | None = field(default=None, repr=False)
     ssh_hostname: str | None = None
@@ -97,6 +99,51 @@ def _text_or_none(value: Any) -> str | None:
     return value.strip() or None
 
 
+def normalize_host_aliases(
+    value: Any,
+    *,
+    field_name: str = "host_aliases",
+) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"{field_name} must be a string, JSON list, or comma-separated list"
+                ) from exc
+            return normalize_host_aliases(parsed, field_name=field_name)
+        values: list[Any] = text.split(",")
+    elif isinstance(value, list | tuple):
+        values = list(value)
+    else:
+        raise ValueError(f"{field_name} must be a string or list of strings")
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if not isinstance(item, str):
+            raise ValueError(f"{field_name} entries must be strings")
+        alias = item.strip().lower()
+        if not alias:
+            continue
+        if any(character.isspace() for character in alias):
+            raise ValueError(f"{field_name} entries may not contain whitespace")
+        if any(character in alias for character in ("@", "/", "\\", "*", ">")):
+            raise ValueError(
+                f"{field_name} entries may not contain @, path separators, or NATS wildcards"
+            )
+        if alias in seen:
+            continue
+        seen.add(alias)
+        aliases.append(alias)
+    return tuple(aliases)
+
+
 def load_config(
     config_path: str | os.PathLike[str] | None = None,
     *,
@@ -125,6 +172,12 @@ def load_config(
     repo_roots = _path_tuple(data.get("repo_roots"), default=root_default)
     if environ.get(REPO_ROOTS_ENV):
         repo_roots = _path_tuple(environ.get(REPO_ROOTS_ENV), default=repo_roots)
+    host_aliases = normalize_host_aliases(data.get("host_aliases"))
+    if HOST_ALIASES_ENV in environ:
+        host_aliases = normalize_host_aliases(
+            environ.get(HOST_ALIASES_ENV),
+            field_name=HOST_ALIASES_ENV,
+        )
 
     graph_server_url = _text_or_none(
         environ.get(
@@ -160,6 +213,7 @@ def load_config(
         state_dir=state_dir,
         host_identity_path=host_identity_path,
         repo_roots=tuple(repo_roots),
+        host_aliases=host_aliases,
         graph_server_url=graph_server_url,
         graph_server_token=graph_server_token,
         ssh_hostname=ssh_hostname,

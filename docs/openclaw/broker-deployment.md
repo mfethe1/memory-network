@@ -11,9 +11,10 @@ Use one provider-neutral persistent VM target named `openclaw-m1-broker-01`:
 
 - Region: same cloud region as the first Fleet Controller test deployment; if
   the controller region is not chosen yet, use the closest US region to the
-  Windows test hosts and record the final provider/region in deployment notes.
+  Linux/macOS test hosts and record the final provider/region in deployment
+  notes.
 - Network: private subnet or private overlay only, reachable from controller,
-  Messaging Service, Context Manager, and enrolled Windows hosts.
+  Messaging Service, Context Manager, and enrolled Linux/macOS hosts.
 - Compute: one Linux VM with a stable private address or private DNS name.
 - Disk: one persistent block volume, at least 20 GiB, mounted at
   `/var/lib/nats`; the VM root disk may be replaced without replacing this
@@ -108,6 +109,9 @@ Operational requirements:
 - Run NATS as a supervised service and stop it cleanly during planned restarts.
 - Do not let hosts create, update, or delete streams, consumers, or KV buckets.
 - Keep stream and KV creation in controller/admin deployment automation.
+- The Linux/macOS host installers only provision broker topology when
+  `--provision-broker` is explicitly set for an admin bootstrap. Routine
+  Lenny/Rosie enrollment must omit that flag.
 - Create `openclaw_agent_states` with a bucket TTL equal to 3x the configured
   host heartbeat interval. With the default 30 second heartbeat, that bucket TTL
   is 90 seconds. Host daemons verify this bucket TTL before publishing agent
