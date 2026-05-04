@@ -11,16 +11,18 @@ agent memory into `github.com/mfethe1/fumemory` on Railway.
 **Architecture:** Keep each PC's local `code_index` graph-server and SQLite
 store authoritative for local run status, transcripts, process state, file
 claims, and graph context. Add a thin OpenClaw host daemon per PC for outbound
-fleet coordination, add an OpenClaw Messaging Service as the single
-human-facing conversation and routing layer, use NATS JetStream/KV for
-task/event/message transport and host/repo/task leases, and sync long-term
-summaries into `fumemory`.
+fleet coordination, add an OpenClaw Messaging Service as the canonical
+room/message/delivery layer, add thin external messaging adapters for Telegram,
+Slack, Discord, Matrix, email, and webhook surfaces, use NATS JetStream/KV for
+task/event/message/context transport and host/repo/task leases, and sync
+long-term summaries plus context hot-load pointers into `fumemory`.
 
 **Tech Stack:** Python `code_index`, Windows Service host daemon, Windows
 OpenSSH, Tailscale/private networking, NATS JetStream/KV, Model Context
-Protocol, OpenTelemetry, OpenClaw web UI, Telegram notification adapter,
-Claude/Kimi/Codex/OpenCode/Goose provider adapters, Cursor TypeScript SDK via
-a Node sidecar, and `fumemory` on Railway.
+Protocol, OpenTelemetry, OpenClaw web UI, OpenClaw Context Manager, Telegram,
+Slack, Discord, Matrix/email/webhook messaging adapters, Claude/Kimi/Codex/
+OpenCode/Goose provider adapters, Cursor TypeScript SDK via a Node sidecar,
+and `fumemory` on Railway.
 
 ---
 
@@ -41,6 +43,18 @@ Research inputs used:
 5. Kimi CLI architecture critique.
 6. Local repo inspection with `code_index doctor --json` and
    `code_index agent-adapter --list-providers --json`.
+7. Tavily searches and Firecrawl scrapes for Slack Socket Mode, Discord
+   interactions, Telegram Bot API webhook behavior, Matrix application
+   services, NATS JetStream consumers, CloudEvents, MCP transports, and
+   long-context/context-memory systems.
+8. Claude CLI and Kimi CLI review of multi-service messaging and context
+   management changes.
+9. Three Codex subagents:
+   - Local repo context-management and schema fact finder.
+   - External research brief on context rot, context engineering, MemGPT/Letta,
+     LangGraph memory, and restart/handoff alternatives to compaction.
+   - Architecture critique for `fumemory` SQL tables, context health,
+     hot-load manifests, and session restart policy.
 
 Important local facts:
 
@@ -55,6 +69,12 @@ Important local facts:
 6. The repo already has unified chat context, same-run follow-up messages,
    Agent Swarm parent/child metadata, local file claims, and graph-server
    provider registry plumbing that should be reused for OpenClaw messaging.
+7. The repo already builds bounded `context_packet` payloads, layered
+   `graph_context`, compact collaboration packets, run transcripts, and
+   per-run/global JSONL event feeds; the OpenClaw Context Manager should wrap
+   those contracts instead of inventing a second context format.
+8. `fumemory` must stay a semantic memory and context pointer system, not the
+   process-liveness source of truth and not a raw transcript warehouse.
 
 ## Research Sources
 
@@ -102,6 +122,36 @@ Primary and high-signal sources:
    https://github.com/OpenHands/OpenHands
 21. Aider:
    https://github.com/Aider-AI/aider
+22. Slack Socket Mode:
+   https://docs.slack.dev/apis/events-api/using-socket-mode
+23. Discord interactions:
+   https://docs.discord.com/developers/interactions/receiving-and-responding
+24. Telegram Bot API:
+   https://core.telegram.org/bots/api
+25. Matrix Application Service API:
+   https://spec.matrix.org/v1.10/application-service-api/
+26. CloudEvents specification:
+   https://github.com/cloudevents/spec/blob/main/cloudevents/spec.md
+27. Anthropic effective context engineering:
+   https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents
+28. Anthropic Claude Code session management:
+   https://claude.com/blog/using-claude-code-session-management-and-1m-context
+29. Anthropic contextual retrieval:
+   https://www.anthropic.com/engineering/contextual-retrieval
+30. MemGPT paper:
+   https://arxiv.org/abs/2310.08560
+31. Letta memory docs:
+   https://docs.letta.com/guides/agents/memory
+32. LangGraph memory concepts:
+   https://docs.langchain.com/oss/python/concepts/memory
+33. Lost in the Middle:
+   https://arxiv.org/abs/2307.03172
+34. RULER long-context benchmark:
+   https://arxiv.org/abs/2404.06654
+35. Chroma Context Rot:
+   https://www.trychroma.com/research/context-rot
+36. Context as a Tool:
+   https://arxiv.org/abs/2512.22087
 
 ## Accepted Claude And Kimi Review Corrections
 
@@ -145,6 +195,42 @@ OpenClaw messaging review additions accepted:
    transport, Fleet Controller owns assignments and leases, and `fumemory`
    stores explicit checkpoints instead of raw chat.
 
+Multi-service messaging additions accepted:
+
+1. Keep one canonical OpenClaw Messaging Service store for rooms, messages,
+   delivery records, command refs, identity links, and route policy.
+2. Add an adapter registry and a common adapter contract for Telegram, Slack,
+   Discord, Matrix, email, webhook, CLI, and future API clients.
+3. Treat each external service adapter as a thin parser/renderer/delivery
+   worker with no authority to create local runs, mutate leases, or publish
+   fleet commands directly.
+4. Normalize every external event into the same message envelope and derive
+   idempotency from platform event IDs, room IDs, and adapter IDs.
+5. Fan-out through delivery records and NATS subjects; never bridge platforms
+   directly adapter-to-adapter.
+6. External text that looks like a command remains a chat message until the
+   Messaging Service maps the sender to a verified OpenClaw identity, validates
+   command policy, and creates a signed command reference.
+
+Context-manager and `fumemory` additions accepted:
+
+1. Do not automatically load long "soul", project memory, or contextual files
+   into every OpenClaw run.
+2. Store memory pointers, source metadata, summaries, decisions, failures,
+   context health, and handoff packets in `fumemory`; hot-load source content
+   only when the current task proves relevance.
+3. Add an OpenClaw Context Manager as a first-class control-plane service plus
+   a lightweight host-local context probe in the host daemon.
+4. Treat compaction as degraded fallback. The normal continuation path is a
+   deliberate checkpoint and fresh-session handoff with signed context
+   manifests, source handles, file hashes, event offsets, and explicit omissions.
+5. Start context health warnings before the hard limit, plan handoff around
+   75k tokens, and prefer a new provider session around 80k tokens, with
+   provider-specific thresholds and cooldowns.
+6. Reuse existing `code_index` context packets, layered graph context,
+   collaboration packets, run transcripts, same-run follow-up metadata, and
+   Agent Swarm parent/child metadata instead of duplicating live context state.
+
 ## Non-Goals For The First Version
 
 1. Do not replace the local graph-server.
@@ -157,6 +243,15 @@ OpenClaw messaging review additions accepted:
 8. Do not make Telegram the primary task/event transport.
 9. Do not duplicate user-facing conversation state independently inside every
    host daemon.
+10. Do not let Slack, Discord, Matrix, email, webhooks, or Telegram become
+    parallel command paths around the OpenClaw Messaging Service and Fleet
+    Controller.
+11. Do not auto-load long "soul" files, global memory dumps, raw transcripts,
+    or stale project docs into every agent prompt.
+12. Do not use compaction as the primary long-running-agent continuation
+    strategy.
+13. Do not let agents mutate `fumemory` context leases, handoff packets, or
+    route policy directly.
 
 ## Target Architecture
 
@@ -177,6 +272,12 @@ Responsibilities:
 8. Sync durable memory summaries to `fumemory`.
 9. Store secrets through Windows DPAPI or Credential Manager.
 10. Keep local rotating logs when the network or collector is unavailable.
+11. Run a lightweight context probe that reports provider token estimates,
+    loaded context handles, file hashes, active claims, tool-output volume,
+    duplicate context hints, and provider-visible compaction events.
+12. Enforce Context Manager decisions locally by blocking automatic long-file
+    loads, applying signed context manifests, and starting fresh provider runs
+    only after Fleet Controller authorization.
 
 The daemon is not responsible for:
 
@@ -184,6 +285,7 @@ The daemon is not responsible for:
 2. Rewriting local terminal run status from fleet state.
 3. Exposing unrestricted shell access.
 4. Holding provider credentials in plain text.
+5. Deciding global context policy or writing `fumemory` context leases directly.
 
 ### Module: Local Graph Server
 
@@ -208,27 +310,86 @@ Responsibilities:
 
 1. Store durable rooms for fleet, repo, task, run, host, and swarm
    conversations.
-2. Accept messages from OpenClaw web UI, Telegram, CLI, scripts, and API
-   clients through one contract.
+2. Accept messages from OpenClaw web UI, Telegram, Slack, Discord, Matrix,
+   email, CLI, scripts, webhooks, and API clients through one contract.
 3. Normalize human chat, operator commands, agent replies, host alerts, and
    controller events into one append-only room timeline.
-4. Create delivery records for target hosts, Agent Runs, swarm rooms, Telegram
-   chats, and web clients.
+4. Create delivery records for target hosts, Agent Runs, swarm rooms, external
+   platform chats, web clients, and webhook subscribers.
 5. Convert approved mutating messages into signed command references for the
    Fleet Controller or host daemon inbox.
 6. Project delivery, acknowledgement, and failure state back into the UI.
-7. Apply notification rules so Telegram receives high-signal alerts and
-   replies instead of raw heartbeats or every run event.
+7. Apply notification rules so Telegram, Slack, Discord, Matrix, email, and
+   webhook receivers get high-signal alerts and replies instead of raw
+   heartbeats or every run event.
 8. Preserve `trace_id`, `correlation_id`, `task_id`, `run_id`, `host_id`, and
    event offsets so messages can be audited and synced into memory summaries.
+9. Own adapter registration, route policy, room-to-platform mappings, external
+   identity links, and delivery idempotency.
+10. Normalize platform-specific event IDs, thread IDs, users, attachments,
+    reactions, edits, and deletes into canonical message and delivery events.
+11. Fan out messages to adapters through delivery records and NATS subjects,
+    not by letting adapters bridge directly to each other.
+12. Validate external command promotion before creating signed command refs.
+13. Record context-health and handoff notices in rooms as system events without
+    changing local terminal `AgentRun` status.
 
 The messaging service is not responsible for:
 
 1. Deciding host eligibility or bypassing Fleet Controller leases.
 2. Owning local terminal `AgentRun` status.
 3. Storing raw full transcripts in `fumemory`.
-4. Letting Telegram commands mutate execution without central validation and
-   signing.
+4. Letting Telegram, Slack, Discord, Matrix, email, or webhook commands mutate
+   execution without central validation and signing.
+5. Rendering platform-native message formats itself when an external adapter
+   can do that through the adapter contract.
+
+### Module: Messaging Adapter Registry And External Adapters
+
+Adapters are thin services or controller modules. They parse inbound platform
+events, render outbound deliveries, and report delivery acknowledgements.
+
+Initial adapters:
+
+1. Web UI adapter.
+2. Telegram adapter.
+3. Slack adapter.
+4. Discord adapter.
+5. Matrix adapter.
+6. Email adapter.
+7. Generic signed webhook adapter.
+8. CLI/script adapter.
+
+Adapter responsibilities:
+
+1. Register adapter identity, platform type, capabilities, rate limits,
+   supported content features, health, and routing constraints.
+2. Normalize inbound platform events to OpenClaw message envelopes with stable
+   idempotency keys.
+3. Strip any untrusted `command_ref`, signed payload, or execution directive
+   from inbound external messages before publishing them.
+4. Render outbound OpenClaw deliveries into platform-native text, threads,
+   replies, attachments, reactions, edits, or emails.
+5. Acknowledge delivery outcomes back to the Messaging Service.
+6. Keep only platform offset cursors and retry state; do not own durable room
+   history.
+
+Adapter-specific notes:
+
+1. Slack Socket Mode requires per-event acknowledgement by `envelope_id` and
+   can run multiple active WebSocket connections, so the Slack adapter needs
+   idempotent inbound handling and explicit reconnect behavior.
+2. Discord interactions require a fast initial response and follow-up messages
+   through interaction tokens, so Discord command surfaces must defer quickly
+   and hand execution to the Messaging Service.
+3. Telegram webhooks and polling are mutually exclusive for a bot, so the
+   adapter must choose one ingestion mode per bot identity and record it in the
+   registry.
+4. Matrix application services use transaction IDs for retry idempotency and
+   explicit namespace registration; map those transaction IDs to OpenClaw
+   idempotency keys.
+5. Generic webhooks are inbound-only for the first version and cannot promote
+   commands.
 
 ### Module: OpenClaw Web UI
 
@@ -266,10 +427,65 @@ Responsibilities:
 6. Store fleet-level audit events.
 7. Provide dashboard/API views and message-friendly fleet projections.
 8. Push durable memory objects to `fumemory` or accept host-pushed summaries.
+9. Accept Context Manager handoff proposals and authorize fresh provider runs
+   only after leases, host eligibility, and restart cooldowns pass.
+10. Surface context health and handoff state in fleet APIs without treating
+    context health as terminal local run status.
 
 The controller may mark a host or run as `unknown` or `stale`, but it must not
 write terminal local `AgentRun` status unless process liveness is known false
 and no active local claims remain.
+
+### Module: OpenClaw Context Manager
+
+Runs centrally near the Fleet Controller and `fumemory`, with a lightweight
+context probe inside each host daemon.
+
+Goal:
+
+1. Keep agent prompts small, relevant, auditable, and restartable.
+2. Replace automatic long-file prompt stuffing with signed hot-load manifests.
+3. Treat context as a managed working set backed by local graph-server context
+   and `fumemory` pointers.
+
+Responsibilities:
+
+1. Consume host context metrics for each Agent Run: estimated provider tokens,
+   loaded files, loaded pointers, tool-output volume, active claims, source
+   hashes, context packet IDs, provider-visible compaction signals, and recent
+   failures.
+2. Query local graph-server through the host daemon for bounded
+   `context_packet`, layered `graph_context`, collaboration packets, run
+   transcripts, active claims, blockers, process liveness, and file hashes.
+3. Query `fumemory` for decisions, failed approaches, verification states,
+   repo/host preferences, prior summaries, source pointers, and handoff
+   packets.
+4. Query the Messaging Service for task-room summaries and explicit operator
+   instructions.
+5. Rank context pointers by task relevance, freshness, source authority,
+   sensitivity, token cost, and whether the pointer is required, useful,
+   inspect-only, avoid, or expired.
+6. Produce signed context manifests that contain pointer IDs, source URIs,
+   locator JSON, load order, budgets, expiry, file/content hashes, relevance
+   reasons, and explicit omissions.
+7. Write context health events and handoff packets to `fumemory` with source
+   event offsets, not raw full transcripts.
+8. Warn at provider-specific soft thresholds, plan handoff near 75k tokens, and
+   request a fresh session near 80k tokens or on critical rot signals.
+9. Coordinate fresh-session handoff through the Fleet Controller, not directly
+   through a provider adapter.
+10. Maintain restart cooldowns so context pressure does not create handoff
+    loops.
+
+The Context Manager is not responsible for:
+
+1. Owning local `AgentRun` status, transcripts, process liveness, or file
+   claims.
+2. Loading long "soul" or project-memory files automatically.
+3. Silently compacting conversation history and replacing the transcript.
+4. Letting an external messaging adapter create execution commands.
+5. Writing provider secrets, raw private transcripts, or unrestricted local
+   file content into `fumemory`.
 
 ### Module: NATS JetStream And KV
 
@@ -282,6 +498,9 @@ Responsibilities:
 3. Replayable audit stream.
 4. Host capability key-value records.
 5. Host/repo/task-level leases with fencing revisions.
+6. Adapter registry and route-policy KV records.
+7. Durable message delivery, acknowledgement, and dead-letter streams.
+8. Context metrics, manifest, health, and handoff event streams.
 
 Deployment recommendation:
 
@@ -293,7 +512,9 @@ Deployment recommendation:
 
 ### Module: fumemory
 
-Use `fumemory` as durable semantic memory.
+Use `fumemory` as durable semantic memory and context-pointer storage. It
+should point agents to the right hot-load locations; it should not auto-hydrate
+long context into every run.
 
 Responsibilities:
 
@@ -304,6 +525,21 @@ Responsibilities:
 5. Store repo and host preferences.
 6. Store cross-run lessons.
 7. Provide search/retrieval for long-term memory.
+8. Store context sources and hot-load pointers with source hashes, locator JSON,
+   sensitivity, expiry, and relevance metadata.
+9. Store context health events and handoff packets for deliberate fresh-session
+   continuation.
+10. Store compact room/run/task summaries with source offsets and omissions.
+11. Store "avoid" pointers for failed approaches and stale or superseded
+    decisions.
+
+`fumemory` is not responsible for:
+
+1. Process liveness.
+2. Local `AgentRun` terminal status.
+3. File-claim fencing.
+4. Raw full transcripts by default.
+5. Provider secrets or unrestricted local file content.
 
 Required sync properties:
 
@@ -311,6 +547,8 @@ Required sync properties:
 2. Backpressure.
 3. Retry with bounded local queue.
 4. Traceability back to `host_id`, `task_id`, `run_id`, and event offsets.
+5. Rebuildability from local graph-server events and Messaging Service rooms.
+6. Sensitivity filtering before cross-host or cross-provider retrieval.
 
 ### Module: Provider Adapters
 
@@ -419,6 +657,8 @@ openclaw_messages:
   message_type           # chat | command | event | summary | alert
   body
   context_handles_json
+  adapter_id
+  platform_ref_json       # external room/thread/message/user ids when present
   trace_id
   correlation_id
   parent_message_id
@@ -437,13 +677,70 @@ it.
 openclaw_message_deliveries:
   delivery_id
   message_id
-  recipient_kind         # host | run | agent | telegram | web | controller
+  recipient_kind         # host | run | agent | adapter | web | controller
   recipient_id
   delivery_status        # queued | delivered | acked | failed | expired
   nats_sequence
   delivered_at
   acked_at
   error
+  metadata_json
+```
+
+### Messaging Adapter
+
+External messaging services register capabilities and policy in one registry.
+The adapter record is not room history; it is routing and operational state.
+
+```text
+openclaw_messaging_adapters:
+  adapter_id
+  adapter_type            # web | telegram | slack | discord | matrix | email | webhook | cli
+  display_name
+  status                  # active | paused | degraded | disabled
+  capabilities_json       # threads, edits, reactions, attachments, rich_text
+  rate_limits_json
+  auth_key_id
+  last_seen_at
+  created_at
+  updated_at
+  metadata_json
+```
+
+### Platform Room Mapping
+
+Rooms can be mirrored into multiple messaging services. The mapping is explicit
+so a new external channel cannot silently create a command surface.
+
+```text
+openclaw_platform_room_mappings:
+  mapping_id
+  adapter_id
+  platform_room_id
+  platform_thread_id
+  room_id
+  sync_mode               # bidirectional | inbound_only | outbound_only | notify_only
+  route_policy_json
+  created_at
+  archived_at
+  metadata_json
+```
+
+### External Identity Link
+
+External users must be linked to OpenClaw identities before a chat message can
+be promoted into a command.
+
+```text
+openclaw_external_identities:
+  identity_link_id
+  adapter_id
+  platform_user_id
+  openclaw_identity_id
+  display_name
+  scopes_json             # message:write, command:propose, command:write
+  verified_at
+  revoked_at
   metadata_json
 ```
 
@@ -521,6 +818,135 @@ memory_sync:
   created_at
 ```
 
+### Context Source
+
+Context sources live in `fumemory`. They describe where relevant memory can be
+hot-loaded from, not what must be injected into every prompt.
+
+```text
+context_sources:
+  source_id
+  source_kind             # repo_file | graph_symbol | graph_chunk | room | run_summary | decision | doc | external
+  repo_id
+  host_id
+  uri                     # file path, codeindex://..., room://..., fumemory://...
+  title
+  content_hash
+  version_ref             # git sha, graph index version, message offset
+  sensitivity             # public | normal | private | secret
+  created_at
+  updated_at
+  metadata_json
+```
+
+### Context Pointer
+
+```text
+context_pointers:
+  pointer_id
+  source_id
+  pointer_kind            # required | hot_load | cite | inspect | avoid
+  locator_json            # line ranges, symbol_uid, room offsets, summary section
+  summary
+  token_estimate
+  freshness_at
+  expires_at
+  metadata_json
+```
+
+### Context Relevance Score
+
+```text
+context_relevance_scores:
+  score_id
+  pointer_id
+  task_id
+  run_id
+  agent_id
+  query_hash
+  score
+  reason
+  model
+  computed_at
+```
+
+### Agent Context Lease
+
+```text
+agent_context_leases:
+  lease_id
+  agent_id
+  run_id
+  task_id
+  provider
+  budget_tokens
+  soft_limit_tokens
+  hard_limit_tokens
+  estimated_used_tokens
+  status                  # active | warning | handoff_pending | restarted | expired | released
+  context_manifest_hash
+  expires_at
+  created_at
+  updated_at
+```
+
+### Context Manifest
+
+Context manifests are signed, expiring hot-load instructions. They are the
+normal mechanism for starting or restarting agent sessions without prompt
+bloat.
+
+```text
+context_manifest:
+  manifest_id
+  lease_id
+  task_id
+  run_id
+  repo_id
+  host_id
+  provider
+  pointer_ids
+  required_pointer_ids
+  load_order_json
+  omitted_json
+  token_budget_json
+  signature_key_id
+  signed_payload
+  expires_at
+```
+
+### Handoff Packet
+
+```text
+handoff_packets:
+  handoff_id
+  from_run_id
+  to_run_id
+  task_id
+  trigger_kind            # token_pressure | context_rot | provider_error | manual
+  status                  # proposed | approved | consumed | failed | superseded
+  packet_json             # goal, state, decisions, claims, verification, pointers
+  packet_hash
+  created_at
+  consumed_at
+```
+
+### Context Health Event
+
+```text
+context_health_events:
+  event_id
+  run_id
+  agent_id
+  task_id
+  event_kind              # token_pressure | stale_context | contradiction | drift | duplicate_context | missing_required
+  severity                # info | warning | critical
+  observed_tokens
+  budget_tokens
+  details_json
+  created_at
+```
+
 ## NATS Subject Layout
 
 Initial subjects:
@@ -534,11 +960,24 @@ openclaw.run.<host_id>.<run_id>.events
 openclaw.run.<host_id>.<run_id>.status
 openclaw.run.<host_id>.<run_id>.verification
 openclaw.message.inbound
+openclaw.message.inbound.<adapter_type>.<adapter_id>
 openclaw.room.<room_id>.events
 openclaw.host.<host_id>.inbox
 openclaw.host.<host_id>.messages.ack
 openclaw.notification.telegram.outbound
+openclaw.adapter.<adapter_type>.<adapter_id>.inbound
+openclaw.adapter.<adapter_type>.<adapter_id>.outbound
+openclaw.adapter.<adapter_type>.<adapter_id>.ack
+openclaw.adapter.<adapter_type>.<adapter_id>.health
+openclaw.context.<host_id>.<run_id>.metrics
+openclaw.context.<host_id>.<run_id>.health
+openclaw.context.<host_id>.<run_id>.manifest.request
+openclaw.context.<host_id>.<run_id>.manifest.response
+openclaw.context.<host_id>.<run_id>.handoff.proposed
+openclaw.context.<host_id>.<run_id>.handoff.ack
+openclaw.context.audit
 openclaw.audit.<host_id>
+openclaw.deadletter
 ```
 
 Initial KV buckets:
@@ -549,6 +988,10 @@ openclaw_leases
 openclaw_provider_caps
 openclaw_controller_config
 openclaw_message_routes
+openclaw_messaging_adapters
+openclaw_platform_room_mappings
+openclaw_context_policy
+openclaw_context_leases
 ```
 
 Subject ACL baseline:
@@ -560,12 +1003,18 @@ Subject ACL baseline:
 4. Controller may consume all host events.
 5. No host may consume another host's task stream.
 6. No host may publish controller config.
-7. Messaging Service may publish room events, host inbox messages, and
-   notification adapter messages.
-8. Telegram adapter may publish only inbound user messages and consume only its
-   own outbound notification subject.
+7. Messaging Service may publish room events, host inbox messages, adapter
+   outbound deliveries, and message delivery state.
+8. External adapters may publish only their own inbound, acknowledgement, and
+   health subjects.
 9. Hosts may consume only their own inbox and publish only acknowledgements for
    messages addressed to that host.
+10. No external adapter may publish `openclaw.command.*`,
+    `openclaw.task.*`, `openclaw.host.*`, or context manifest subjects.
+11. Context Manager may consume host context metrics and publish only context
+    health, manifests, handoff proposals, and context audit records.
+12. Only Fleet Controller may authorize a fresh provider run from a handoff
+    proposal.
 
 ## Implementation Scenarios
 
@@ -575,22 +1024,24 @@ to split into Scenario B later.
 
 ### Scenario A - Controller-Embedded Messaging
 
-Implement rooms, messages, delivery records, and Telegram adapter endpoints in
-the Fleet Controller package.
+Implement rooms, messages, delivery records, adapter registry, route policy,
+Telegram adapter endpoints, and passive Context Manager endpoints in the Fleet
+Controller package.
 
 Best when:
 
 1. The first milestone needs one deployable service.
 2. The team wants fewer moving pieces while task assignment, leases, and host
    daemon behavior are still being proven.
-3. Telegram notifications are high-signal alerts, not a heavy chat workload.
+3. Telegram and other adapters are high-signal alerts or small chat workloads,
+   not a heavy multi-platform bridge.
 
 Tradeoffs:
 
 1. Fastest path to an end-to-end demo.
 2. Simplest auth and deployment story.
-3. Messaging and scheduling code must keep clear module interfaces to avoid a
-   future split becoming painful.
+3. Messaging, context, and scheduling code must keep clear module interfaces to
+   avoid a future split becoming painful.
 
 ### Scenario B - Standalone Messaging Service
 
@@ -601,8 +1052,8 @@ Best when:
 
 1. Multiple UI clients, Telegram, and API clients become active at the same
    time.
-2. Message retention, notification rules, or moderation/audit needs start
-   growing faster than scheduling.
+2. Message retention, adapter routing, notification rules, or moderation/audit
+   needs start growing faster than scheduling.
 3. The controller should stay focused on host eligibility, leases, assignment,
    and fleet health.
 
@@ -744,19 +1195,27 @@ Verification:
 3. Create: `code_index/openclaw_messaging/store.py`
 4. Create: `code_index/openclaw_messaging/routes.py`
 5. Create: `code_index/openclaw_messaging/telegram.py`
-6. Create: `code_index/openclaw_messaging/notifications.py`
-7. Create: `docs/openclaw/messaging-service.md`
-8. Create: `docs/openclaw/openclaw-ui-command-center.md`
-9. Create: `tests/openclaw_messaging/test_rooms.py`
-10. Create: `tests/openclaw_messaging/test_message_delivery.py`
-11. Create: `tests/openclaw_messaging/test_telegram_adapter.py`
-12. Modify: `code_index/openclaw_controller/app.py`
-13. Modify: `pyproject.toml`
+6. Create: `code_index/openclaw_messaging/adapters.py`
+7. Create: `code_index/openclaw_messaging/adapter_registry.py`
+8. Create: `code_index/openclaw_messaging/notifications.py`
+9. Create: `docs/openclaw/messaging-service.md`
+10. Create: `docs/openclaw/messaging-adapters.md`
+11. Create: `docs/openclaw/openclaw-ui-command-center.md`
+12. Create: `tests/openclaw_messaging/test_rooms.py`
+13. Create: `tests/openclaw_messaging/test_message_delivery.py`
+14. Create: `tests/openclaw_messaging/test_adapter_registry.py`
+15. Create: `tests/openclaw_messaging/test_telegram_adapter.py`
+16. Modify: `code_index/openclaw_controller/app.py`
+17. Modify: `pyproject.toml`
 
 Tasks:
 
 - [ ] Implement `openclaw_rooms`, `openclaw_messages`,
-      `openclaw_message_deliveries`, and `openclaw_command_refs` storage.
+      `openclaw_message_deliveries`, `openclaw_command_refs`,
+      `openclaw_messaging_adapters`, `openclaw_platform_room_mappings`, and
+      `openclaw_external_identities` storage.
+- [ ] Define the base adapter contract for normalize inbound, render outbound,
+      acknowledge delivery, report health, and expose capabilities.
 - [ ] Add room kinds for fleet, repo, task, run, host, and swarm.
 - [ ] Add APIs for `GET /rooms`, `GET /rooms/{room_id}/messages`,
       `POST /messages`, `POST /messages/{message_id}/ack`, and
@@ -768,12 +1227,17 @@ Tasks:
 - [ ] Define the OpenClaw Web UI command center layout: inbox, room timeline,
       target selector, command cards, delivery state, and context side panel.
 - [ ] Convert mutating messages into signed command references instead of
-      directly publishing host tasks from Telegram or UI code.
+      directly publishing host tasks from Telegram, Slack, Discord, Matrix,
+      email, webhook, or UI code.
 - [ ] Add Telegram inbound webhook handling and outbound notification delivery.
+- [ ] Add stub adapter registrations for Slack, Discord, Matrix, email, and
+      generic webhook with no command-promotion permissions by default.
+- [ ] Add idempotency keys based on adapter ID, platform room/thread ID, and
+      platform event/message ID.
 - [ ] Add notification rules for `needs_attention`, `blocked`, `failed`,
       `completed`, `lease_conflict`, and `verification_blocked`.
 - [ ] Add duplicate delivery tests and idempotency tests for repeated Telegram
-      webhook updates.
+      webhook updates and replayed adapter events.
 
 Verification:
 
@@ -784,6 +1248,9 @@ Verification:
 4. Mutating messages require a signed command reference before host delivery.
 5. A task room can show all Agent Swarm child runs without sending separate
    Telegram messages to each one.
+6. A Slack or Discord-looking inbound payload cannot create a command until the
+   sender is linked to an OpenClaw identity and policy allows promotion.
+7. A generic webhook can create an inbound message but cannot create a command.
 
 ### Slice 4 - NATS Event Outbox And Task Inbox
 
@@ -866,6 +1333,9 @@ Tasks:
 - [ ] Return assignment and rejection results in a shape the Messaging Service
       can attach to the originating room message.
 - [ ] Add run health aggregation from heartbeats and events.
+- [ ] Accept Context Manager handoff proposals and authorize fresh provider
+      runs only after host eligibility, leases, and restart cooldown checks.
+- [ ] Expose context health and handoff state in fleet API projections.
 - [ ] Add API tests for host selection and rejected assignments.
 
 Verification:
@@ -875,6 +1345,76 @@ Verification:
 3. Controller marks host health `unknown` or `stale` without mutating local
    terminal run status.
 4. Controller rejects unsigned or expired command references.
+5. Controller rejects a context handoff restart when the repo/task lease is not
+   valid or the restart cooldown is active.
+
+### Slice 7A - Context Manager And fumemory Pointer Store
+
+**Files:**
+
+1. Create: `code_index/openclaw_context/__init__.py`
+2. Create: `code_index/openclaw_context/models.py`
+3. Create: `code_index/openclaw_context/store.py`
+4. Create: `code_index/openclaw_context/policy.py`
+5. Create: `code_index/openclaw_context/manifest.py`
+6. Create: `code_index/openclaw_context/health.py`
+7. Create: `code_index/openclaw_context/handoff.py`
+8. Create: `code_index/openclaw_hostd/context_probe.py`
+9. Create: `docs/openclaw/context-manager.md`
+10. Create: `docs/openclaw/context-hot-load-manifest.md`
+11. Create: `tests/openclaw_context/test_pointer_store.py`
+12. Create: `tests/openclaw_context/test_context_health.py`
+13. Create: `tests/openclaw_context/test_manifest.py`
+14. Create: `tests/openclaw_context/test_handoff.py`
+15. Modify: `code_index/openclaw_hostd/service.py`
+16. Modify: `pyproject.toml`
+
+Tasks:
+
+- [ ] Add `context_sources`, `context_pointers`,
+      `context_relevance_scores`, `agent_context_leases`,
+      `handoff_packets`, and `context_health_events` storage in `fumemory` or
+      a `fumemory`-compatible schema migration.
+- [ ] Add context pointer dedupe by source URI, content hash, and locator JSON.
+- [ ] Add sensitivity filters for cross-host, cross-provider, and external
+      messaging retrieval.
+- [ ] Add host context metrics collection for estimated tokens, loaded files,
+      loaded pointer IDs, file hashes, active claims, recent failures, tool
+      output volume, and provider-visible compaction signals.
+- [ ] Generate signed context manifests containing pointer IDs, load order,
+      required pointers, omissions, token budget, expiry, and source hashes.
+- [ ] Reuse existing local `context_packet`, layered `graph_context`,
+      collaboration packet, transcript, run metadata, and claim data as context
+      sources.
+- [ ] Block automatic loading of long "soul", global memory, raw transcript,
+      or stale project context files unless a manifest explicitly selects a
+      section or pointer.
+- [ ] Add context-health heuristics for token pressure, stale context,
+      duplicate context, contradiction, drift, missing required instructions,
+      source hash mismatch, repeated failed approach, and pending edit under
+      pressure.
+- [ ] Warn around 65k to 70k tokens, prepare handoff around 75k, and propose a
+      fresh session around 80k or critical context health.
+- [ ] Add handoff packet generation with current goal, latest state,
+      accepted/rejected decisions, active claims, verification state, unresolved
+      questions, required pointers, omitted context, and source offsets.
+- [ ] Treat compaction as degraded fallback and record a critical
+      `context_health_event` when provider compaction happens without a
+      Context Manager handoff.
+
+Verification:
+
+1. Context manifest generation fits the configured budget and cannot drop
+   required pointers.
+2. A long "soul" file is not auto-loaded; only a pointer or selected section is
+   returned.
+3. A fake run at 70k tokens produces a warning health event.
+4. A fake run at 80k tokens produces one idempotent handoff proposal.
+5. A source hash mismatch creates a stale-context health event.
+6. Duplicate replay of a manifest request returns the same manifest or a safe
+   idempotent replacement.
+7. `fumemory` outage does not block local run completion; host daemon degrades
+   to local context packets and reports degraded context health.
 
 ### Slice 7 - fumemory Sync
 
@@ -892,6 +1432,11 @@ Tasks:
 - [ ] Build memory sync payloads from completed or failed runs.
 - [ ] Include `idempotency_key`, `trace_id`, `host_id`, `repo_id`, `task_id`,
       `run_id`, and source event offsets.
+- [ ] Sync compact context sources, pointers, decisions, failed approaches,
+      verification states, and handoff packets without syncing raw full
+      transcripts.
+- [ ] Mark stale or superseded memory as `avoid` or expired pointers instead
+      of deleting provenance.
 - [ ] Queue failed syncs locally.
 - [ ] Add backpressure limits.
 - [ ] Add tests for duplicate sync payloads and retry behavior.
@@ -901,6 +1446,7 @@ Verification:
 1. `fumemory` outage does not block local run completion.
 2. Duplicate sync payload is safe.
 3. Memory payload can be traced back to the original run.
+4. Raw transcript text is not written to `fumemory` by default.
 
 ### Slice 8 - Cursor SDK Provider Adapter
 
@@ -1047,7 +1593,8 @@ Initial timing:
 ### Messaging And Notifications
 
 1. OpenClaw Messaging Service owns central room/message/delivery state.
-2. Telegram is a notification and reply adapter, not a host transport.
+2. Telegram, Slack, Discord, Matrix, email, and webhooks are notification,
+   reply, or chat adapters, not host transports.
 3. User-visible task communication should default to one task room, with run
    and host threads available for focused follow-up.
 4. A message can create multiple delivery records, but it must remain one
@@ -1057,6 +1604,52 @@ Initial timing:
 6. Notification rules should suppress routine heartbeats and raw event spam.
 7. Delivery and ACK failures should appear in the room timeline without
    changing local terminal `AgentRun` status.
+8. External adapters cannot publish fleet tasks, host commands, or context
+   manifests directly.
+9. Platform-specific retries must be idempotent against adapter ID, platform
+   event ID, and platform room/thread ID.
+10. Generic webhooks are inbound-only until an explicit signed webhook command
+    policy exists.
+
+### Context Management
+
+1. Always-loaded context must be a small kernel: safety rules, current task
+   contract, active constraints, and pointers to retrieval systems.
+2. Long "soul", global memory, raw transcript, and broad domain docs are
+   source material for hot-loading, not default prompt material.
+3. Context manifests must be signed, expiring, scoped to `host_id`, `repo_id`,
+   `task_id`, `run_id`, and provider, and include source hashes or offsets.
+4. Required pointers outrank optional context, but required pointers should be
+   short handles whenever possible.
+5. Warning threshold: 65k to 70k provider-estimated tokens.
+6. Handoff planning threshold: around 75k provider-estimated tokens.
+7. Fresh-session proposal threshold: around 80k provider-estimated tokens or
+   earlier for critical context rot.
+8. Compaction is degraded mode. If a provider compacts without a Context
+   Manager handoff, record a critical context health event and create a
+   reviewable checkpoint.
+9. Fresh-session handoff should inject only task goal, current state,
+   decisions, constraints, active claims, verification state, unresolved
+   questions, explicit omissions, and hot-load pointers.
+10. Do not restart repeatedly: enforce cooldowns and require materially changed
+    health evidence before proposing another handoff.
+
+Context bloat signals:
+
+1. Stale room chatter or old transcript is more than 30% of loaded context.
+2. Same source appears multiple times with different wording.
+3. Loaded context has no matching read/edit/test/tool use after several turns.
+4. Required pointers cannot fit inside the manifest budget.
+5. Large pasted docs displace selected files, claims, or verification output.
+
+Context rot signals:
+
+1. Loaded source hashes differ from current local graph-server file hashes.
+2. Run references claims, tests, symbols, or paths that no longer exist.
+3. Agent cites a decision superseded by a newer source offset or pointer.
+4. A failed approach repeats after an `avoid` pointer exists.
+5. Conversation goal drifts from the Agent Task acceptance criteria.
+6. Required project/system instructions or active fencing context is missing.
 
 ## Risks And Mitigations
 
@@ -1114,6 +1707,31 @@ Initial timing:
       keep local graph-server as transcript authority, and sync only explicit
       checkpoints to `fumemory`.
 
+14. Additional messaging adapters create unsafe command paths.
+    - Mitigation: one adapter contract, per-adapter NATS credentials, external
+      identity links, command-promotion policy, and signed command refs only
+      from the Messaging Service.
+
+15. Adapter retry behavior creates duplicate messages.
+    - Mitigation: idempotency keys from adapter ID, platform room/thread ID,
+      and platform message/event ID; delivery records remain one-to-many.
+
+16. Context Manager becomes hidden prompt stuffing.
+    - Mitigation: manifests are pointer-first, signed, auditable, expiring, and
+      include explicit load reasons and omissions.
+
+17. Context health false positives create restart loops.
+    - Mitigation: alert-only rollout first, cooldowns, required materially
+      changed health evidence, and human override for repeated handoffs.
+
+18. Summary drift or compaction loses critical nuance.
+    - Mitigation: compaction is degraded mode; handoff packets include source
+      offsets, hashes, decisions, rejected approaches, and "must verify" flags.
+
+19. Cross-host context leakage exposes private paths or transcripts.
+    - Mitigation: `context_sources.sensitivity`, route scopes, host/repo
+      filters, and no raw full transcript sync by default.
+
 ## Success Criteria
 
 1. A Windows PC can enroll as an OpenClaw host with a stable `host_id`.
@@ -1139,6 +1757,28 @@ Initial timing:
     delivery records.
 16. A user can see whether a message is queued, delivered, acknowledged,
     failed, or expired per host/run recipient.
+17. Slack, Discord, Matrix, email, and webhook adapters can register
+    capabilities and route messages through the same room/delivery contract
+    without direct host command access.
+18. External command-like messages cannot mutate execution until sender
+    identity, room policy, and signed command-reference validation pass.
+19. A host reports context metrics for an Agent Run without exposing secrets or
+    raw transcript dumps.
+20. A Context Manager manifest can hot-load relevant pointers without
+    auto-loading long "soul" or global memory files.
+21. A run near 80k provider-estimated tokens can create an idempotent handoff
+    packet and start a fresh provider session through Fleet Controller policy.
+22. Context health events and handoff packets are traceable to source hashes,
+    event offsets, `task_id`, `run_id`, and `host_id`.
+23. System can enable multiple instances of openclaw to communicate and allow for a single message service to relay messages to each openclaw instance.
+24. Messages should be marked as recieved by each of the systems in fumemory, and upon recieving a gateway can claim and write a task to a shared task management system. If another system deems the task partial or does not meet the users needs, they can update this and claim follow up action.
+25. The system should allow for critical review of context rot and prevent this from happening.
+26. There is always a context management and control system in place and this can traverse levels of agents and subagents. This should be a heuristic system managed by an agent and visible in the control system.
+27. The memory-network system should be used to improve context level at the system level, so each instance should be able to run this.
+28. There should be a ssh capability or other cross network, capability to maintain ssh connectivity to the other PCs in the openclaw network that can enhance and has a similar but higher level system of the memory-network, but it would be more of an agent-memory-network.
+29. Agent memory network can be used to monitor all openclaw instances, agents and subagents running in those systems by ssh or other connection methods.
+30. This system is to coordinate multiple instances of openclaw, claude code, kimi cli, opencode and other cli agentic frameworks across a network and allow for easy monitoring of the running systems and is able to recover those systems.
+31. This system should improve the current cross system communication and allow for more powerful integration of multiple systems.
 
 ## First Milestone Definition
 
@@ -1150,11 +1790,15 @@ Milestone 1 scope:
 2. Slice 1: host daemon skeleton.
 3. Slice 2: local graph-server adapter.
 4. Slice 3: embedded Messaging Service with rooms, message storage, delivery
-   records, and Telegram adapter stubs.
+   records, adapter registry, platform room mappings, external identities, and
+   Telegram adapter stubs.
 5. Slice 4: task inbox, host inbox, message ACKs, and event outbox.
 6. Slice 5: minimal host/repo/task leases and fencing before adding a second
    host.
 7. Slice 6: minimal controller task assignment from signed command references.
+8. Slice 7A passive mode: Context Manager pointer schema, host context metrics,
+   signed manifest stubs, and alert-only health events. No automatic restart
+   until metrics and false positives are understood.
 
 Milestone 1 demo:
 
@@ -1168,7 +1812,11 @@ Milestone 1 demo:
 7. Host receives task, dispatches local adapter, publishes events, and reports
    final local status.
 8. Telegram receives only the high-signal task status notification.
-9. Stop the network connection during a run and verify local status remains
+9. Host context probe reports estimated tokens, loaded pointers, active claims,
+   and source hashes to the Context Manager.
+10. Context Manager returns a signed pointer-first manifest and does not
+    auto-load long "soul" or global memory files.
+11. Stop the network connection during a run and verify local status remains
    authoritative.
 
 ## Recommended Next Command Sequence
@@ -1194,3 +1842,11 @@ ERROR: file or directory not found: tests/openclaw_hostd
 ```
 
 That failure is acceptable before Slice 1 creates the first tests.
+
+For the first messaging and context-manager slices, the expected initial
+failures are also missing test directories:
+
+```powershell
+python -m pytest tests/openclaw_messaging -q
+python -m pytest tests/openclaw_context -q
+```
