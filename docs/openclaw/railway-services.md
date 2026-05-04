@@ -47,6 +47,13 @@ Fleet MCP:
 
 Railway sets `PORT` automatically. When a volume is attached, Railway also sets `RAILWAY_VOLUME_MOUNT_PATH`.
 
+Both OpenClaw Python services should set:
+
+- `RAILPACK_INSTALL_COMMAND=python -m pip install -e ".[openclaw]"`
+
+The `openclaw` optional dependency group installs the HTTP MCP SDK and the
+NATS client required by production readiness checks.
+
 Fleet MCP opens the controller and messaging stores outside `development` mode
 so Fleet Controller-backed tools can inspect current fleet state. Use the same
 controller signing secret and SQLite paths as the controller service, or keep
