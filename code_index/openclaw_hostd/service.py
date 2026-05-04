@@ -9,6 +9,7 @@ import time
 from typing import Sequence
 
 from code_index.openclaw_hostd.config import HostDaemonConfig, load_config
+from code_index.openclaw_hostd.graph_client import GraphServerClient
 from code_index.openclaw_hostd.heartbeat import build_heartbeat_payload
 from code_index.openclaw_hostd.identity import load_or_create_host_identity
 from code_index.openclaw_hostd.logging import get_logger, redact_mapping
@@ -55,6 +56,13 @@ def _emit_payload(payload: dict[str, object], *, as_json: bool) -> None:
     )
 
 
+def _probe_graph_server_provider_registry(url: str) -> bool:
+    try:
+        return GraphServerClient(url, timeout=0.5).health().available
+    except ValueError:
+        return False
+
+
 def run_once(
     config: HostDaemonConfig,
     *,
@@ -62,9 +70,13 @@ def run_once(
     probe_graph_server: bool = False,
 ) -> dict[str, object]:
     identity = load_or_create_host_identity(config.host_identity_path)
+    graph_server_probe = (
+        _probe_graph_server_provider_registry if probe_graph_server else None
+    )
     payload = build_heartbeat_payload(
         config,
         identity,
+        graph_server_probe=graph_server_probe,
         probe_graph_server=probe_graph_server,
     )
     _emit_payload(payload, as_json=as_json)
