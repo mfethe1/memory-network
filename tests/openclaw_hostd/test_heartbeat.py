@@ -11,6 +11,7 @@ from code_index.openclaw_hostd import service
 from code_index.openclaw_hostd.config import (
     GRAPH_SERVER_TOKEN_ENV,
     GRAPH_SERVER_URL_ENV,
+    FLEET_LEASE_STORE_PATH_ENV,
     HOST_IDENTITY_PATH_ENV,
     HostDaemonConfig,
     NATS_URL_ENV,
@@ -157,6 +158,7 @@ def test_config_loads_json_file_with_environment_overrides(tmp_path: Path) -> No
                 "repo_roots": [str(file_root)],
                 "graph_server_url": "http://127.0.0.1:1111/health",
                 "graph_server_token": "file-token",
+                "fleet_lease_store_path": str(tmp_path / "leases-from-file.db"),
                 "ssh_hostname": "file-host",
                 "heartbeat_interval_seconds": 45,
             }
@@ -171,6 +173,7 @@ def test_config_loads_json_file_with_environment_overrides(tmp_path: Path) -> No
             GRAPH_SERVER_URL_ENV: "",
             GRAPH_SERVER_TOKEN_ENV: "env-token",
             NATS_URL_ENV: "nats://user:nats-secret@example.invalid:4222",
+            FLEET_LEASE_STORE_PATH_ENV: str(tmp_path / "leases-from-env.db"),
             HOST_IDENTITY_PATH_ENV: str(tmp_path / "identity-from-env.json"),
         },
         cwd=tmp_path,
@@ -185,5 +188,6 @@ def test_config_loads_json_file_with_environment_overrides(tmp_path: Path) -> No
     assert "env-token" not in repr(config)
     assert config.nats_url == "nats://user:nats-secret@example.invalid:4222"
     assert "nats-secret" not in repr(config)
+    assert config.fleet_lease_store_path == tmp_path / "leases-from-env.db"
     assert config.ssh_hostname == "file-host"
     assert config.heartbeat_interval_seconds == 45

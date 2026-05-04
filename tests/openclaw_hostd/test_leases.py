@@ -11,10 +11,12 @@ from code_index import agent_activity
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
 from code_index.openclaw_hostd.leases import DEFAULT_NO_PROGRESS_THRESHOLD
+from code_index.openclaw_hostd.leases import FleetLeaseController
 from code_index.openclaw_hostd.leases import InMemoryFleetLeaseStore
 from code_index.openclaw_hostd.leases import LeaseConflictError
 from code_index.openclaw_hostd.leases import LeaseFencingError
 from code_index.openclaw_hostd.leases import LeaseOwnerError
+from code_index.openclaw_hostd.leases import SQLiteFleetLeaseStore
 from code_index.openclaw_hostd.leases import release_task_lease_on_terminal_status
 from code_index.openclaw_hostd.leases import revoke_no_progress_task_leases
 
@@ -40,6 +42,35 @@ def test_two_hosts_cannot_acquire_same_exclusive_task_lease() -> None:
             owner_host_id="host-b",
             owner_run_id="run-b",
         )
+
+
+def test_sqlite_fleet_lease_store_enforces_conflicts_across_instances(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "fleet-leases.db"
+    host_a_store = SQLiteFleetLeaseStore(db_path)
+    host_b_store = SQLiteFleetLeaseStore(db_path)
+    try:
+        first = host_a_store.acquire_lease(
+            "task",
+            "task-123",
+            owner_host_id="host-a",
+            owner_run_id="run-a",
+        )
+
+        with pytest.raises(LeaseConflictError, match="host-a"):
+            host_b_store.acquire_lease(
+                "task",
+                "task-123",
+                owner_host_id="host-b",
+                owner_run_id="run-b",
+            )
+
+        assert first.fencing_revision == 1
+        assert host_b_store.get_active_lease("task", "task-123") == first
+    finally:
+        host_a_store.close()
+        host_b_store.close()
 
 
 def test_renewal_requires_owner_and_stale_fencing_cannot_release() -> None:
@@ -188,6 +219,53 @@ def test_fleet_controller_revokes_stale_no_progress_task_and_marks_reassignable(
     assert task.terminal_status is None
 
 
+def test_fleet_controller_service_reads_shared_agent_state_and_revokes_stale_task(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+    db_path = tmp_path / "fleet-leases.db"
+    host_store = SQLiteFleetLeaseStore(db_path)
+    controller_store = SQLiteFleetLeaseStore(db_path)
+    try:
+        host_store.acquire_lease(
+            "task",
+            "task-123",
+            owner_host_id="host-a",
+            owner_run_id="run-a",
+            now=now - timedelta(minutes=12),
+        )
+        host_store.record_task_status(
+            "task-123",
+            status="running",
+            host_id="host-a",
+            run_id="run-a",
+            now=now - timedelta(minutes=12),
+        )
+        host_store.put_agent_state(
+            "host-a.run-a",
+            {
+                "host_id": "host-a",
+                "task_id": "task-123",
+                "run_id": "run-a",
+                "last_action_at": (
+                    now - DEFAULT_NO_PROGRESS_THRESHOLD - timedelta(seconds=1)
+                ).isoformat(),
+            },
+        )
+
+        result = FleetLeaseController(controller_store).run_no_progress_check(now=now)
+
+        task = controller_store.get_task_record("task-123")
+        assert [item.task_id for item in result.revoked] == ["task-123"]
+        assert controller_store.get_active_lease("task", "task-123", now=now) is None
+        assert task is not None
+        assert task.status == "reassignable"
+        assert task.reassignable is True
+    finally:
+        host_store.close()
+        controller_store.close()
+
+
 def test_completed_task_before_no_progress_threshold_is_never_reassignable() -> None:
     now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
     frozen_last_action_at = now - DEFAULT_NO_PROGRESS_THRESHOLD - timedelta(seconds=1)
@@ -228,6 +306,51 @@ def test_completed_task_before_no_progress_threshold_is_never_reassignable() -> 
     assert task.status == "completed"
     assert task.reassignable is False
     assert task.terminal_status == "completed"
+
+
+def test_fleet_controller_service_never_reassigns_completed_task(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+    store = SQLiteFleetLeaseStore(tmp_path / "fleet-leases.db")
+    try:
+        lease = store.acquire_lease(
+            "task",
+            "task-123",
+            owner_host_id="host-a",
+            owner_run_id="run-a",
+            now=now - timedelta(minutes=2),
+        )
+        release_task_lease_on_terminal_status(
+            store,
+            task_id="task-123",
+            owner_host_id="host-a",
+            fencing_revision=lease.fencing_revision,
+            terminal_status="completed",
+            run_id="run-a",
+            now=now - timedelta(minutes=1),
+        )
+        store.put_agent_state(
+            "host-a.run-a",
+            {
+                "host_id": "host-a",
+                "task_id": "task-123",
+                "run_id": "run-a",
+                "last_action_at": (
+                    now - DEFAULT_NO_PROGRESS_THRESHOLD - timedelta(seconds=1)
+                ).isoformat(),
+            },
+        )
+
+        result = FleetLeaseController(store).run_no_progress_check(now=now)
+
+        task = store.get_task_record("task-123")
+        assert result.revoked == []
+        assert task is not None
+        assert task.status == "completed"
+        assert task.reassignable is False
+    finally:
+        store.close()
 
 
 def test_local_file_claims_continue_to_work_without_nats(tmp_path: Path) -> None:

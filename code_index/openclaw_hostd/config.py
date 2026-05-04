@@ -19,6 +19,7 @@ GRAPH_SERVER_TOKEN_ENV = "OPENCLAW_HOSTD_GRAPH_SERVER_TOKEN"
 SSH_HOSTNAME_ENV = "OPENCLAW_HOSTD_SSH_HOSTNAME"
 HEARTBEAT_INTERVAL_ENV = "OPENCLAW_HOSTD_HEARTBEAT_INTERVAL_SECONDS"
 NATS_URL_ENV = "OPENCLAW_HOSTD_NATS_URL"
+FLEET_LEASE_STORE_PATH_ENV = "OPENCLAW_HOSTD_FLEET_LEASE_STORE_PATH"
 
 DEFAULT_GRAPH_SERVER_URL = "http://127.0.0.1:8767/health"
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30
@@ -34,6 +35,7 @@ class HostDaemonConfig:
     ssh_hostname: str | None = None
     heartbeat_interval_seconds: int = DEFAULT_HEARTBEAT_INTERVAL_SECONDS
     nats_url: str | None = field(default=None, repr=False)
+    fleet_lease_store_path: Path | None = None
     config_path: Path | None = None
 
 
@@ -142,6 +144,12 @@ def load_config(
         default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
     )
     nats_url = _text_or_none(environ.get(NATS_URL_ENV, data.get("nats_url")))
+    fleet_lease_store_path = _optional_path(
+        environ.get(FLEET_LEASE_STORE_PATH_ENV)
+    )
+    if fleet_lease_store_path is None:
+        fleet_lease_store_path = _optional_path(data.get("fleet_lease_store_path"))
+    fleet_lease_store_path = fleet_lease_store_path or state_dir / "fleet-leases.db"
 
     return HostDaemonConfig(
         state_dir=state_dir,
@@ -152,5 +160,6 @@ def load_config(
         ssh_hostname=ssh_hostname,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
         nats_url=nats_url,
+        fleet_lease_store_path=fleet_lease_store_path,
         config_path=selected_config_path,
     )

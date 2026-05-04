@@ -11,6 +11,7 @@ from code_index.openclaw_hostd import service
 from code_index.openclaw_hostd.config import HostDaemonConfig
 from code_index.openclaw_hostd.graph_client import GraphServerResponse
 from code_index.openclaw_hostd.identity import HostIdentity
+from code_index.openclaw_hostd.leases import SQLiteFleetLeaseStore
 from code_index.openclaw_hostd.nats_client import AgentRunState
 from code_index.openclaw_hostd.nats_client import NatsClient
 from code_index.openclaw_hostd.nats_client import NatsUnavailableError
@@ -74,6 +75,16 @@ class FakeGraphClient:
             ok=True,
             status_code=200,
             payload=self.agent_board_payload or {},
+        )
+
+
+class RespectRunIdGraphClient(FakeGraphClient):
+    def submit_task(self, **payload: Any) -> GraphServerResponse:
+        self.requests.append(dict(payload))
+        return GraphServerResponse(
+            ok=True,
+            status_code=201,
+            payload={"run": {"run_id": payload["run_id"]}},
         )
 
 
@@ -191,6 +202,23 @@ def _config_with_nats(tmp_path: Path) -> HostDaemonConfig:
         heartbeat_interval_seconds=config.heartbeat_interval_seconds,
         nats_url="nats://127.0.0.1:4222",
         config_path=config.config_path,
+        fleet_lease_store_path=config.fleet_lease_store_path,
+    )
+
+
+def _config_with_nats_and_leases(tmp_path: Path) -> HostDaemonConfig:
+    config = _config_with_nats(tmp_path)
+    return HostDaemonConfig(
+        state_dir=config.state_dir,
+        host_identity_path=config.host_identity_path,
+        repo_roots=config.repo_roots,
+        graph_server_url=config.graph_server_url,
+        graph_server_token=config.graph_server_token,
+        ssh_hostname=config.ssh_hostname,
+        heartbeat_interval_seconds=config.heartbeat_interval_seconds,
+        nats_url=config.nats_url,
+        config_path=config.config_path,
+        fleet_lease_store_path=tmp_path / "central-fleet-leases.db",
     )
 
 
@@ -206,6 +234,7 @@ def _config_with_nats_without_graph(tmp_path: Path) -> HostDaemonConfig:
         heartbeat_interval_seconds=config.heartbeat_interval_seconds,
         nats_url=config.nats_url,
         config_path=config.config_path,
+        fleet_lease_store_path=config.fleet_lease_store_path,
     )
 
 
@@ -605,6 +634,109 @@ def test_nats_subscription_callbacks_are_processed_off_callback_thread(
 
     assert errors == []
     assert [request["task_id"] for request in graph.requests] == ["task-thread"]
+
+
+def test_nats_runtime_uses_configured_shared_lease_store_by_default(
+    tmp_path: Path,
+) -> None:
+    config = _config_with_nats_and_leases(tmp_path)
+    central = SQLiteFleetLeaseStore(config.fleet_lease_store_path)
+    central.acquire_lease(
+        "task",
+        "task-conflict",
+        owner_host_id="host-other",
+        owner_run_id="run-other",
+    )
+    central.close()
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    graph = FakeGraphClient()
+    runtime = service.setup_nats_runtime(
+        config,
+        HostIdentity(host_id=HOST_ID),
+        nats_client=nats,
+        graph_client=graph,
+    )
+    assert runtime is not None
+
+    transport.subscriptions[f"openclaw.deliver.{HOST_ID}.tasks"](
+        {
+            "kind": "openclaw.task.assigned",
+            "schema_version": 1,
+            "host_id": HOST_ID,
+            "task_id": "task-conflict",
+            "message_id": "msg-conflict",
+            "delivery_id": "delivery-conflict",
+            "message": "This should not dispatch.",
+        }
+    )
+    runtime.close()
+
+    assert graph.requests == []
+    assert [payload["status"] for _, payload in transport.published] == [
+        "lease_conflict"
+    ]
+
+
+def test_daemon_loop_releases_task_lease_when_graph_reports_terminal_run(
+    tmp_path: Path,
+) -> None:
+    config = _config_with_nats_and_leases(tmp_path)
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    graph = RespectRunIdGraphClient()
+    runtime = service.setup_nats_runtime(
+        config,
+        HostIdentity(host_id=HOST_ID),
+        nats_client=nats,
+        graph_client=graph,
+    )
+    assert runtime is not None
+    assignment = {
+        "kind": "openclaw.task.assigned",
+        "schema_version": 1,
+        "host_id": HOST_ID,
+        "task_id": "task-complete",
+        "message_id": "msg-complete",
+        "delivery_id": "delivery-complete",
+        "message": "Complete normally.",
+    }
+    transport.subscriptions[f"openclaw.deliver.{HOST_ID}.tasks"](assignment)
+    run_id = graph.requests[0]["run_id"]
+    runtime.close()
+    central = SQLiteFleetLeaseStore(config.fleet_lease_store_path)
+    assert central.get_active_lease("task", "task-complete") is not None
+    central.close()
+    graph.agent_board_payload = {
+        "runs": [
+            {
+                "run_id": run_id,
+                "task_id": "task-complete",
+                "status": "completed",
+            }
+        ]
+    }
+    loop_transport = FakeNatsTransport()
+    loop_nats = NatsClient(transport=loop_transport)
+
+    service.run_daemon_loop(
+        config,
+        as_json=True,
+        nats_client=loop_nats,
+        graph_client=graph,
+        sleep=lambda seconds: None,
+        max_iterations=1,
+    )
+
+    verified = SQLiteFleetLeaseStore(config.fleet_lease_store_path)
+    task = verified.get_task_record("task-complete")
+    try:
+        assert verified.get_active_lease("task", "task-complete") is None
+        assert task is not None
+        assert task.status == "completed"
+        assert task.terminal_status == "completed"
+    finally:
+        verified.close()
 
 
 def test_nats_message_ack_and_reply_are_sent_after_delivery_processing(

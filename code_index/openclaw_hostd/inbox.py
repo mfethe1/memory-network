@@ -123,6 +123,21 @@ class TaskInbox:
 
     def handle_task_assignment(self, raw_message: Mapping[str, Any]) -> TaskInboxResult:
         message = _normalise_task_assignment(raw_message, host_id=self.host_id)
+        existing_task = self._task_row(message["task_id"])
+        if existing_task is not None and not _recoverable_task_row(existing_task):
+            run_id = str(existing_task.get("run_id") or "").strip()
+            ack_published = self._publish_task_ack_once(
+                message,
+                run_id=run_id,
+                status="duplicate",
+            )
+            return TaskInboxResult(
+                task_id=message["task_id"],
+                run_id=run_id,
+                status="duplicate",
+                duplicate=True,
+                ack_published=ack_published,
+            )
         conflict_replay = self._task_ack_row(
             message["message_id"],
             message["delivery_id"],

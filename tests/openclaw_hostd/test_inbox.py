@@ -255,6 +255,33 @@ def test_task_inbox_releases_task_lease_for_terminal_local_status(
     assert task.status == "completed"
 
 
+def test_task_inbox_does_not_reacquire_lease_for_terminal_duplicate(
+    tmp_path: Path,
+) -> None:
+    graph = FakeGraphClient()
+    leases = InMemoryFleetLeaseStore()
+    inbox = TaskInbox(
+        tmp_path / "inbox.db",
+        host_id="host-a",
+        graph_client=graph,
+        lease_store=leases,
+    )
+    accepted = inbox.handle_task_assignment(_assignment())
+    inbox.release_task_lease_on_terminal_status(
+        "task-123",
+        terminal_status="completed",
+        run_id=accepted.run_id,
+    )
+
+    duplicate = inbox.handle_task_assignment(
+        _assignment(message_id="msg-late", delivery_id="delivery-late")
+    )
+
+    assert duplicate.status == "duplicate"
+    assert leases.get_active_lease("task", "task-123") is None
+    assert [request["task_id"] for request in graph.requests] == ["task-123"]
+
+
 def test_task_inbox_rejects_wrong_host_without_dispatch_or_ack(
     tmp_path: Path,
 ) -> None:

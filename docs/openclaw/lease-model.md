@@ -7,6 +7,12 @@ prevent duplicate cross-host assignment and recovery actions. File-level claims
 remain local to each host's graph-server SQLite database and are not mirrored
 through NATS in Milestone 1.
 
+The Slice 5 implementation provides a shared SQLite-backed fleet lease store.
+Hosts can point `OPENCLAW_HOSTD_FLEET_LEASE_STORE_PATH` at the same database to
+get central conflict enforcement across host daemon processes. If the variable
+is not set, hostd uses `fleet-leases.db` under its configured state directory.
+This is the file-backed Slice 5 stand-in for the later NATS KV deployment.
+
 ## Fleet Lease Scopes
 
 - `host`: exclusive ownership of host-level controller work for one host.
@@ -54,6 +60,14 @@ Terminal local run statuses release task leases through
 
 Non-terminal statuses do not release fleet leases.
 
+The host daemon creates the configured lease store during NATS runtime setup and
+passes it into `TaskInbox`. A task delivery that conflicts with an active task
+lease publishes a `lease_conflict` ACK and does not dispatch to graph-server.
+
+The daemon loop also polls graph-server's agent board through the existing
+injectable graph client. When a local run is reported with a terminal status,
+the matching task lease is released with the stored fencing revision.
+
 ## No-Progress Detection
 
 The Fleet Controller reads `openclaw_agent_states`-like entries and active task
@@ -69,6 +83,11 @@ For each active task lease:
 
 A normally completed task is never marked `reassignable`, even if an old agent
 state remains visible until KV TTL removes it.
+
+Slice 5 exposes this as `FleetLeaseController.run_no_progress_check()`. It reads
+agent-state rows from the shared store, revokes stale active task leases, writes
+the task state as `reassignable`, and returns both revocation records and the
+updated task records. This is intentionally not the full Slice 6 assignment API.
 
 ## File Claims Stay Local
 

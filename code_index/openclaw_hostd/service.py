@@ -22,6 +22,8 @@ from code_index.openclaw_hostd.heartbeat import build_heartbeat_payload
 from code_index.openclaw_hostd.identity import load_or_create_host_identity
 from code_index.openclaw_hostd.identity import HostIdentity
 from code_index.openclaw_hostd.inbox import HostInbox, TaskInbox
+from code_index.openclaw_hostd.leases import SQLiteFleetLeaseStore
+from code_index.openclaw_hostd.leases import TERMINAL_TASK_STATUSES
 from code_index.openclaw_hostd.logging import get_logger, redact_mapping
 from code_index.openclaw_hostd.nats_client import AgentRunState, NatsClient
 from code_index.openclaw_hostd.nats_client import NatsUnavailableError
@@ -62,6 +64,7 @@ class HostDaemonNatsRuntime:
     outbox: Any
     task_inbox: TaskInbox
     host_inbox: HostInbox
+    lease_store: Any | None = None
     dispatcher: NatsMessageDispatcher | None = None
 
     def close(self) -> None:
@@ -70,6 +73,7 @@ class HostDaemonNatsRuntime:
         _close_quietly(self.task_inbox)
         _close_quietly(self.host_inbox)
         _close_quietly(self.outbox)
+        _close_quietly(self.lease_store)
         _close_quietly(self.nats_client)
 
 
@@ -223,10 +227,16 @@ def create_configured_nats_client(
     return NatsClient(transport=factory(config.nats_url))
 
 
+def create_configured_lease_store(config: HostDaemonConfig) -> SQLiteFleetLeaseStore:
+    path = config.fleet_lease_store_path or config.state_dir / "fleet-leases.db"
+    return SQLiteFleetLeaseStore(path)
+
+
 def graph_server_active_run_provider(
     graph_client: Any | None,
     *,
     logger: Any | None = None,
+    terminal_task_inbox: TaskInbox | None = None,
 ) -> ActiveRunProvider:
     def _provider() -> tuple[AgentRunState, ...]:
         if graph_client is None:
@@ -252,6 +262,12 @@ def graph_server_active_run_provider(
         payload = getattr(response, "payload", response)
         if not isinstance(payload, Mapping):
             return ()
+        if terminal_task_inbox is not None:
+            release_terminal_task_leases_from_graph_payload(
+                terminal_task_inbox,
+                payload,
+                logger=logger,
+            )
         return tuple(_agent_run_states_from_graph_payload(payload))
 
     return _provider
@@ -271,25 +287,119 @@ def _agent_run_states_from_graph_payload(
     return states
 
 
-def _graph_payload_runs(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+def release_terminal_task_leases_from_graph(
+    task_inbox: TaskInbox,
+    graph_client: Any | None,
+    *,
+    logger: Any | None = None,
+) -> list[Any]:
+    if graph_client is None:
+        return []
+    try:
+        agent_board = getattr(graph_client, "agent_board")
+        response = agent_board()
+    except Exception as exc:
+        _logger_debug(
+            logger,
+            "OpenClaw terminal run lookup failed: %s",
+            exc,
+        )
+        return []
+    ok = bool(getattr(response, "ok", True))
+    if not ok:
+        _logger_debug(
+            logger,
+            "OpenClaw terminal run lookup returned unavailable: %s",
+            getattr(response, "error", None),
+        )
+        return []
+    payload = getattr(response, "payload", response)
+    if not isinstance(payload, Mapping):
+        return []
+    return release_terminal_task_leases_from_graph_payload(
+        task_inbox,
+        payload,
+        logger=logger,
+    )
+
+
+def release_terminal_task_leases_from_graph_payload(
+    task_inbox: TaskInbox,
+    payload: Mapping[str, Any],
+    *,
+    logger: Any | None = None,
+) -> list[Any]:
+    released: list[Any] = []
+    for run in _graph_payload_all_runs(payload):
+        status = _run_text(run.get("status")).lower()
+        if status not in TERMINAL_TASK_STATUSES:
+            continue
+        metadata = run.get("metadata") if isinstance(run.get("metadata"), Mapping) else {}
+        assert isinstance(metadata, Mapping)
+        task_id = _run_text(
+            run.get("task_id")
+            or metadata.get("task_id")
+            or metadata.get("openclaw_task_id")
+        )
+        if not task_id:
+            continue
+        try:
+            result = task_inbox.release_task_lease_on_terminal_status(
+                task_id,
+                terminal_status=status,
+                run_id=_run_text(run.get("run_id") or run.get("id")) or None,
+            )
+        except Exception as exc:
+            _logger_warning(
+                logger,
+                "OpenClaw task lease release failed for %s: %s",
+                task_id,
+                exc,
+            )
+            continue
+        if result is not None:
+            released.append(result)
+    return released
+
+
+def _graph_payload_all_runs(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     runs: list[Mapping[str, Any]] = []
 
-    def add_many(value: Any) -> None:
+    def add_many(value: Any, *, column_name: str | None = None) -> None:
         if isinstance(value, list):
-            runs.extend(item for item in value if isinstance(item, Mapping))
+            for item in value:
+                if not isinstance(item, Mapping):
+                    continue
+                if column_name:
+                    copied = dict(item)
+                    copied["_openclaw_column"] = column_name
+                    runs.append(copied)
+                else:
+                    runs.append(item)
 
     add_many(payload.get("active_runs"))
     add_many(payload.get("runs"))
     agent = payload.get("agent")
     if isinstance(agent, Mapping):
         add_many(agent.get("active_runs"))
+        add_many(agent.get("runs"))
     columns = payload.get("columns")
     if isinstance(columns, Mapping):
         for column_name, column in columns.items():
-            if str(column_name).strip().lower() != "active":
-                continue
             if isinstance(column, Mapping):
-                add_many(column.get("runs"))
+                add_many(column.get("runs"), column_name=str(column_name))
+    return runs
+
+
+def _graph_payload_runs(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    runs = []
+    for run in _graph_payload_all_runs(payload):
+        column = str(
+            run.get("_openclaw_column") or run.get("column") or ""
+        ).strip().lower()
+        if column and column != "active":
+            continue
+        runs.append(run)
     return [run for run in runs if _active_graph_run(run)]
 
 
@@ -433,6 +543,7 @@ def setup_nats_runtime(
     nats_transport_factory: NatsTransportFactory | None = None,
     graph_client: Any | None = None,
     outbox: Any | None = None,
+    lease_store: Any | None = None,
     command_ref_verifier: Callable[[Mapping[str, Any]], bool] | None = None,
     logger: Any | None = None,
 ) -> HostDaemonNatsRuntime | None:
@@ -446,6 +557,7 @@ def setup_nats_runtime(
             return None
         if not getattr(nats_client, "connected", False):
             nats_client.connect()
+        lease_store = lease_store or create_configured_lease_store(config)
     except (NatsUnavailableError, RuntimeError, OSError, ValueError) as exc:
         logger.warning("OpenClaw NATS unavailable; continuing without NATS: %s", exc)
         return None
@@ -458,6 +570,7 @@ def setup_nats_runtime(
         graph_client=graph_client,
         nats_client=nats_client,
         outbox=outbox,
+        lease_store=lease_store,
     )
     host_inbox = HostInbox(
         config.state_dir / "host-inbox.db",
@@ -491,6 +604,7 @@ def setup_nats_runtime(
         outbox=outbox,
         task_inbox=task_inbox,
         host_inbox=host_inbox,
+        lease_store=lease_store,
         dispatcher=dispatcher,
     )
 
@@ -504,6 +618,7 @@ def run_daemon_loop(
     nats_transport_factory: NatsTransportFactory | None = None,
     graph_client: Any | None = None,
     outbox: Any | None = None,
+    lease_store: Any | None = None,
     active_run_provider: ActiveRunProvider | None = None,
     command_ref_verifier: Callable[[Mapping[str, Any]], bool] | None = None,
     logger: Any | None = None,
@@ -519,6 +634,7 @@ def run_daemon_loop(
         nats_transport_factory=nats_transport_factory,
         graph_client=graph_client,
         outbox=outbox,
+        lease_store=lease_store,
         command_ref_verifier=command_ref_verifier,
         logger=logger,
     )
@@ -529,6 +645,7 @@ def run_daemon_loop(
         active_run_provider = graph_server_active_run_provider(
             provider_graph_client,
             logger=logger,
+            terminal_task_inbox=runtime.task_inbox,
         )
     if active_run_provider is None:
         active_run_provider = empty_active_run_provider
