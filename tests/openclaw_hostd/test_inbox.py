@@ -13,6 +13,7 @@ from code_index.openclaw_hostd.graph_client import GraphServerResponse
 from code_index.openclaw_hostd.inbox import HostInbox
 from code_index.openclaw_hostd.inbox import InboxValidationError
 from code_index.openclaw_hostd.inbox import TaskInbox
+from code_index.openclaw_hostd.leases import InMemoryFleetLeaseStore
 from code_index.openclaw_hostd.nats_client import AgentRunState
 from code_index.openclaw_hostd.nats_client import NatsClient
 from code_index.openclaw_hostd import service
@@ -189,6 +190,69 @@ def test_task_inbox_validates_assignment_deduplicates_by_task_id_and_publishes_a
         "accepted",
         "duplicate",
     ]
+
+
+def test_task_inbox_fails_closed_when_task_lease_conflicts(
+    tmp_path: Path,
+) -> None:
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    nats.connect()
+    graph = FakeGraphClient()
+    leases = InMemoryFleetLeaseStore()
+    leases.acquire_lease(
+        "task",
+        "task-123",
+        owner_host_id="host-b",
+        owner_run_id="run-host-b",
+    )
+    inbox = TaskInbox(
+        tmp_path / "inbox.db",
+        host_id="host-a",
+        graph_client=graph,
+        nats_client=nats,
+        lease_store=leases,
+    )
+
+    result = inbox.handle_task_assignment(_assignment())
+
+    assert result.status == "lease_conflict"
+    assert result.duplicate is False
+    assert result.ack_published is True
+    assert graph.requests == []
+    assert inbox._task_row("task-123") is None
+    assert [payload["status"] for _, payload in transport.published] == [
+        "lease_conflict"
+    ]
+
+
+def test_task_inbox_releases_task_lease_for_terminal_local_status(
+    tmp_path: Path,
+) -> None:
+    graph = FakeGraphClient()
+    leases = InMemoryFleetLeaseStore()
+    inbox = TaskInbox(
+        tmp_path / "inbox.db",
+        host_id="host-a",
+        graph_client=graph,
+        lease_store=leases,
+    )
+    accepted = inbox.handle_task_assignment(_assignment())
+    active = leases.get_active_lease("task", "task-123")
+    assert active is not None
+
+    released = inbox.release_task_lease_on_terminal_status(
+        "task-123",
+        terminal_status="completed",
+        run_id=accepted.run_id,
+    )
+
+    task = leases.get_task_record("task-123")
+    assert released is not None
+    assert released.status == "released"
+    assert leases.get_active_lease("task", "task-123") is None
+    assert task is not None
+    assert task.status == "completed"
 
 
 def test_task_inbox_rejects_wrong_host_without_dispatch_or_ack(

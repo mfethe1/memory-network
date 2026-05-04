@@ -12,6 +12,9 @@ import sqlite3
 import threading
 from typing import Any, Iterator
 
+from code_index.openclaw_hostd.leases import LeaseConflictError
+from code_index.openclaw_hostd.leases import release_task_lease_on_terminal_status
+
 
 NON_MUTATING_MESSAGE_TYPES = frozenset({"chat", "event", "summary", "alert"})
 TASK_ASSIGNMENT_KINDS = frozenset(
@@ -55,6 +58,8 @@ class TaskInbox:
         graph_client: Any,
         nats_client: Any | None = None,
         outbox: Any | None = None,
+        lease_store: Any | None = None,
+        lease_ttl_seconds: int | float | None = 1800,
     ) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,6 +67,8 @@ class TaskInbox:
         self.graph_client = graph_client
         self.nats_client = nats_client
         self.outbox = outbox
+        self.lease_store = lease_store
+        self.lease_ttl_seconds = lease_ttl_seconds
         self._lock = threading.RLock()
         self._inflight_task_ids: set[str] = set()
         self._inflight_task_acks: set[tuple[str, str]] = set()
@@ -83,6 +90,10 @@ class TaskInbox:
                   delivery_id TEXT NOT NULL,
                   run_id TEXT NOT NULL,
                   status TEXT NOT NULL,
+                  lease_id TEXT,
+                  lease_scope TEXT,
+                  lease_resource_id TEXT,
+                  lease_fencing_revision INTEGER,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
@@ -98,11 +109,57 @@ class TaskInbox:
                 );
                 """
             )
+            _ensure_columns(
+                self.conn,
+                "openclaw_task_inbox",
+                {
+                    "lease_id": "TEXT",
+                    "lease_scope": "TEXT",
+                    "lease_resource_id": "TEXT",
+                    "lease_fencing_revision": "INTEGER",
+                },
+            )
             self.conn.commit()
 
     def handle_task_assignment(self, raw_message: Mapping[str, Any]) -> TaskInboxResult:
         message = _normalise_task_assignment(raw_message, host_id=self.host_id)
-        existing, should_submit = self._reserve_task_submission(message)
+        conflict_replay = self._task_ack_row(
+            message["message_id"],
+            message["delivery_id"],
+        )
+        if (
+            conflict_replay is not None
+            and str(conflict_replay.get("status") or "") == "lease_conflict"
+        ):
+            return TaskInboxResult(
+                task_id=message["task_id"],
+                run_id="",
+                status="lease_conflict",
+                duplicate=True,
+                ack_published=False,
+            )
+        planned_run_id = _planned_run_id(self.host_id, message["task_id"])
+        task_lease = self._acquire_task_lease(
+            message["task_id"],
+            run_id=planned_run_id,
+        )
+        if task_lease is None and self.lease_store is not None:
+            ack_published = self._publish_task_ack_once(
+                message,
+                run_id="",
+                status="lease_conflict",
+            )
+            return TaskInboxResult(
+                task_id=message["task_id"],
+                run_id="",
+                status="lease_conflict",
+                duplicate=False,
+                ack_published=ack_published,
+            )
+        existing, should_submit = self._reserve_task_submission(
+            message,
+            task_lease=task_lease,
+        )
         planned_run_id = str(existing.get("run_id") or "").strip()
         if not should_submit:
             if _recoverable_task_row(existing):
@@ -141,9 +198,21 @@ class TaskInbox:
             if not response.ok:
                 error = response.error or "graph-server task dispatch failed"
                 self._update_task_status(message["task_id"], status="failed")
+                self.release_task_lease_on_terminal_status(
+                    message["task_id"],
+                    terminal_status="failed",
+                    run_id=planned_run_id,
+                )
                 raise RuntimeError(error)
             run_id = _run_id(response.payload)
             self._finalize_task(message["task_id"], run_id=run_id, status="accepted")
+            if self.lease_store is not None:
+                self.lease_store.record_task_status(
+                    message["task_id"],
+                    status="accepted",
+                    host_id=self.host_id,
+                    run_id=run_id,
+                )
             ack_published = self._publish_task_ack_once(
                 message,
                 run_id=run_id,
@@ -160,6 +229,37 @@ class TaskInbox:
             with self._lock:
                 self._inflight_task_ids.discard(message["task_id"])
 
+    def release_task_lease_on_terminal_status(
+        self,
+        task_id: str,
+        *,
+        terminal_status: str,
+        run_id: str | None = None,
+    ) -> Any | None:
+        if self.lease_store is None:
+            return None
+        row = self._task_row(task_id)
+        if row is None:
+            return None
+        fencing_revision = row.get("lease_fencing_revision")
+        if fencing_revision is None:
+            return None
+        released = release_task_lease_on_terminal_status(
+            self.lease_store,
+            task_id=task_id,
+            owner_host_id=self.host_id,
+            fencing_revision=int(fencing_revision),
+            terminal_status=terminal_status,
+            run_id=run_id or str(row.get("run_id") or "").strip() or None,
+        )
+        if released is not None:
+            self._update_task_status(
+                task_id,
+                status=str(terminal_status or "").strip().lower(),
+                run_id=run_id,
+            )
+        return released
+
     def _task_row(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self.conn.execute(
@@ -175,23 +275,33 @@ class TaskInbox:
     def _reserve_task_submission(
         self,
         message: Mapping[str, Any],
+        *,
+        task_lease: Any | None = None,
     ) -> tuple[dict[str, Any], bool]:
         now = _now()
         planned_run_id = _planned_run_id(self.host_id, message["task_id"])
+        lease_id, lease_scope, lease_resource_id, lease_fencing_revision = (
+            _lease_row_values(task_lease)
+        )
         try:
             with self._transaction():
                 self.conn.execute(
                     """
                     INSERT INTO openclaw_task_inbox (
                       task_id, message_id, delivery_id, run_id, status,
-                      created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, 'processing', ?, ?)
+                      lease_id, lease_scope, lease_resource_id,
+                      lease_fencing_revision, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'processing', ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         message["task_id"],
                         message["message_id"],
                         message["delivery_id"],
                         planned_run_id,
+                        lease_id,
+                        lease_scope,
+                        lease_resource_id,
+                        lease_fencing_revision,
                         now,
                         now,
                     ),
@@ -212,6 +322,8 @@ class TaskInbox:
                     run_id=str(existing.get("run_id") or "").strip()
                     or planned_run_id,
                 )
+                if task_lease is not None:
+                    self._update_task_lease(message["task_id"], task_lease)
                 refreshed = self._task_row(message["task_id"]) or existing
                 return refreshed, True
             return existing, False
@@ -221,6 +333,10 @@ class TaskInbox:
             "delivery_id": message["delivery_id"],
             "run_id": planned_run_id,
             "status": "processing",
+            "lease_id": lease_id,
+            "lease_scope": lease_scope,
+            "lease_resource_id": lease_resource_id,
+            "lease_fencing_revision": lease_fencing_revision,
             "created_at": now,
             "updated_at": now,
         }, True
@@ -237,6 +353,45 @@ class TaskInbox:
                 """,
                 (run_id, status, _now(), task_id),
             )
+
+    def _update_task_lease(self, task_id: str, task_lease: Any) -> None:
+        lease_id, lease_scope, lease_resource_id, lease_fencing_revision = (
+            _lease_row_values(task_lease)
+        )
+        with self._transaction():
+            self.conn.execute(
+                """
+                UPDATE openclaw_task_inbox
+                   SET lease_id = ?,
+                       lease_scope = ?,
+                       lease_resource_id = ?,
+                       lease_fencing_revision = ?,
+                       updated_at = ?
+                 WHERE task_id = ?
+                """,
+                (
+                    lease_id,
+                    lease_scope,
+                    lease_resource_id,
+                    lease_fencing_revision,
+                    _now(),
+                    task_id,
+                ),
+            )
+
+    def _acquire_task_lease(self, task_id: str, *, run_id: str) -> Any | None:
+        if self.lease_store is None:
+            return None
+        try:
+            return self.lease_store.acquire_lease(
+                "task",
+                task_id,
+                owner_host_id=self.host_id,
+                owner_run_id=run_id,
+                ttl_seconds=self.lease_ttl_seconds,
+            )
+        except LeaseConflictError:
+            return None
 
     def _update_task_status(
         self,
@@ -654,6 +809,33 @@ def _publish_or_enqueue(
 def _configure_sqlite(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+
+
+def _ensure_columns(
+    conn: sqlite3.Connection,
+    table_name: str,
+    columns: Mapping[str, str],
+) -> None:
+    existing = {
+        str(row["name"])
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    for name, definition in columns.items():
+        if name in existing:
+            continue
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {name} {definition}")
+
+
+def _lease_row_values(task_lease: Any | None) -> tuple[str | None, str | None, str | None, int | None]:
+    if task_lease is None:
+        return None, None, None, None
+    lease_id = str(getattr(task_lease, "lease_id", "") or "").strip() or None
+    scope = str(getattr(task_lease, "scope", "") or "").strip() or None
+    resource_id = str(getattr(task_lease, "resource_id", "") or "").strip() or None
+    fencing_revision = getattr(task_lease, "fencing_revision", None)
+    if fencing_revision is not None:
+        fencing_revision = int(fencing_revision)
+    return lease_id, scope, resource_id, fencing_revision
 
 
 def _recoverable_task_row(row: Mapping[str, Any] | None) -> bool:
