@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 
 
 _GRAPH_SERVER_ENDPOINT_PREFIXES = (
+    "/api/agent-board",
     "/api/agent-providers",
     "/api/agent-runs",
     "/api/agent-task-preflight",
@@ -85,6 +86,9 @@ class GraphServerClient:
             payload=response.payload,
             error=error,
         )
+
+    def agent_board(self) -> GraphServerResponse:
+        return self._request_json("GET", "/api/agent-board")
 
     def submit_task(
         self,
@@ -163,7 +167,7 @@ class GraphServerClient:
             )
             last_response = response
             if not response.ok:
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= deadline or _response_timed_out(response):
                     return _poll_timeout_response(run_id, response)
                 return response
             status = _run_status(response.payload)
@@ -298,6 +302,10 @@ def _string_list(values: Iterable[str] | str | None) -> list[str]:
 def _run_status(payload: dict[str, Any]) -> str:
     run = payload.get("run") if isinstance(payload.get("run"), dict) else {}
     return str(run.get("status") or payload.get("status") or "").strip().lower()
+
+
+def _response_timed_out(response: GraphServerResponse) -> bool:
+    return response.status_code is None and "timed out" in str(response.error or "")
 
 
 def _poll_timeout_response(

@@ -20,11 +20,25 @@ from code_index.openclaw_hostd.inbox import HostInbox, TaskInbox
 from code_index.openclaw_hostd.logging import get_logger, redact_mapping
 from code_index.openclaw_hostd.nats_client import AgentRunState, NatsClient
 from code_index.openclaw_hostd.nats_client import NatsUnavailableError
+from code_index.openclaw_hostd.nats_client import create_nats_transport
 from code_index.openclaw_hostd.nats_client import publish_agent_state_entries
 from code_index.openclaw_hostd.outbox import EventOutbox
 
 
 ActiveRunProvider = Callable[[], Iterable[AgentRunState | Mapping[str, Any]]]
+NatsTransportFactory = Callable[[str], Any]
+_STOPPED_ACTIVE_RUN_STATUSES = frozenset(
+    {
+        "completed",
+        "failed",
+        "cancelled",
+        "canceled",
+        "review",
+        "needs_review",
+        "needs-review",
+        "done",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -95,10 +109,196 @@ def empty_active_run_provider() -> tuple[AgentRunState, ...]:
     return ()
 
 
-def create_configured_nats_client(config: HostDaemonConfig) -> NatsClient | None:
+def create_configured_nats_client(
+    config: HostDaemonConfig,
+    *,
+    transport_factory: NatsTransportFactory | None = None,
+) -> NatsClient | None:
     if not config.nats_url:
         return None
-    return NatsClient()
+    factory = transport_factory or create_nats_transport
+    return NatsClient(transport=factory(config.nats_url))
+
+
+def graph_server_active_run_provider(
+    graph_client: Any | None,
+    *,
+    logger: Any | None = None,
+) -> ActiveRunProvider:
+    def _provider() -> tuple[AgentRunState, ...]:
+        if graph_client is None:
+            return ()
+        try:
+            agent_board = getattr(graph_client, "agent_board")
+            response = agent_board()
+        except Exception as exc:
+            _logger_debug(
+                logger,
+                "OpenClaw graph-server active run lookup failed: %s",
+                exc,
+            )
+            return ()
+        ok = bool(getattr(response, "ok", True))
+        if not ok:
+            _logger_debug(
+                logger,
+                "OpenClaw graph-server active run lookup returned unavailable: %s",
+                getattr(response, "error", None),
+            )
+            return ()
+        payload = getattr(response, "payload", response)
+        if not isinstance(payload, Mapping):
+            return ()
+        return tuple(_agent_run_states_from_graph_payload(payload))
+
+    return _provider
+
+
+def _agent_run_states_from_graph_payload(
+    payload: Mapping[str, Any],
+) -> list[AgentRunState]:
+    states: list[AgentRunState] = []
+    seen: set[str] = set()
+    for run in _graph_payload_runs(payload):
+        state = _agent_run_state_from_graph_run(run)
+        if state is None or state.run_id in seen:
+            continue
+        seen.add(state.run_id)
+        states.append(state)
+    return states
+
+
+def _graph_payload_runs(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    runs: list[Mapping[str, Any]] = []
+
+    def add_many(value: Any) -> None:
+        if isinstance(value, list):
+            runs.extend(item for item in value if isinstance(item, Mapping))
+
+    add_many(payload.get("active_runs"))
+    add_many(payload.get("runs"))
+    agent = payload.get("agent")
+    if isinstance(agent, Mapping):
+        add_many(agent.get("active_runs"))
+    columns = payload.get("columns")
+    if isinstance(columns, Mapping):
+        for column_name, column in columns.items():
+            if str(column_name).strip().lower() == "done":
+                continue
+            if isinstance(column, Mapping):
+                add_many(column.get("runs"))
+    return runs
+
+
+def _agent_run_state_from_graph_run(run: Mapping[str, Any]) -> AgentRunState | None:
+    run_id = _run_text(run.get("run_id") or run.get("id"))
+    if not run_id:
+        return None
+    status = _run_text(run.get("status")).lower()
+    if status in _STOPPED_ACTIVE_RUN_STATUSES:
+        return None
+    metadata = run.get("metadata") if isinstance(run.get("metadata"), Mapping) else {}
+    assert isinstance(metadata, Mapping)
+    task_id = _run_text(
+        run.get("task_id")
+        or metadata.get("task_id")
+        or metadata.get("openclaw_task_id")
+        or run_id
+    )
+    agent_id = _run_text(
+        run.get("agent_id")
+        or metadata.get("agent_id")
+        or run.get("agent_name")
+        or run.get("provider")
+        or run_id
+    )
+    active_files = _tuple_field(
+        run.get("active_files")
+        or run.get("selected_paths")
+        or metadata.get("selected_paths")
+    )
+    active_symbols = _tuple_field(
+        run.get("active_symbols")
+        or run.get("selected_nodes")
+        or metadata.get("selected_nodes")
+    )
+    return AgentRunState(
+        agent_id=agent_id,
+        task_id=task_id,
+        run_id=run_id,
+        current_subtask=_run_text(
+            run.get("current_subtask")
+            or run.get("status_message")
+            or run.get("message")
+            or run.get("status")
+        ),
+        active_files=tuple(str(item) for item in active_files),
+        active_symbols=tuple(str(item) for item in active_symbols),
+        loaded_context_handles=tuple(
+            item
+            for item in _tuple_field(
+                run.get("loaded_context_handles")
+                or metadata.get("loaded_context_handles")
+                or run.get("context_handles")
+                or metadata.get("context_handles")
+            )
+            if isinstance(item, Mapping)
+        ),
+        estimated_tokens=_run_int(
+            run.get("estimated_tokens") or metadata.get("estimated_tokens")
+        ),
+        approach_history=tuple(
+            str(item)
+            for item in _tuple_field(
+                run.get("approach_history") or metadata.get("approach_history")
+            )
+        ),
+        last_action_at=(
+            run.get("last_action_at")
+            or run.get("updated_at")
+            or run.get("heartbeat_at")
+            or run.get("started_at")
+        ),
+    )
+
+
+def _tuple_field(value: Any) -> tuple[Any, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return (text,)
+        if isinstance(parsed, list):
+            return tuple(parsed)
+        return (text,)
+    if isinstance(value, Mapping):
+        return (dict(value),)
+    try:
+        return tuple(value)
+    except TypeError:
+        return (value,)
+
+
+def _run_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _run_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _logger_debug(logger: Any | None, message: str, *args: object) -> None:
+    debug = getattr(logger, "debug", None)
+    if debug is not None:
+        debug(message, *args)
 
 
 def setup_nats_runtime(
@@ -106,19 +306,23 @@ def setup_nats_runtime(
     identity: HostIdentity,
     *,
     nats_client: Any | None = None,
+    nats_transport_factory: NatsTransportFactory | None = None,
     graph_client: Any | None = None,
     outbox: Any | None = None,
     command_ref_verifier: Callable[[Mapping[str, Any]], bool] | None = None,
     logger: Any | None = None,
 ) -> HostDaemonNatsRuntime | None:
     logger = logger or get_logger()
-    nats_client = nats_client or create_configured_nats_client(config)
-    if nats_client is None:
-        return None
     try:
+        nats_client = nats_client or create_configured_nats_client(
+            config,
+            transport_factory=nats_transport_factory,
+        )
+        if nats_client is None:
+            return None
         if not getattr(nats_client, "connected", False):
             nats_client.connect()
-    except (NatsUnavailableError, RuntimeError, OSError) as exc:
+    except (NatsUnavailableError, RuntimeError, OSError, ValueError) as exc:
         logger.warning("OpenClaw NATS unavailable; continuing without NATS: %s", exc)
         return None
 
@@ -161,22 +365,37 @@ def run_daemon_loop(
     as_json: bool,
     probe_graph_server: bool = False,
     nats_client: Any | None = None,
+    nats_transport_factory: NatsTransportFactory | None = None,
     graph_client: Any | None = None,
     outbox: Any | None = None,
-    active_run_provider: ActiveRunProvider = empty_active_run_provider,
+    active_run_provider: ActiveRunProvider | None = None,
     command_ref_verifier: Callable[[Mapping[str, Any]], bool] | None = None,
+    logger: Any | None = None,
     sleep: Callable[[float], None] = time.sleep,
     max_iterations: int | None = None,
 ) -> None:
+    logger = logger or get_logger()
     identity = load_or_create_host_identity(config.host_identity_path)
     runtime = setup_nats_runtime(
         config,
         identity,
         nats_client=nats_client,
+        nats_transport_factory=nats_transport_factory,
         graph_client=graph_client,
         outbox=outbox,
         command_ref_verifier=command_ref_verifier,
+        logger=logger,
     )
+    if active_run_provider is None and runtime is not None:
+        provider_graph_client = graph_client
+        if provider_graph_client is None:
+            provider_graph_client = getattr(runtime.task_inbox, "graph_client", None)
+        active_run_provider = graph_server_active_run_provider(
+            provider_graph_client,
+            logger=logger,
+        )
+    if active_run_provider is None:
+        active_run_provider = empty_active_run_provider
     iterations = 0
     while True:
         run_once(
@@ -257,10 +476,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         if args.once:
-            run_once(
+            run_daemon_loop(
                 config,
                 as_json=bool(args.json),
                 probe_graph_server=bool(args.probe_graph_server),
+                sleep=lambda seconds: None,
+                max_iterations=1,
             )
             return 0
 

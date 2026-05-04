@@ -33,6 +33,21 @@ class FakeGraphServerState:
             "ok": True,
             "run": {"run_id": "local-run-1", "status": "queued"},
         }
+        self.agent_board_status = HTTPStatus.OK
+        self.agent_board_payload: dict[str, Any] = {
+            "kind": "code_index_agent_kanban",
+            "columns": {
+                "active": {
+                    "runs": [
+                        {
+                            "run_id": "local-run-1",
+                            "task_id": "task-1",
+                            "status": "working",
+                        }
+                    ]
+                }
+            },
+        }
         self.run_status_payloads: list[dict[str, Any]] = [
             {"run": {"run_id": "local-run-1", "status": "queued"}}
         ]
@@ -66,6 +81,12 @@ class FakeGraphServerHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/health":
             self._send_json(HTTPStatus.OK, {"ok": True})
+            return
+        if self.path == "/api/agent-board":
+            self._send_json(
+                self.state.agent_board_status,
+                self.state.agent_board_payload,
+            )
             return
         if self.path.startswith("/api/agent-runs/"):
             index = min(
@@ -279,6 +300,17 @@ def test_submit_task_posts_openclaw_task_payload_to_agent_runs() -> None:
             },
         }
     ]
+
+
+def test_agent_board_fetches_local_graph_server_active_runs() -> None:
+    with RunningFakeGraphServer() as fake:
+        result = GraphServerClient(fake.base_url).agent_board()
+
+    assert result.ok is True
+    assert result.payload["columns"]["active"]["runs"] == [
+        {"run_id": "local-run-1", "task_id": "task-1", "status": "working"}
+    ]
+    assert fake.state.requests == [{"method": "GET", "path": "/api/agent-board"}]
 
 
 def test_poll_run_status_fetches_until_stopped_status() -> None:

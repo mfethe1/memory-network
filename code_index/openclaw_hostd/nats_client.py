@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import inspect
 import json
 import re
+import threading
 from typing import Any, Protocol, runtime_checkable
+from urllib.parse import urlsplit
 
 
 AGENT_STATES_BUCKET = "openclaw_agent_states"
@@ -267,3 +271,173 @@ def _non_negative_int(value: Any) -> int:
 
 def _kv_key_part(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "unknown"
+
+
+class NatsPyTransport:
+    """Synchronous adapter around the optional nats-py async client."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        connect_timeout_seconds: float = 2.0,
+        operation_timeout_seconds: float = 5.0,
+    ) -> None:
+        self.url = _nats_url(url)
+        try:
+            import nats  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise NatsUnavailableError(
+                "OPENCLAW_HOSTD_NATS_URL is configured, but optional nats-py "
+                "package is not installed"
+            ) from exc
+        self._nats = nats
+        self._connect_timeout_seconds = max(0.1, float(connect_timeout_seconds))
+        self._operation_timeout_seconds = max(0.1, float(operation_timeout_seconds))
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._client: Any | None = None
+        self._subscriptions: list[Any] = []
+
+    def connect(self) -> None:
+        if self._client is not None:
+            return
+        self._start_loop()
+
+        async def _connect() -> None:
+            self._client = await self._nats.connect(
+                servers=[self.url],
+                connect_timeout=self._connect_timeout_seconds,
+            )
+
+        try:
+            self._run(_connect())
+        except Exception:
+            self.close()
+            raise
+
+    def publish(self, subject: str, payload: bytes) -> None:
+        client = self._require_client()
+
+        async def _publish() -> None:
+            await client.publish(subject, payload)
+            await client.flush()
+
+        self._run(_publish())
+
+    def subscribe(self, subject: str, callback: Callable[[Any], Any]) -> Any:
+        client = self._require_client()
+
+        async def _wrapped(message: Any) -> None:
+            result = callback(message)
+            if inspect.isawaitable(result):
+                await result
+
+        async def _subscribe() -> Any:
+            subscription = await client.subscribe(subject, cb=_wrapped)
+            self._subscriptions.append(subscription)
+            return subscription
+
+        return self._run(_subscribe())
+
+    def kv_put(
+        self,
+        bucket: str,
+        key: str,
+        payload: bytes,
+        *,
+        ttl_seconds: int | float | None = None,
+    ) -> Any:
+        client = self._require_client()
+
+        async def _kv_put() -> Any:
+            jetstream = client.jetstream()
+            try:
+                kv = await jetstream.key_value(bucket)
+            except Exception as exc:
+                if not _looks_like_not_found(exc):
+                    raise
+                try:
+                    from nats.js.api import KeyValueConfig  # type: ignore[import-not-found]
+                except ImportError as import_exc:
+                    raise NatsUnavailableError(
+                        "configured nats-py transport has no JetStream KV support"
+                    ) from import_exc
+                config_kwargs: dict[str, Any] = {"bucket": bucket}
+                if ttl_seconds is not None:
+                    config_kwargs["ttl"] = float(ttl_seconds)
+                kv = await jetstream.create_key_value(
+                    config=KeyValueConfig(**config_kwargs)
+                )
+            return await kv.put(key, payload)
+
+        return self._run(_kv_put())
+
+    def close(self) -> None:
+        client = self._client
+        if client is not None:
+
+            async def _close() -> None:
+                await client.drain()
+
+            try:
+                self._run(_close())
+            finally:
+                self._client = None
+        loop = self._loop
+        if loop is not None:
+            loop.call_soon_threadsafe(loop.stop)
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2)
+        self._loop = None
+        self._thread = None
+
+    def _start_loop(self) -> None:
+        if self._loop is not None:
+            return
+        loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _run_loop() -> None:
+            asyncio.set_event_loop(loop)
+            ready.set()
+            loop.run_forever()
+
+        thread = threading.Thread(
+            target=_run_loop,
+            name="openclaw-nats-client",
+            daemon=True,
+        )
+        thread.start()
+        ready.wait(timeout=2)
+        self._loop = loop
+        self._thread = thread
+
+    def _run(self, awaitable: Any) -> Any:
+        if self._loop is None:
+            raise NatsUnavailableError("NATS event loop is not running")
+        future = asyncio.run_coroutine_threadsafe(awaitable, self._loop)
+        return future.result(timeout=self._operation_timeout_seconds)
+
+    def _require_client(self) -> Any:
+        if self._client is None:
+            raise NatsUnavailableError("NATS transport is not connected")
+        return self._client
+
+
+def create_nats_transport(url: str) -> NatsPyTransport:
+    return NatsPyTransport(url)
+
+
+def _nats_url(value: str) -> str:
+    url = str(value or "").strip()
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"nats", "tls", "ws", "wss"} or not parsed.netloc:
+        raise ValueError("OPENCLAW_HOSTD_NATS_URL must be an absolute NATS URL")
+    return url
+
+
+def _looks_like_not_found(exc: Exception) -> bool:
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    return "notfound" in text or "not found" in text or "not_found" in text
