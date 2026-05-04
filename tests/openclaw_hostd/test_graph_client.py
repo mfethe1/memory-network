@@ -280,6 +280,7 @@ def test_submit_task_posts_openclaw_task_payload_to_agent_runs() -> None:
             message="Inspect selected files.",
             selected_paths=("code_index/openclaw_hostd/service.py", "tests/x.py"),
             provider="codex",
+            run_id="run-task-123",
         )
 
     assert result.ok is True
@@ -292,6 +293,7 @@ def test_submit_task_posts_openclaw_task_payload_to_agent_runs() -> None:
                 "task_id": "task-123",
                 "host_id": "host_0123456789abcdef0123456789abcdef",
                 "message": "Inspect selected files.",
+                "run_id": "run-task-123",
                 "selected_paths": [
                     "code_index/openclaw_hostd/service.py",
                     "tests/x.py",

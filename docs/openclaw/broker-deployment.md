@@ -103,6 +103,11 @@ Operational requirements:
 - Run NATS as a supervised service and stop it cleanly during planned restarts.
 - Do not let hosts create, update, or delete streams, consumers, or KV buckets.
 - Keep stream and KV creation in controller/admin deployment automation.
+- Create `openclaw_agent_states` with a bucket TTL equal to 3x the configured
+  host heartbeat interval. With the default 30 second heartbeat, that bucket TTL
+  is 90 seconds. Host daemons verify this bucket TTL before publishing agent
+  state and degrade NATS state publishing if the bucket is missing TTL or has
+  the wrong TTL.
 
 ## Restart Verification
 
@@ -139,7 +144,7 @@ nats --server $env:NATS_URL --creds $creds stream add OPENCLAW_RUN_EVENTS `
   --storage file --retention limits --ack
 
 nats --server $env:NATS_URL --creds $creds kv add openclaw_hosts --storage file
-nats --server $env:NATS_URL --creds $creds kv add openclaw_agent_states --storage file
+nats --server $env:NATS_URL --creds $creds kv add openclaw_agent_states --storage file --ttl 90s
 
 nats --server $env:NATS_URL --creds $creds pub openclaw.task.oclh_canary.assigned `
   '{"task_id":"canary-task"}'

@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 import sqlite3
 import threading
 from typing import Any, Iterator
@@ -102,24 +103,24 @@ class TaskInbox:
     def handle_task_assignment(self, raw_message: Mapping[str, Any]) -> TaskInboxResult:
         message = _normalise_task_assignment(raw_message, host_id=self.host_id)
         existing, should_submit = self._reserve_task_submission(message)
+        planned_run_id = str(existing.get("run_id") or "").strip()
         if not should_submit:
             if _recoverable_task_row(existing):
                 return TaskInboxResult(
                     task_id=message["task_id"],
-                    run_id="",
+                    run_id=planned_run_id,
                     status="processing",
                     duplicate=True,
                     ack_published=False,
                 )
-            run_id = str(existing["run_id"] or "")
             ack_published = self._publish_task_ack_once(
                 message,
-                run_id=run_id,
+                run_id=planned_run_id,
                 status="duplicate",
             )
             return TaskInboxResult(
                 task_id=message["task_id"],
-                run_id=run_id,
+                run_id=planned_run_id,
                 status="duplicate",
                 duplicate=True,
                 ack_published=ack_published,
@@ -135,6 +136,7 @@ class TaskInbox:
                 selected_nodes=message["selected_nodes"],
                 node=message.get("node"),
                 agent_name=message.get("agent_name"),
+                run_id=planned_run_id,
             )
             if not response.ok:
                 error = response.error or "graph-server task dispatch failed"
@@ -175,6 +177,7 @@ class TaskInbox:
         message: Mapping[str, Any],
     ) -> tuple[dict[str, Any], bool]:
         now = _now()
+        planned_run_id = _planned_run_id(self.host_id, message["task_id"])
         try:
             with self._transaction():
                 self.conn.execute(
@@ -182,12 +185,13 @@ class TaskInbox:
                     INSERT INTO openclaw_task_inbox (
                       task_id, message_id, delivery_id, run_id, status,
                       created_at, updated_at
-                    ) VALUES (?, ?, ?, '', 'processing', ?, ?)
+                    ) VALUES (?, ?, ?, ?, 'processing', ?, ?)
                     """,
                     (
                         message["task_id"],
                         message["message_id"],
                         message["delivery_id"],
+                        planned_run_id,
                         now,
                         now,
                     ),
@@ -202,10 +206,24 @@ class TaskInbox:
                     if message["task_id"] in self._inflight_task_ids:
                         return existing, False
                     self._inflight_task_ids.add(message["task_id"])
-                self._update_task_status(message["task_id"], status="processing")
-                return existing, True
+                self._update_task_status(
+                    message["task_id"],
+                    status="processing",
+                    run_id=str(existing.get("run_id") or "").strip()
+                    or planned_run_id,
+                )
+                refreshed = self._task_row(message["task_id"]) or existing
+                return refreshed, True
             return existing, False
-        return {}, True
+        return {
+            "task_id": message["task_id"],
+            "message_id": message["message_id"],
+            "delivery_id": message["delivery_id"],
+            "run_id": planned_run_id,
+            "status": "processing",
+            "created_at": now,
+            "updated_at": now,
+        }, True
 
     def _finalize_task(self, task_id: str, *, run_id: str, status: str) -> None:
         with self._transaction():
@@ -220,17 +238,35 @@ class TaskInbox:
                 (run_id, status, _now(), task_id),
             )
 
-    def _update_task_status(self, task_id: str, *, status: str) -> None:
+    def _update_task_status(
+        self,
+        task_id: str,
+        *,
+        status: str,
+        run_id: str | None = None,
+    ) -> None:
         with self._transaction():
-            self.conn.execute(
-                """
-                UPDATE openclaw_task_inbox
-                   SET status = ?,
-                       updated_at = ?
-                 WHERE task_id = ?
-                """,
-                (status, _now(), task_id),
-            )
+            if run_id:
+                self.conn.execute(
+                    """
+                    UPDATE openclaw_task_inbox
+                       SET status = ?,
+                           run_id = ?,
+                           updated_at = ?
+                     WHERE task_id = ?
+                    """,
+                    (status, run_id, _now(), task_id),
+                )
+            else:
+                self.conn.execute(
+                    """
+                    UPDATE openclaw_task_inbox
+                       SET status = ?,
+                           updated_at = ?
+                     WHERE task_id = ?
+                    """,
+                    (status, _now(), task_id),
+                )
 
     def _publish_task_ack_once(
         self,
@@ -623,9 +659,13 @@ def _configure_sqlite(conn: sqlite3.Connection) -> None:
 def _recoverable_task_row(row: Mapping[str, Any] | None) -> bool:
     if not row:
         return False
-    run_id = str(row.get("run_id") or "").strip()
     status = str(row.get("status") or "").strip().lower()
-    return not run_id and status in {"processing", "failed", "recoverable"}
+    return status in {"processing", "failed", "recoverable"}
+
+
+def _planned_run_id(_host_id: str, task_id: str) -> str:
+    task_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(task_id or "")).strip(".-")
+    return f"run-{task_part}" if task_part else "run-openclaw-task"
 
 
 def _run_id(payload: Mapping[str, Any]) -> str:

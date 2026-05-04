@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 import pytest
 
 from code_index.openclaw_hostd.nats_client import NatsClient
+from code_index.openclaw_hostd.nats_client import NatsPyTransport
 from code_index.openclaw_hostd.nats_client import NatsUnavailableError
 from code_index.openclaw_hostd.outbox import EventOutbox
 
@@ -41,6 +43,39 @@ class KvTransportWithoutTtlSupport(FakeNatsTransport):
         ttl_seconds: int | float | None = None,
     ) -> None:
         return None
+
+
+class InspectingKvTransport(FakeNatsTransport):
+    def __init__(self, *, bucket_ttl_seconds: int | float | None) -> None:
+        super().__init__()
+        self.bucket_ttl_seconds = bucket_ttl_seconds
+        self.ensure_calls: list[tuple[str, int | float]] = []
+        self.kv_entries: list[tuple[str, str, dict[str, Any], int | float | None]] = []
+
+    def ensure_kv_bucket_ttl(
+        self,
+        bucket: str,
+        *,
+        ttl_seconds: int | float,
+    ) -> None:
+        self.ensure_calls.append((bucket, ttl_seconds))
+        if self.bucket_ttl_seconds != ttl_seconds:
+            raise NatsUnavailableError(
+                f"KV bucket {bucket} TTL is {self.bucket_ttl_seconds}; "
+                f"expected {ttl_seconds}"
+            )
+
+    def kv_put(
+        self,
+        bucket: str,
+        key: str,
+        payload: bytes,
+        *,
+        ttl_seconds: int | float | None = None,
+    ) -> None:
+        self.kv_entries.append(
+            (bucket, key, json.loads(payload.decode("utf-8")), ttl_seconds)
+        )
 
 
 def test_outbox_persists_failed_events_and_drains_after_reconnect(
@@ -105,3 +140,46 @@ def test_nats_client_rejects_ttl_kv_write_without_explicit_ttl_support() -> None
             {"run_id": "run"},
             ttl_seconds=30,
         )
+
+
+def test_nats_client_accepts_ttl_kv_write_when_bucket_ttl_is_verified() -> None:
+    transport = InspectingKvTransport(bucket_ttl_seconds=30)
+    client = NatsClient(transport=transport)
+    client.connect()
+
+    client.kv_put(
+        "openclaw_agent_states",
+        "host.run",
+        {"run_id": "run"},
+        ttl_seconds=30,
+    )
+
+    assert transport.ensure_calls == [("openclaw_agent_states", 30)]
+    assert transport.kv_entries == [
+        ("openclaw_agent_states", "host.run", {"run_id": "run"}, 30)
+    ]
+
+
+def test_nats_client_rejects_ttl_kv_write_when_bucket_ttl_is_wrong() -> None:
+    transport = InspectingKvTransport(bucket_ttl_seconds=None)
+    client = NatsClient(transport=transport)
+    client.connect()
+
+    with pytest.raises(NatsUnavailableError, match="TTL"):
+        client.kv_put(
+            "openclaw_agent_states",
+            "host.run",
+            {"run_id": "run"},
+            ttl_seconds=30,
+        )
+
+    assert transport.kv_entries == []
+
+
+def test_nats_py_transport_does_not_advertise_per_entry_kv_ttl(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "nats", object())
+
+    transport = NatsPyTransport("nats://127.0.0.1:4222")
+
+    assert getattr(transport, "supports_kv_ttl", False) is False
+    assert callable(getattr(transport, "ensure_kv_bucket_ttl"))

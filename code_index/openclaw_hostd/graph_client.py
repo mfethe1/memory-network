@@ -101,6 +101,7 @@ class GraphServerClient:
         selected_nodes: Iterable[str] = (),
         node: dict[str, Any] | None = None,
         agent_name: str | None = None,
+        run_id: str | None = None,
     ) -> GraphServerResponse:
         payload: dict[str, Any] = {
             "task_id": str(task_id).strip(),
@@ -108,6 +109,9 @@ class GraphServerClient:
             "message": str(message).strip(),
             "selected_paths": _string_list(selected_paths),
         }
+        run_id_text = str(run_id or "").strip()
+        if run_id_text:
+            payload["run_id"] = run_id_text
         provider_text = str(provider or "").strip().lower()
         if provider_text:
             payload["provider"] = provider_text

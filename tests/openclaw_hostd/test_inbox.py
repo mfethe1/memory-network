@@ -53,7 +53,11 @@ class FakeGraphClient:
         return GraphServerResponse(
             ok=True,
             status_code=201,
-            payload={"run": {"run_id": f"run-{payload['task_id']}"}},
+            payload={
+                "run": {
+                    "run_id": payload.get("run_id") or f"run-{payload['task_id']}"
+                }
+            },
         )
 
 
@@ -98,7 +102,32 @@ class ReentrantGraphClient(FakeGraphClient):
         return GraphServerResponse(
             ok=True,
             status_code=201,
-            payload={"run": {"run_id": f"run-{payload['task_id']}"}},
+            payload={
+                "run": {
+                    "run_id": payload.get("run_id") or f"run-{payload['task_id']}"
+                }
+            },
+        )
+
+
+class CrashAfterAcceptGraphClient(FakeGraphClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.created_run_ids: list[str] = []
+        self.fail_first = True
+
+    def submit_task(self, **payload: Any) -> GraphServerResponse:
+        self.requests.append(dict(payload))
+        run_id = str(payload.get("run_id") or f"run-{payload['task_id']}")
+        if run_id not in self.created_run_ids:
+            self.created_run_ids.append(run_id)
+        if self.fail_first:
+            self.fail_first = False
+            raise RuntimeError("host crashed after graph-server accepted")
+        return GraphServerResponse(
+            ok=True,
+            status_code=200,
+            payload={"run": {"run_id": run_id, "duplicate": True}},
         )
 
 
@@ -247,6 +276,28 @@ def test_processing_task_without_run_id_is_recovered_after_crash(
     assert first_replay.run_id == "run-task-123"
     assert second_replay.status == "duplicate"
     assert [request["task_id"] for request in graph.requests] == ["task-123"]
+
+
+def test_crash_after_graph_accept_replay_uses_same_planned_run_id(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "inbox.db"
+    graph = CrashAfterAcceptGraphClient()
+    first = TaskInbox(db_path, host_id="host-a", graph_client=graph)
+    with pytest.raises(RuntimeError, match="host crashed"):
+        first.handle_task_assignment(_assignment())
+    first.close()
+    recovered = TaskInbox(db_path, host_id="host-a", graph_client=graph)
+
+    replay = recovered.handle_task_assignment(_assignment())
+
+    assert replay.status == "accepted"
+    assert replay.run_id == "run-task-123"
+    assert [request["run_id"] for request in graph.requests] == [
+        "run-task-123",
+        "run-task-123",
+    ]
+    assert graph.created_run_ids == ["run-task-123"]
 
 
 def test_task_ack_is_reserved_before_publish_so_reentrant_replay_does_not_ack_twice(

@@ -1023,7 +1023,8 @@ def _make_routes_class(
                     _json_bytes({"error": "message is required"}),
                 )
                 return
-            planned_run_id = secrets.token_hex(16)
+            supplied_run_id = str(payload.get("run_id") or "").strip()
+            planned_run_id = supplied_run_id or secrets.token_hex(16)
             swarm_config = (
                 request.get("swarm") if isinstance(request.get("swarm"), dict) else {}
             )
@@ -1035,6 +1036,37 @@ def _make_routes_class(
                 conn = db_mod.connect(config.db_path)
                 try:
                     db_mod.apply_schema(conn)
+                    if supplied_run_id:
+                        existing_run = agent_activity.get_run(conn, supplied_run_id)
+                        if existing_run is not None:
+                            activity = run_orchestrator.snapshot(conn, limit=80)
+                            board = activity.get("kanban") or agent_activity.kanban_board(
+                                conn,
+                                limit=25,
+                            )
+                            board["orchestrator"] = activity.get("orchestrator")
+                            self._send_bytes(
+                                HTTPStatus.OK,
+                                _json_bytes(
+                                    {
+                                        "ok": True,
+                                        "duplicate": True,
+                                        "run": existing_run,
+                                        "event": None,
+                                        "dispatch": {
+                                            "configured": False,
+                                            "status": "duplicate",
+                                            "idempotency_key": supplied_run_id,
+                                        },
+                                        "task": {
+                                            "kind": "code_index_agent_task",
+                                            "run_id": supplied_run_id,
+                                        },
+                                        "board": board,
+                                    }
+                                ),
+                            )
+                            return
                     request = scopes.apply_scope_to_request(
                         conn,
                         config.root,

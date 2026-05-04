@@ -85,14 +85,18 @@ class NatsClient:
         self._ensure_connected()
         bucket = _text(bucket, field_name="bucket")
         key = _text(key, field_name="key")
-        if ttl_seconds is not None and not getattr(
-            self._transport,
-            "supports_kv_ttl",
-            False,
-        ):
-            raise NatsUnavailableError(
-                "configured NATS transport does not explicitly support KV TTL"
+        if ttl_seconds is not None:
+            ensure_bucket_ttl = getattr(
+                self._transport,
+                "ensure_kv_bucket_ttl",
+                None,
             )
+            if ensure_bucket_ttl is not None:
+                ensure_bucket_ttl(bucket, ttl_seconds=ttl_seconds)
+            elif not getattr(self._transport, "supports_kv_ttl", False):
+                raise NatsUnavailableError(
+                    "configured NATS transport does not explicitly support KV TTL"
+                )
         kv_put = getattr(self._transport, "kv_put", None)
         if kv_put is not None:
             return kv_put(
@@ -306,7 +310,6 @@ class NatsPyTransport:
         self._thread: threading.Thread | None = None
         self._client: Any | None = None
         self._subscriptions: list[Any] = []
-        self.supports_kv_ttl = True
 
     def connect(self) -> None:
         if self._client is not None:
@@ -361,26 +364,34 @@ class NatsPyTransport:
 
         async def _kv_put() -> Any:
             jetstream = client.jetstream()
-            try:
-                kv = await jetstream.key_value(bucket)
-            except Exception as exc:
-                if not _looks_like_not_found(exc):
-                    raise
-                try:
-                    from nats.js.api import KeyValueConfig  # type: ignore[import-not-found]
-                except ImportError as import_exc:
-                    raise NatsUnavailableError(
-                        "configured nats-py transport has no JetStream KV support"
-                    ) from import_exc
-                config_kwargs: dict[str, Any] = {"bucket": bucket}
-                if ttl_seconds is not None:
-                    config_kwargs["ttl"] = float(ttl_seconds)
-                kv = await jetstream.create_key_value(
-                    config=KeyValueConfig(**config_kwargs)
+            if ttl_seconds is None:
+                kv = await self._kv_bucket(jetstream, bucket, ttl_seconds=None)
+            else:
+                kv = await self._ensure_kv_bucket_ttl(
+                    jetstream,
+                    bucket,
+                    ttl_seconds=float(ttl_seconds),
                 )
             return await kv.put(key, payload)
 
         return self._run(_kv_put())
+
+    def ensure_kv_bucket_ttl(
+        self,
+        bucket: str,
+        *,
+        ttl_seconds: int | float,
+    ) -> None:
+        client = self._require_client()
+
+        async def _ensure() -> None:
+            await self._ensure_kv_bucket_ttl(
+                client.jetstream(),
+                bucket,
+                ttl_seconds=float(ttl_seconds),
+            )
+
+        self._run(_ensure())
 
     def close(self) -> None:
         client = self._client
@@ -434,6 +445,56 @@ class NatsPyTransport:
             raise NatsUnavailableError("NATS transport is not connected")
         return self._client
 
+    async def _kv_bucket(
+        self,
+        jetstream: Any,
+        bucket: str,
+        *,
+        ttl_seconds: float | None,
+    ) -> Any:
+        try:
+            return await jetstream.key_value(bucket)
+        except Exception as exc:
+            if not _looks_like_not_found(exc):
+                raise
+            try:
+                from nats.js.api import KeyValueConfig  # type: ignore[import-not-found]
+            except ImportError as import_exc:
+                raise NatsUnavailableError(
+                    "configured nats-py transport has no JetStream KV support"
+                ) from import_exc
+            config_kwargs: dict[str, Any] = {"bucket": bucket}
+            if ttl_seconds is not None:
+                config_kwargs["ttl"] = ttl_seconds
+            return await jetstream.create_key_value(
+                config=KeyValueConfig(**config_kwargs)
+            )
+
+    async def _ensure_kv_bucket_ttl(
+        self,
+        jetstream: Any,
+        bucket: str,
+        *,
+        ttl_seconds: float,
+    ) -> Any:
+        kv = await self._kv_bucket(
+            jetstream,
+            bucket,
+            ttl_seconds=ttl_seconds,
+        )
+        actual_ttl = await _kv_bucket_ttl_seconds(kv)
+        if actual_ttl is None:
+            raise NatsUnavailableError(
+                f"NATS KV bucket {bucket} TTL could not be verified; "
+                f"expected {ttl_seconds:g} seconds"
+            )
+        if abs(actual_ttl - ttl_seconds) > 0.001:
+            raise NatsUnavailableError(
+                f"NATS KV bucket {bucket} TTL is {actual_ttl:g} seconds; "
+                f"expected {ttl_seconds:g} seconds"
+            )
+        return kv
+
 
 def create_nats_transport(url: str) -> NatsPyTransport:
     return NatsPyTransport(url)
@@ -450,3 +511,62 @@ def _nats_url(value: str) -> str:
 def _looks_like_not_found(exc: Exception) -> bool:
     text = f"{exc.__class__.__name__} {exc}".lower()
     return "notfound" in text or "not found" in text or "not_found" in text
+
+
+async def _kv_bucket_ttl_seconds(kv: Any) -> float | None:
+    status = await _kv_status(kv)
+    if status is None:
+        return None
+    for source in (status, getattr(status, "config", None)):
+        ttl = _ttl_seconds_from_object(source)
+        if ttl is not None:
+            return ttl
+    if isinstance(status, Mapping):
+        config = status.get("config")
+        for source in (status, config):
+            ttl = _ttl_seconds_from_object(source)
+            if ttl is not None:
+                return ttl
+    return None
+
+
+async def _kv_status(kv: Any) -> Any | None:
+    status = getattr(kv, "status", None)
+    if status is None:
+        return None
+    value = status()
+    if inspect.isawaitable(value):
+        value = await value
+    return value
+
+
+def _ttl_seconds_from_object(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        candidates = (value.get("ttl"), value.get("max_age"))
+    else:
+        candidates = (
+            getattr(value, "ttl", None),
+            getattr(value, "max_age", None),
+        )
+    for candidate in candidates:
+        ttl = _duration_seconds(candidate)
+        if ttl is not None:
+            return ttl
+    return None
+
+
+def _duration_seconds(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+        return seconds if seconds > 0 else None
+    total_seconds = getattr(value, "total_seconds", None)
+    if callable(total_seconds):
+        seconds = float(total_seconds())
+        return seconds if seconds > 0 else None
+    return None
