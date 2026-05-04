@@ -69,6 +69,13 @@ def test_redact_url_fails_closed_for_missing_scheme_query_secret() -> None:
     assert redact_url("127.0.0.1:8767/health?token=super-secret") == REDACTED
 
 
+def test_redact_url_strips_path_embedded_secret_from_absolute_url() -> None:
+    assert (
+        redact_url("http://127.0.0.1/secret/super-secret?token=x")
+        == "http://127.0.0.1"
+    )
+
+
 def test_cli_once_json_redacts_graph_server_url_secret(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

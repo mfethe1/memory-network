@@ -43,7 +43,7 @@ def redact_url(value: str | None) -> str | None:
     redacted = SplitResult(
         scheme=parts.scheme,
         netloc=netloc,
-        path=parts.path,
+        path="",
         query="",
         fragment="",
     )
