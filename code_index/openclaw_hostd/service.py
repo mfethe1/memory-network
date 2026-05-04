@@ -6,6 +6,8 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Iterable, Mapping
+from typing import Any
 from typing import Sequence
 
 from code_index.openclaw_hostd.config import HostDaemonConfig, load_config
@@ -13,6 +15,8 @@ from code_index.openclaw_hostd.graph_client import GraphServerClient
 from code_index.openclaw_hostd.heartbeat import build_heartbeat_payload
 from code_index.openclaw_hostd.identity import load_or_create_host_identity
 from code_index.openclaw_hostd.logging import get_logger, redact_mapping
+from code_index.openclaw_hostd.nats_client import AgentRunState
+from code_index.openclaw_hostd.nats_client import publish_agent_state_entries
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -76,6 +80,8 @@ def run_once(
     *,
     as_json: bool,
     probe_graph_server: bool = False,
+    nats_client: Any | None = None,
+    active_agent_runs: Iterable[AgentRunState | Mapping[str, Any]] = (),
 ) -> dict[str, object]:
     identity = load_or_create_host_identity(config.host_identity_path)
     graph_server_probe = None
@@ -90,6 +96,13 @@ def run_once(
         graph_server_probe=graph_server_probe,
         probe_graph_server=probe_graph_server,
     )
+    if nats_client is not None:
+        publish_agent_state_entries(
+            nats_client,
+            host_id=identity.host_id,
+            active_agent_runs=active_agent_runs,
+            heartbeat_interval_seconds=config.heartbeat_interval_seconds,
+        )
     _emit_payload(payload, as_json=as_json)
     return payload
 
