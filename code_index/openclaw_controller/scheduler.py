@@ -127,6 +127,14 @@ class FleetController:
     ) -> AssignmentResult:
         timestamp = _utc(now)
         message_id = _optional_text(command_ref.get("message_id"))
+        consumed = self._consumed_command_ref(command_ref)
+        if consumed is not None:
+            return self._assignment_rejected(
+                reason="command_ref_consumed",
+                message="command reference has already been consumed",
+                message_id=message_id,
+                details=consumed,
+            )
         if not self.messaging_store.verify_command_ref(command_ref):
             return self._assignment_rejected(
                 reason="invalid_command_ref",
@@ -159,7 +167,11 @@ class FleetController:
                 message_id=stored_command["message_id"],
             )
 
-        selected_host, rejection = self._select_host(details, now=timestamp)
+        selected_host, rejection = self._select_host(
+            details,
+            message_id=stored_command["message_id"],
+            now=timestamp,
+        )
         if selected_host is None:
             return self._assignment_rejected(
                 reason=rejection.reason,
@@ -189,6 +201,7 @@ class FleetController:
             details.task_id,
             now=timestamp,
         )
+        repo_lease = None
         try:
             repo_lease = self.lease_store.acquire_lease(
                 "repo",
@@ -205,6 +218,14 @@ class FleetController:
                 now=timestamp,
             )
         except LeaseConflictError as exc:
+            if repo_lease is not None and existing_repo_lease is None:
+                self._release_lease_quietly(
+                    "repo",
+                    repo_lease.resource_id,
+                    owner_host_id=selected_host.host_id,
+                    fencing_revision=repo_lease.fencing_revision,
+                    now=timestamp,
+                )
             return self._assignment_rejected(
                 reason=(
                     "repo_lease_conflict"
@@ -239,6 +260,10 @@ class FleetController:
                 message_id=stored_command["message_id"],
             )
 
+        self.messaging_store.mark_command_ref_status(
+            stored_command["command_id"],
+            status="assigned",
+        )
         assignment = TaskAssignment(
             task_id=details.task_id,
             host_id=selected_host.host_id,
@@ -281,6 +306,14 @@ class FleetController:
             run_id = _required_text(proposal.get("run_id"), "run_id")
             repo_root = _required_text(proposal.get("repo_root"), "repo_root")
             provider = _required_text(proposal.get("provider"), "provider")
+            required_provider_capabilities = _first_string_tuple(
+                proposal,
+                (
+                    "required_provider_capabilities",
+                    "provider_capabilities",
+                    "required_capabilities",
+                ),
+            )
         except ValueError as exc:
             return self._handoff_rejected(
                 reason="invalid_handoff_proposal",
@@ -323,6 +356,7 @@ class FleetController:
             host,
             repo_root=repo_root,
             provider=provider,
+            required_provider_capabilities=required_provider_capabilities,
             now=timestamp,
         ):
             return self._handoff_rejected(
@@ -355,6 +389,7 @@ class FleetController:
             "run_id": run_id,
             "repo_root": repo_root,
             "provider": provider,
+            "required_provider_capabilities": list(required_provider_capabilities),
             "authorized_at": timestamp.isoformat(),
             "repo_lease_id": repo_lease.lease_id,
             "task_lease_id": task_lease.lease_id,
@@ -448,11 +483,17 @@ class FleetController:
         self,
         details: AssignmentDetails,
         *,
+        message_id: str,
         now: datetime,
     ) -> tuple[HostInventoryRecord | None, Rejection]:
         failures: list[dict[str, str]] = []
         for host in sorted(self._hosts.values(), key=lambda item: item.host_id):
-            reason = self._host_rejection_reason(host, details, now=now)
+            reason = self._host_rejection_reason(
+                host,
+                details,
+                message_id=message_id,
+                now=now,
+            )
             if reason is not None:
                 failures.append({"host_id": host.host_id, "reason": reason})
                 continue
@@ -474,6 +515,7 @@ class FleetController:
         host: HostInventoryRecord,
         details: AssignmentDetails,
         *,
+        message_id: str | None = None,
         now: datetime,
     ) -> str | None:
         if host.health_at(now) != HOST_HEALTHY:
@@ -487,6 +529,11 @@ class FleetController:
             details.required_provider_capabilities,
         ):
             return "provider_capability_missing"
+        if message_id is not None and self._host_delivery(
+            message_id,
+            host_id=host.host_id,
+        ) is None:
+            return "delivery_missing"
         repo_lease = self.lease_store.get_active_lease(
             "repo",
             details.repo_root,
@@ -598,6 +645,41 @@ class FleetController:
                 fencing_revision=repo_lease.fencing_revision,
                 now=now,
             )
+
+    def _release_lease_quietly(
+        self,
+        scope: str,
+        resource_id: str,
+        *,
+        owner_host_id: str,
+        fencing_revision: int,
+        now: datetime,
+    ) -> None:
+        try:
+            self.lease_store.release_lease(
+                scope,
+                resource_id,
+                owner_host_id=owner_host_id,
+                fencing_revision=fencing_revision,
+                now=now,
+            )
+        except Exception:
+            return
+
+    def _consumed_command_ref(
+        self,
+        command_ref: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        message_id = _optional_text(command_ref.get("message_id"))
+        command_id = _optional_text(command_ref.get("command_id"))
+        if message_id is None or command_id is None:
+            return None
+        stored = self.messaging_store.get_command_ref_for_message(message_id)
+        if stored is None or stored["command_id"] != command_id:
+            return None
+        if stored["status"] in {"assigned", "rejected", "cancelled"}:
+            return {"command_id": command_id, "status": stored["status"]}
+        return None
 
     def _assignment_rejected(
         self,

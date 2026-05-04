@@ -36,7 +36,12 @@ class OpenClawControllerApp:
         if _is_fleet_path(path):
             if self.fleet_controller is None:
                 return ApiResponse(404, {"error": "fleet controller is not configured"})
-            return FleetRouter(self.fleet_controller).handle(method, path, body)
+            return FleetRouter(self.fleet_controller).handle(
+                method,
+                path,
+                body,
+                principal=principal,
+            )
         return self.router.handle(
             method,
             path,
@@ -84,6 +89,7 @@ class FleetRouter:
         method: str,
         path: str,
         body: Mapping[str, Any] | None = None,
+        principal: Principal | None = None,
     ) -> ApiResponse:
         method = method.upper()
         parts = [
@@ -101,18 +107,43 @@ class FleetRouter:
                     {"hosts": self.controller.project_fleet()["hosts"]},
                 )
             if method == "POST" and parts == ["fleet", "hosts", "heartbeat"]:
+                if not _principal_has_scope(
+                    principal,
+                    {"fleet:ingest", "host:ingest"},
+                ):
+                    return _forbidden()
                 host = self.controller.record_host_heartbeat(_object(payload))
                 return ApiResponse(200, {"host": host})
             if method == "POST" and parts == ["fleet", "agent-states"]:
+                if not _principal_has_scope(
+                    principal,
+                    {"fleet:ingest", "host:ingest"},
+                ):
+                    return _forbidden()
                 state = self.controller.record_agent_state(_object(payload))
                 return ApiResponse(200, {"agent_state": state})
             if method == "POST" and parts == ["fleet", "run-events"]:
+                if not _principal_has_scope(
+                    principal,
+                    {"fleet:ingest", "host:ingest"},
+                ):
+                    return _forbidden()
                 event = self.controller.record_run_event(_object(payload))
                 return ApiResponse(200, {"run_event": event})
             if method == "POST" and parts == ["fleet", "context", "health"]:
+                if not _principal_has_scope(
+                    principal,
+                    {"fleet:ingest", "context:write"},
+                ):
+                    return _forbidden()
                 health = self.controller.record_context_health(_object(payload))
                 return ApiResponse(200, {"context_health": health})
             if method == "POST" and parts == ["fleet", "tasks"]:
+                if not _principal_has_scope(
+                    principal,
+                    {"command:write", "controller:write", "fleet:assign"},
+                ):
+                    return _forbidden()
                 command_ref = payload.get("command_ref")
                 if not isinstance(command_ref, Mapping):
                     return ApiResponse(
@@ -122,6 +153,11 @@ class FleetRouter:
                 result = self.controller.assign_task_from_command_ref(command_ref)
                 return ApiResponse(_assignment_status_code(result), result.to_dict())
             if method == "POST" and parts == ["fleet", "handoffs"]:
+                if not _principal_has_scope(
+                    principal,
+                    {"fleet:handoff", "context:handoff"},
+                ):
+                    return _forbidden()
                 result = self.controller.submit_handoff_proposal(_object(payload))
                 return ApiResponse(_handoff_status_code(result), result.to_dict())
         except KeyError as exc:
@@ -190,6 +226,19 @@ def _object(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
     raise ValueError("expected object")
+
+
+def _principal_has_scope(
+    principal: Principal | None,
+    allowed_scopes: set[str],
+) -> bool:
+    if principal is None:
+        return False
+    return bool(set(principal.scopes) & allowed_scopes)
+
+
+def _forbidden() -> ApiResponse:
+    return ApiResponse(403, {"error": "fleet write requires trusted principal scope"})
 
 
 def _assignment_status_code(result: Any) -> int:

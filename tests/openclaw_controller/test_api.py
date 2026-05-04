@@ -1,16 +1,34 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from code_index.openclaw_controller.app import create_app
+from code_index.openclaw_hostd import service
+from code_index.openclaw_hostd.config import HostDaemonConfig
+from code_index.openclaw_hostd.graph_client import GraphServerResponse
+from code_index.openclaw_hostd.identity import HostIdentity
 from code_index.openclaw_hostd.leases import InMemoryFleetLeaseStore
+from code_index.openclaw_hostd.nats_client import NatsClient
 from code_index.openclaw_messaging.routes import Principal
 
 
 SIGNING_SECRET = "test-secret"
 NOW = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+INGEST_PRINCIPAL = Principal(
+    principal_id="host-a",
+    scopes=frozenset({"fleet:ingest"}),
+)
+ASSIGN_PRINCIPAL = Principal(
+    principal_id="controller",
+    scopes=frozenset({"command:write"}),
+)
+HANDOFF_PRINCIPAL = Principal(
+    principal_id="context-manager",
+    scopes=frozenset({"fleet:handoff"}),
+)
 
 
 class FakeNats:
@@ -19,6 +37,50 @@ class FakeNats:
 
     def publish(self, subject: str, payload: dict[str, Any]) -> None:
         self.published.append((subject, dict(payload)))
+
+
+class BridgedNatsTransport:
+    def __init__(self) -> None:
+        self.connected = False
+        self.subscriptions: dict[str, Any] = {}
+        self.published: list[tuple[str, dict[str, Any]]] = []
+
+    def connect(self) -> None:
+        self.connected = True
+
+    def subscribe(self, subject: str, callback: Any) -> None:
+        self.subscriptions[subject] = callback
+
+    def publish(self, subject: str, payload: bytes) -> None:
+        decoded = json.loads(payload.decode("utf-8"))
+        self.published.append((subject, decoded))
+        parts = subject.split(".")
+        if (
+            len(parts) == 4
+            and parts[0] == "openclaw"
+            and parts[1] == "task"
+            and parts[3] == "assigned"
+        ):
+            delivery_subject = f"openclaw.deliver.{parts[2]}.tasks"
+            callback = self.subscriptions.get(delivery_subject)
+            if callback is not None:
+                callback(decoded)
+
+    def close(self) -> None:
+        self.connected = False
+
+
+class FakeGraphClient:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, Any]] = []
+
+    def submit_task(self, **payload: Any) -> GraphServerResponse:
+        self.requests.append(dict(payload))
+        return GraphServerResponse(
+            ok=True,
+            status_code=201,
+            payload={"run": {"run_id": payload["run_id"]}},
+        )
 
 
 def _heartbeat(host_id: str = "host-a") -> dict[str, Any]:
@@ -88,7 +150,12 @@ def test_fleet_task_route_assigns_eligible_host_and_preserves_messaging_routes(
         nats_client=nats,
     )
     try:
-        heartbeat = app.handle_request("POST", "/fleet/hosts/heartbeat", _heartbeat())
+        heartbeat = app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            _heartbeat(),
+            principal=INGEST_PRINCIPAL,
+        )
         command_ref = _command_ref(app)
 
         assigned = app.handle_request(
@@ -98,6 +165,7 @@ def test_fleet_task_route_assigns_eligible_host_and_preserves_messaging_routes(
                 "command_ref": command_ref,
                 "provider": "malicious-body-value",
             },
+            principal=ASSIGN_PRINCIPAL,
         )
         rooms = app.handle_request("GET", "/rooms")
 
@@ -132,13 +200,19 @@ def test_fleet_task_route_returns_rejected_assignment_shape_for_repo_lease_confl
         nats_client=FakeNats(),
     )
     try:
-        app.handle_request("POST", "/fleet/hosts/heartbeat", _heartbeat())
+        app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            _heartbeat(),
+            principal=INGEST_PRINCIPAL,
+        )
         command_ref = _command_ref(app)
 
         rejected = app.handle_request(
             "POST",
             "/fleet/tasks",
             {"command_ref": command_ref},
+            principal=ASSIGN_PRINCIPAL,
         )
 
         assert rejected.status_code == 409
@@ -158,18 +232,209 @@ def test_fleet_route_rejects_invalid_command_reference(tmp_path: Path) -> None:
         nats_client=FakeNats(),
     )
     try:
-        app.handle_request("POST", "/fleet/hosts/heartbeat", _heartbeat())
+        app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            _heartbeat(),
+            principal=INGEST_PRINCIPAL,
+        )
 
         rejected = app.handle_request(
             "POST",
             "/fleet/tasks",
             {"command_ref": {"command_id": "cmd-unsigned"}},
+            principal=ASSIGN_PRINCIPAL,
         )
 
         assert rejected.status_code == 403
         assert rejected.body["status"] == "rejected"
         assert rejected.body["rejection"]["reason"] == "invalid_command_ref"
     finally:
+        app.close()
+
+
+def test_fleet_write_routes_reject_untrusted_or_missing_principal(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        tmp_path / "messages.db",
+        signing_secret=SIGNING_SECRET,
+        lease_store=InMemoryFleetLeaseStore(),
+        nats_client=FakeNats(),
+    )
+    try:
+        heartbeat_body = {
+            **_heartbeat(),
+            "principal": {
+                "principal_id": "host-a",
+                "scopes": ["fleet:ingest"],
+            },
+        }
+
+        unauthenticated_heartbeat = app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            heartbeat_body,
+        )
+        wrong_scope_heartbeat = app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            _heartbeat(),
+            principal=ASSIGN_PRINCIPAL,
+        )
+
+        assert unauthenticated_heartbeat.status_code == 403
+        assert wrong_scope_heartbeat.status_code == 403
+    finally:
+        app.close()
+
+
+def test_fleet_task_assignment_requires_trusted_assignment_scope(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        tmp_path / "messages.db",
+        signing_secret=SIGNING_SECRET,
+        lease_store=InMemoryFleetLeaseStore(),
+        nats_client=FakeNats(),
+    )
+    try:
+        app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            _heartbeat(),
+            principal=INGEST_PRINCIPAL,
+        )
+        command_ref = _command_ref(app)
+
+        unauthenticated = app.handle_request(
+            "POST",
+            "/fleet/tasks",
+            {
+                "command_ref": command_ref,
+                "principal": {
+                    "principal_id": "controller",
+                    "scopes": ["command:write"],
+                },
+            },
+        )
+        wrong_scope = app.handle_request(
+            "POST",
+            "/fleet/tasks",
+            {"command_ref": command_ref},
+            principal=INGEST_PRINCIPAL,
+        )
+
+        assert unauthenticated.status_code == 403
+        assert wrong_scope.status_code == 403
+    finally:
+        app.close()
+
+
+def test_handoff_route_requires_handoff_scope(tmp_path: Path) -> None:
+    leases = InMemoryFleetLeaseStore()
+    leases.acquire_lease(
+        "repo",
+        r"E:\Projects\repo-a",
+        owner_host_id="host-a",
+        ttl_seconds=None,
+        now=NOW,
+    )
+    leases.acquire_lease(
+        "task",
+        "task-123",
+        owner_host_id="host-a",
+        owner_run_id="run-123",
+        ttl_seconds=None,
+        now=NOW,
+    )
+    app = create_app(
+        tmp_path / "messages.db",
+        signing_secret=SIGNING_SECRET,
+        lease_store=leases,
+        nats_client=FakeNats(),
+    )
+    try:
+        app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            _heartbeat(),
+            principal=INGEST_PRINCIPAL,
+        )
+        body = {
+            "handoff_id": "handoff-1",
+            "host_id": "host-a",
+            "task_id": "task-123",
+            "run_id": "run-123",
+            "repo_root": r"E:\Projects\repo-a",
+            "provider": "codex",
+        }
+
+        unauthenticated = app.handle_request("POST", "/fleet/handoffs", body)
+        wrong_scope = app.handle_request(
+            "POST",
+            "/fleet/handoffs",
+            body,
+            principal=ASSIGN_PRINCIPAL,
+        )
+
+        assert unauthenticated.status_code == 403
+        assert wrong_scope.status_code == 403
+    finally:
+        app.close()
+
+
+def test_controller_assignment_reaches_hostd_task_inbox_through_broker_bridge(
+    tmp_path: Path,
+) -> None:
+    transport = BridgedNatsTransport()
+    nats = NatsClient(transport=transport)
+    leases = InMemoryFleetLeaseStore()
+    graph = FakeGraphClient()
+    config = HostDaemonConfig(
+        state_dir=tmp_path / "host-state",
+        host_identity_path=tmp_path / "host-state" / "host-id.json",
+        repo_roots=(tmp_path,),
+        graph_server_url="http://127.0.0.1:8767",
+    )
+    runtime = service.setup_nats_runtime(
+        config,
+        HostIdentity(host_id="host-a"),
+        nats_client=nats,
+        graph_client=graph,
+        lease_store=leases,
+    )
+    assert runtime is not None
+    app = create_app(
+        tmp_path / "messages.db",
+        signing_secret=SIGNING_SECRET,
+        lease_store=leases,
+        nats_client=nats,
+    )
+    try:
+        app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            _heartbeat(),
+            principal=INGEST_PRINCIPAL,
+        )
+        command_ref = _command_ref(app)
+
+        response = app.handle_request(
+            "POST",
+            "/fleet/tasks",
+            {"command_ref": command_ref},
+            principal=ASSIGN_PRINCIPAL,
+        )
+
+        assert response.status_code == 202
+        assert [subject for subject, _ in transport.published] == [
+            "openclaw.task.host-a.assigned",
+            "openclaw.task.host-a.ack",
+        ]
+        assert [request["task_id"] for request in graph.requests] == ["task-123"]
+    finally:
+        runtime.close()
         app.close()
 
 
@@ -199,7 +464,12 @@ def test_fleet_projection_exposes_context_health_and_handoff_state(
         nats_client=FakeNats(),
     )
     try:
-        app.handle_request("POST", "/fleet/hosts/heartbeat", _heartbeat())
+        app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            _heartbeat(),
+            principal=INGEST_PRINCIPAL,
+        )
         app.handle_request(
             "POST",
             "/fleet/context/health",
@@ -210,6 +480,7 @@ def test_fleet_projection_exposes_context_health_and_handoff_state(
                 "health": "warning",
                 "estimated_tokens": 76000,
             },
+            principal=INGEST_PRINCIPAL,
         )
         handoff = app.handle_request(
             "POST",
@@ -223,6 +494,7 @@ def test_fleet_projection_exposes_context_health_and_handoff_state(
                 "provider": "codex",
                 "reason": "context pressure",
             },
+            principal=HANDOFF_PRINCIPAL,
         )
         projection = app.handle_request("GET", "/fleet")
 

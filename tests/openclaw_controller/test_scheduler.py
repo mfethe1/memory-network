@@ -7,6 +7,7 @@ from typing import Any
 
 from code_index.openclaw_controller.scheduler import FleetController
 from code_index.openclaw_hostd.leases import InMemoryFleetLeaseStore
+from code_index.openclaw_hostd.leases import LeaseConflictError
 from code_index.openclaw_messaging.store import MessagingStore
 
 
@@ -20,6 +21,18 @@ class FakeNats:
 
     def publish(self, subject: str, payload: dict[str, Any]) -> None:
         self.published.append((subject, dict(payload)))
+
+
+class RaceLeaseStore(InMemoryFleetLeaseStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_task_acquire = True
+
+    def acquire_lease(self, scope: str, resource_id: str, **kwargs: Any) -> Any:
+        if scope == "task" and self.fail_task_acquire:
+            self.fail_task_acquire = False
+            raise LeaseConflictError("task lease conflict for raced task")
+        return super().acquire_lease(scope, resource_id, **kwargs)
 
 
 def _store(tmp_path: Path) -> MessagingStore:
@@ -117,6 +130,7 @@ def _command(
     provider: str = "codex",
     required_provider_capabilities: list[str] | None = None,
     expires_at: str | None = None,
+    recipients: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     assignment = {
         "repo_root": repo_root,
@@ -131,9 +145,9 @@ def _command(
         display_name=f"Task {task_id}",
         task_id=task_id,
         metadata={
-            "default_delivery_targets": [
-                {"recipient_kind": "host", "recipient_id": host_id}
-            ],
+            "default_delivery_targets": recipients
+            if recipients is not None
+            else [{"recipient_kind": "host", "recipient_id": host_id}],
             "assignment": assignment,
         },
     )
@@ -220,6 +234,51 @@ def test_controller_refuses_assignment_when_repo_lease_is_held_elsewhere(
         store.close()
 
 
+def test_repo_lease_is_released_when_task_lease_acquisition_races(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        leases = RaceLeaseStore()
+        controller, nats, _leases = _controller(store, lease_store=leases)
+        _host(controller, "host-a")
+        command_ref = _command(store)
+
+        result = controller.assign_task_from_command_ref(command_ref, now=NOW)
+
+        assert result.status == "rejected"
+        assert result.rejection is not None
+        assert result.rejection.reason == "task_lease_conflict"
+        assert leases.get_active_lease("repo", r"E:\Projects\repo-a", now=NOW) is None
+        assert nats.published == []
+    finally:
+        store.close()
+
+
+def test_host_selection_skips_eligible_host_without_delivery_record(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        controller, nats, _leases = _controller(store)
+        _host(controller, "host-a")
+        _host(controller, "host-b")
+        command_ref = _command(
+            store,
+            host_id="host-b",
+            recipients=[{"recipient_kind": "host", "recipient_id": "host-b"}],
+        )
+
+        result = controller.assign_task_from_command_ref(command_ref, now=NOW)
+
+        assert result.status == "assigned"
+        assert result.assignment is not None
+        assert result.assignment.host_id == "host-b"
+        assert nats.published[0][0] == "openclaw.task.host-b.assigned"
+    finally:
+        store.close()
+
+
 def test_required_provider_capabilities_skip_same_provider_host_without_capability(
     tmp_path: Path,
 ) -> None:
@@ -279,6 +338,32 @@ def test_assignment_rejects_when_provider_id_matches_but_capability_is_missing(
             ]
         }
         assert nats.published == []
+    finally:
+        store.close()
+
+
+def test_successful_assignment_consumes_command_ref_and_replay_is_rejected(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        controller, nats, _leases = _controller(store)
+        _host(controller, "host-a")
+        command_ref = _command(store)
+
+        assigned = controller.assign_task_from_command_ref(command_ref, now=NOW)
+        replay = controller.assign_task_from_command_ref(command_ref, now=NOW)
+
+        stored = store.get_command_ref_for_message(command_ref["message_id"])
+        assert assigned.status == "assigned"
+        assert stored is not None
+        assert stored["status"] == "assigned"
+        assert replay.status == "rejected"
+        assert replay.rejection is not None
+        assert replay.rejection.reason == "command_ref_consumed"
+        assert [subject for subject, _payload in nats.published] == [
+            "openclaw.task.host-a.assigned"
+        ]
     finally:
         store.close()
 
@@ -483,5 +568,85 @@ def test_handoff_restart_requires_valid_leases_and_restart_cooldown(
         assert invalid_after_release.status == "rejected"
         assert invalid_after_release.rejection is not None
         assert invalid_after_release.rejection.reason == "lease_invalid"
+    finally:
+        store.close()
+
+
+def test_handoff_restart_requires_provider_capabilities(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    try:
+        controller, _nats, leases = _controller(store)
+        _host_with_capabilities(
+            controller,
+            "host-a",
+            capabilities=["task_run"],
+        )
+        proposal = {
+            "handoff_id": "handoff-1",
+            "host_id": "host-a",
+            "task_id": "task-123",
+            "run_id": "run-123",
+            "repo_root": r"E:\Projects\repo-a",
+            "provider": "codex",
+            "required_provider_capabilities": ["fresh_session"],
+        }
+        leases.acquire_lease(
+            "repo",
+            r"E:\Projects\repo-a",
+            owner_host_id="host-a",
+            now=NOW,
+        )
+        leases.acquire_lease(
+            "task",
+            "task-123",
+            owner_host_id="host-a",
+            owner_run_id="run-123",
+            now=NOW,
+        )
+
+        rejected = controller.submit_handoff_proposal(proposal, now=NOW)
+
+        assert rejected.status == "rejected"
+        assert rejected.rejection is not None
+        assert rejected.rejection.reason == "host_ineligible"
+    finally:
+        store.close()
+
+
+def test_host_liveness_uses_controller_receipt_time_not_future_host_time(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        controller, _nats, _leases = _controller(store)
+        controller.record_host_heartbeat(
+            {
+                "kind": "openclaw.host_heartbeat",
+                "schema_version": 1,
+                "host_id": "host-a",
+                "heartbeat_interval_seconds": 10,
+                "generated_at": (NOW + timedelta(days=1)).isoformat(),
+                "status": "HEALTHY",
+                "capabilities": {
+                    "repo_roots": [
+                        {"path": r"E:\Projects\repo-a", "exists": True}
+                    ],
+                    "providers": [
+                        {
+                            "id": "codex",
+                            "display_name": "Codex",
+                            "capabilities": ["task_run"],
+                        }
+                    ],
+                },
+            },
+            now=NOW,
+        )
+
+        projection = controller.project_fleet(now=NOW + timedelta(seconds=31))
+
+        host = projection["hosts"][0]
+        assert host["health"] == "stale"
+        assert host["last_heartbeat_at"] == NOW.isoformat()
     finally:
         store.close()

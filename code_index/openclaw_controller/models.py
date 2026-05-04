@@ -12,6 +12,9 @@ HOST_HEALTHY = "healthy"
 HOST_STALE = "stale"
 HOST_UNKNOWN = "unknown"
 HOST_UNHEALTHY = "unhealthy"
+HOST_HEALTH_VALUES = frozenset(
+    {HOST_HEALTHY, HOST_STALE, HOST_UNKNOWN, HOST_UNHEALTHY}
+)
 
 
 @dataclass(frozen=True)
@@ -89,7 +92,6 @@ class HostInventoryRecord:
             ProviderCapability.from_mapping(item)
             for item in _mapping_list(capabilities.get("providers"))
         )
-        generated_at = _parse_datetime(payload.get("generated_at")) or now
         return cls(
             host_id=_required_text(payload.get("host_id"), "host_id"),
             repo_roots=repo_roots,
@@ -98,8 +100,8 @@ class HostInventoryRecord:
                 1,
                 _int_or_default(payload.get("heartbeat_interval_seconds"), 10),
             ),
-            last_heartbeat_at=_utc(generated_at),
-            status=_optional_text(payload.get("status")) or HOST_HEALTHY,
+            last_heartbeat_at=_utc(now),
+            status=_host_status(payload.get("status")),
             metadata={"heartbeat": dict(payload)},
         )
 
@@ -291,6 +293,13 @@ def _required_text(value: object, field_name: str) -> str:
 def _optional_text(value: object) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _host_status(value: object) -> str:
+    status = (_optional_text(value) or HOST_HEALTHY).lower()
+    if status in HOST_HEALTH_VALUES:
+        return status
+    return HOST_UNKNOWN
 
 
 def _int_or_default(value: object, default: int) -> int:

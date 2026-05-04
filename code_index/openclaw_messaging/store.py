@@ -578,6 +578,37 @@ class MessagingStore:
             )
         ]
 
+    def mark_command_ref_status(
+        self,
+        command_id: str,
+        *,
+        status: str,
+    ) -> dict[str, Any]:
+        command_id = str(command_id or "").strip()
+        status = str(status or "").strip().lower()
+        if not command_id:
+            raise MessagingError("command_id is required")
+        if status not in {"pending", "active", "assigned", "rejected", "cancelled"}:
+            raise MessagingError(
+                "command status must be pending, active, assigned, rejected, or cancelled"
+            )
+        with self._transaction():
+            cursor = self.conn.execute(
+                """
+                UPDATE openclaw_command_refs
+                   SET status = ?
+                 WHERE command_id = ?
+                """,
+                (status, command_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"unknown command_id: {command_id}")
+        row = self.conn.execute(
+            "SELECT * FROM openclaw_command_refs WHERE command_id = ?",
+            (command_id,),
+        ).fetchone()
+        return _command(row)
+
     def verify_command_ref(self, command_ref: Mapping[str, Any]) -> bool:
         try:
             command_id = str(command_ref["command_id"])
