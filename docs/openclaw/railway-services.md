@@ -38,11 +38,19 @@ Optional controller variables:
 
 Fleet MCP:
 
+- `OPENCLAW_CONTROLLER_SIGNING_SECRET`
+- `OPENCLAW_CONTROLLER_DB_PATH`
+- `OPENCLAW_MESSAGING_DB_PATH`
 - `OPENCLAW_CONTEXT_STORE_PATH`
 - `OPENCLAW_FLEET_MCP_TOKEN`
 - `OPENCLAW_BIND_HOST=::`
 
 Railway sets `PORT` automatically. When a volume is attached, Railway also sets `RAILWAY_VOLUME_MOUNT_PATH`.
+
+Fleet MCP opens the controller and messaging stores outside `development` mode
+so Fleet Controller-backed tools can inspect current fleet state. Use the same
+controller signing secret and SQLite paths as the controller service, or keep
+Fleet MCP in `development` mode for local-only inspection.
 
 ## Path Defaults
 
@@ -117,6 +125,9 @@ Fleet MCP service:
 ```text
 OPENCLAW_DEPLOYMENT_MODE=railway
 OPENCLAW_BIND_HOST=::
+OPENCLAW_CONTROLLER_SIGNING_SECRET=<same-secret-as-controller>
+OPENCLAW_CONTROLLER_DB_PATH=${RAILWAY_VOLUME_MOUNT_PATH}/openclaw/controller-state.db
+OPENCLAW_MESSAGING_DB_PATH=${RAILWAY_VOLUME_MOUNT_PATH}/openclaw/messaging.db
 OPENCLAW_CONTEXT_STORE_PATH=${RAILWAY_VOLUME_MOUNT_PATH}/openclaw/context-store.db
 OPENCLAW_FLEET_MCP_TOKEN=<bearer-token>
 ```

@@ -450,6 +450,7 @@ def test_telegram_poll_route_uses_same_assignment_path_as_webhook(
             "POST",
             "/adapters/telegram/poll",
             {"persist_update_offset": True},
+            headers={"X-Telegram-Bot-Api-Secret-Token": TELEGRAM_SECRET},
         )
 
         assert response.status_code == 200
@@ -468,6 +469,30 @@ def test_telegram_poll_route_uses_same_assignment_path_as_webhook(
         assert [subject for subject, _payload in nats.published] == [
             "openclaw.task.host-z.assigned"
         ]
+    finally:
+        app.close()
+
+
+def test_telegram_poll_route_requires_trusted_adapter_access(tmp_path: Path) -> None:
+    def fake_telegram_poll(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        raise AssertionError("unauthorized poll should not reach Telegram")
+
+    app = create_app(
+        tmp_path / "messages.db",
+        signing_secret=SIGNING_SECRET,
+        telegram_secret_token=TELEGRAM_SECRET,
+        telegram_bot_token="telegram-bot-token",
+        telegram_http_client=fake_telegram_poll,
+    )
+    try:
+        response = app.handle_request(
+            "POST",
+            "/adapters/telegram/poll",
+            {"persist_update_offset": True},
+        )
+
+        assert response.status_code == 403
+        assert response.body["error"] == "Telegram poll requires trusted adapter access"
     finally:
         app.close()
 
@@ -541,7 +566,7 @@ def test_unified_telegram_routes_lenny_and_rosie_aliases_to_distinct_hosts(
             _telegram_update(
                 update_id=610,
                 message_id=710,
-                text="/task task-lenny @lenny summarize repo status",
+                text="@lenny summarize repo status",
             ),
             headers={"X-Telegram-Bot-Api-Secret-Token": TELEGRAM_SECRET},
         )
@@ -559,7 +584,7 @@ def test_unified_telegram_routes_lenny_and_rosie_aliases_to_distinct_hosts(
             _telegram_update(
                 update_id=611,
                 message_id=711,
-                text="/assign task-rosie @rosie check graph server health",
+                text="@rosie check graph server health",
             ),
             headers={"X-Telegram-Bot-Api-Secret-Token": TELEGRAM_SECRET},
         )
@@ -568,6 +593,12 @@ def test_unified_telegram_routes_lenny_and_rosie_aliases_to_distinct_hosts(
         assert rosie.status_code == 201
         assert lenny.body["auto_assignment"]["assignment"]["host_id"] == "host-lenny"
         assert rosie.body["auto_assignment"]["assignment"]["host_id"] == "host-rosie"
+        assert lenny.body["auto_assignment"]["assignment"]["task_id"].startswith(
+            "telegram-msg:"
+        )
+        assert rosie.body["auto_assignment"]["assignment"]["task_id"].startswith(
+            "telegram-msg:"
+        )
         assert [subject for subject, _payload in nats.published] == [
             "openclaw.task.host-lenny.assigned",
             "openclaw.task.host-rosie.assigned",

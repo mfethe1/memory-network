@@ -98,9 +98,10 @@ The host-claim routing extension must recognize:
 
 The `/assign` and `/task` forms set the message target scope to `task` and put
 the prompt text in message metadata for the Fleet Controller assignment
-payload. The mention forms add a host-alias routing hint. The original Telegram
-text remains the room message body for audit and command-signature
-verification.
+payload. The mention forms add a host-alias routing hint and are promoted by
+the controller to generated task IDs shaped like `telegram-msg:<message_id>`
+when the mapped room has assignment metadata. The original Telegram text remains
+the room message body for audit and command-signature verification.
 
 Host aliases are resolved by the Fleet Controller after identity and route
 policy validation. The Telegram adapter must not turn `@rosie` or `@lenny` into

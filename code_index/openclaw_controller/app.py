@@ -855,13 +855,50 @@ def _auto_assignment_for_result(
         return None
     command_ref = result.get("command_ref")
     if not isinstance(command_ref, Mapping):
-        return None
+        return _auto_alias_claim_for_result(
+            result,
+            controller=controller,
+            store=store,
+        )
     if str(command_ref.get("command_type") or "").strip() != "assign_task":
         return None
     assignment = controller.assign_task_from_command_ref(command_ref).to_dict()
     message_id = _optional_text(command_ref.get("message_id"))
     if message_id is not None:
         assignment["deliveries"] = store.list_deliveries(message_id)
+    return assignment
+
+
+def _auto_alias_claim_for_result(
+    result: Mapping[str, Any],
+    *,
+    controller: FleetController,
+    store: MessagingStore,
+) -> dict[str, Any] | None:
+    if not bool(result.get("created")):
+        return None
+    message = result.get("message")
+    if not isinstance(message, Mapping):
+        return None
+    metadata = message.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    routing = metadata.get("routing")
+    claimable = metadata.get("claimable_work")
+    if not isinstance(routing, Mapping) or not _optional_text(
+        routing.get("host_alias")
+    ):
+        return None
+    if not isinstance(claimable, Mapping):
+        return None
+    message_id = _optional_text(message.get("message_id"))
+    if message_id is None:
+        return None
+    promoted = store.promote_message_to_assign_task_command_ref(message_id)
+    assignment = controller.assign_task_from_command_ref(
+        promoted["command_ref"],
+    ).to_dict()
+    assignment["deliveries"] = store.list_deliveries(message_id)
     return assignment
 
 

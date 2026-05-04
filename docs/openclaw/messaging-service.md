@@ -119,10 +119,13 @@ Explicit mentions are hard routing hints:
 ```
 
 After identity and room policy validation, an explicit alias creates or
-constrains the host delivery record for that message. Scheduling still goes
-through the Fleet Controller. If the resolved host is stale, lacks the repo or
-provider capability, or conflicts with an active lease, the message is rejected
-or left unclaimed rather than falling through to another host silently.
+constrains the host delivery record for that message. Bare `@alias` messages are
+promoted to generated task IDs with the `telegram-msg:<message_id>` shape;
+`/task` and `/assign` commands let operators choose the task ID explicitly.
+Scheduling still goes through the Fleet Controller. If the resolved host is
+stale, lacks the repo or provider capability, or conflicts with an active lease,
+the message is rejected or left unclaimed rather than falling through to another
+host silently.
 
 Untagged actionable messages become claimable work:
 

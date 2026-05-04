@@ -22,6 +22,14 @@ On each host:
    deployment context before routine host enrollment. Host installers do not
    mutate shared broker topology unless `--provision-broker` is explicitly set.
 
+On Linux, enable user lingering when OpenClaw user services must survive reboot
+before the user logs in:
+
+```bash
+loginctl enable-linger "$USER"
+loginctl show-user "$USER" -p Linger
+```
+
 Use the same broker URL for both hosts:
 
 ```bash
@@ -78,7 +86,8 @@ Then verify:
 launchctl print "gui/$(id -u)/ai.openclaw.memory-claude-m1.graph-server"
 launchctl print "gui/$(id -u)/ai.openclaw.memory-claude-m1.hostd"
 launchctl print "gui/$(id -u)/ai.openclaw.memory-claude-m1.fleet-mcp"
-tail -n 100 "$HOME/.openclaw/logs/memory-claude-openclaw-m1/hostd.log"
+tail -n 100 "$HOME/.openclaw/logs/ai.openclaw.memory-claude-m1.hostd.log"
+tail -n 100 "$HOME/.openclaw/logs/ai.openclaw.memory-claude-m1.hostd.err.log"
 ```
 
 For a dry run without bootstrapping services:
@@ -108,10 +117,15 @@ Telegram assignment should then resolve by alias:
 ```text
 @lenny summarize the local repo state
 @rosie check the graph server health
+/task task-lenny @lenny summarize the local repo state
+/assign task-rosie @rosie check the graph server health
 ```
 
 The controller must deliver those assignments to
 `openclaw.task.<host_id>.assigned`; it must not publish to alias-scoped subjects.
+Bare `@alias` messages are promoted to generated task IDs with the
+`telegram-msg:<message_id>` shape. `/task` and `/assign` let operators choose
+the task ID explicitly.
 
 ## Admin Broker Provisioning
 

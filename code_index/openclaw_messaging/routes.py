@@ -108,6 +108,17 @@ class MessagingRouter:
                 )
                 return ApiResponse(201 if result["created"] else 200, result)
             if method == "POST" and parts == ["adapters", "telegram", "poll"]:
+                if not _telegram_poll_authorized(
+                    principal,
+                    configured_secret=self.telegram_secret_token,
+                    provided_secret=request_headers.get(
+                        "x-telegram-bot-api-secret-token"
+                    ),
+                ):
+                    return ApiResponse(
+                        403,
+                        {"error": "Telegram poll requires trusted adapter access"},
+                    )
                 if self.telegram_http_client is None:
                     return ApiResponse(
                         503,
@@ -197,3 +208,19 @@ def _principal_can_sign_command(
         return False
     sender_id = _string_or_none(payload.get("sender_id"))
     return not principal.principal_id or not sender_id or principal.principal_id == sender_id
+
+
+def _telegram_poll_authorized(
+    principal: Principal | None,
+    *,
+    configured_secret: str | None,
+    provided_secret: str | None,
+) -> bool:
+    if configured_secret and provided_secret == configured_secret:
+        return True
+    if principal is None:
+        return False
+    return bool(
+        principal.scopes
+        & frozenset({"adapter:poll", "telegram:poll", "controller:write"})
+    )
