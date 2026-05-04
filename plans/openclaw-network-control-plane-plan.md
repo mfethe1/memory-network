@@ -28,7 +28,16 @@ and `fumemory` on Railway.
 
 ## Status
 
-Research-backed planning document created on 2026-05-03.
+Research-backed planning document created on 2026-05-03. Architecture
+review and success criteria grilling session completed 2026-05-03. Major
+additions from that session: Fleet Context Graph (`openclaw_agent_states`
+NATS KV), Context Manager Agent with tiered LLM model escalation (Kimi
+K2.6 → Opus → GPT-5.5), five-step Context Manifest Builder grounded in
+`code_index` structural analysis, context rot prevention at three
+enforcement points, task lease no-progress detection, Completed Work Index
+in `fumemory`, Fleet Controller MCP server, and CMA SSH recovery with
+four-command allowlist. Milestone split into M1 (Fleet Foundation) and M2
+(Intelligence Layer).
 
 Research inputs used:
 
@@ -287,6 +296,36 @@ The daemon is not responsible for:
 4. Holding provider credentials in plain text.
 5. Deciding global context policy or writing `fumemory` context leases directly.
 
+### Module: Fleet Context Graph
+
+The Fleet Context Graph is a real-time NATS KV projection of every running
+agent's workspace state across all fleet hosts. It is not a separate
+service — it is the NATS KV bucket `openclaw_agent_states`, populated by
+host daemon heartbeats and consumed by the CMA and Fleet Controller.
+
+Responsibilities:
+
+1. Each host daemon publishes one `openclaw_agent_states` entry per running
+   agent on every heartbeat interval, covering: `agent_id`, `host_id`,
+   `task_id`, `run_id`, `current_subtask`, `active_files_json`,
+   `active_symbols_json`, `loaded_context_handles_json`,
+   `estimated_tokens`, `approach_history_json`, and `last_action_at`.
+2. The CMA reads all active entries when triggered to build a fleet-wide
+   workspace snapshot before making manifest or quality-gate decisions.
+3. The Fleet Controller reads `last_action_at` per agent for no-progress
+   detection and uses `active_symbols_json` for context-aware task routing
+   — preferring to assign follow-up tasks to the host whose agent already
+   has the most relevant symbols loaded, reducing cold-start context cost.
+4. Entries expire automatically via NATS KV TTL when a host stops
+   publishing heartbeats. No explicit cleanup is required.
+
+The Fleet Context Graph is not responsible for:
+
+1. Storing full transcripts or file contents.
+2. Enforcing leases or file claims.
+3. Providing agent-to-agent direct communication.
+4. Persisting historical agent state beyond the TTL window.
+
 ### Module: Local Graph Server
 
 The existing graph-server remains authoritative per host.
@@ -431,53 +470,143 @@ Responsibilities:
    only after leases, host eligibility, and restart cooldowns pass.
 10. Surface context health and handoff state in fleet APIs without treating
     context health as terminal local run status.
+11. Use `openclaw_agent_states` for context-aware task routing: prefer
+    assigning follow-up tasks to the host whose active agent already has the
+    most relevant symbols loaded, reducing cold-start context cost.
+12. Run no-progress detection: if `last_action_at` in `openclaw_agent_states`
+    has not advanced beyond the configured threshold and no terminal status
+    has been reported, revoke the task lease and mark the task
+    `reassignable`.
+13. Check `fumemory` `avoid` pointers before task assignment. Hold assignment
+    pending CMA review if a known-failed approach covers the target symbols.
+14. Expose an MCP server (Milestone 2) with read-heavy fleet tools for any
+    MCP-compatible provider session to query fleet state without adapter
+    changes. Write operations remain gated through signed command references.
 
 The controller may mark a host or run as `unknown` or `stale`, but it must not
 write terminal local `AgentRun` status unless process liveness is known false
 and no active local claims remain.
 
-### Module: OpenClaw Context Manager
+### Module: OpenClaw Context Manager Agent (CMA)
 
-Runs centrally near the Fleet Controller and `fumemory`, with a lightweight
-context probe inside each host daemon.
+Runs as a fleet-level service that fires ephemeral LLM invocations in
+response to events. It is not a persistent agent session. Each invocation
+is stateless, bounded, and exits after acting.
 
 Goal:
 
 1. Keep agent prompts small, relevant, auditable, and restartable.
-2. Replace automatic long-file prompt stuffing with signed hot-load manifests.
-3. Treat context as a managed working set backed by local graph-server context
-   and `fumemory` pointers.
+2. Replace automatic long-file prompt stuffing with signed hot-load manifests
+   built from live `code_index` structural analysis.
+3. Treat context as a managed working set. Normal continuation is a deliberate
+   checkpoint and fresh-session handoff — compaction is degraded fallback.
+4. Act as the fleet's knowledge broker: surface cross-agent findings to the
+   right agent at the right time without coupling agents to each other.
+5. Push agents toward complete, maintainable solutions — not first solutions.
 
-Responsibilities:
+#### CMA Model Tiers And Escalation
+
+The CMA uses three model tiers. The tier is selected per invocation based
+on signal severity. Escalation is automatic on an `escalate: bool` field in
+the CMA's output JSON. Maximum two escalation hops per trigger event.
+
+```text
+Tier 1 — Kimi K2.6 (32k context, default):
+  Triggers: token threshold crossed, routine manifest rebuild, no-progress
+            check, health-check or index-update SSH action.
+
+Tier 2 — Claude Opus (64k context):
+  Triggers: quality-gate pattern fires (zero test runs, no impact check,
+            premature "done"), source hash mismatch, failed approach
+            repeating, Tier 1 returns escalate: true, unresolved impact
+            on dependent files.
+
+Tier 3 — GPT-5.5 (128k context):
+  Triggers: goal drift detected, Tier 2 returns escalate: true, two or
+            more consecutive handoff failures on the same run, recovery
+            decision after stale host confirmed, cross-host lease conflict
+            with active claims on both sides.
+```
+
+Invocation budget: max 5 concurrent CMA calls fleet-wide, 90-second
+cooldown per `run_id`, dedup within a 30-second window on identical trigger
+events.
+
+#### Context Manifest Builder (Five-Step Pipeline)
+
+Every CMA manifest invocation runs this pipeline before ranking or signing:
+
+```text
+Step 1 — code_index doctor        → verify index health; abort if stale
+Step 2 — code_index impact        → candidate pointer list from target symbols
+Step 3 — code_index tests         → required verification pointer list
+Step 4 — code_index repo-map      → compact orientation block for session start
+Step 5 — fumemory avoid/decisions → prune failed approaches; inject required
+                                    constraints as required pointers
+```
+
+Output: a signed context manifest with pointer IDs, load order, required
+pointers, explicit omissions, token budget, expiry, and source hashes.
+
+#### Quality-Gate Pass
+
+Fires when pattern signals are detected in `openclaw_agent_states`:
+
+```text
+Signal: zero test runs recorded for a task marked complex
+Signal: no code_index impact call before editing target symbols
+Signal: agent emitted "done" without a verification step
+Signal: estimated_tokens < 5k for a task with >3 files in scope
+Signal: approach_history shows same approach attempted twice
+```
+
+When a quality-gate fires, the CMA receives: task goal + acceptance
+criteria, agent state entry, `code_index impact` output for changed
+symbols, `code_index tests` output, fumemory avoid/decision summaries, and
+the Fleet Context Graph snapshot. It decides: pass, flag (inject correction
+pointer into next manifest), or block (hold completion pending operator
+review).
+
+#### Knowledge Broker Role
+
+The CMA is the only component that reads `openclaw_agent_states` entries
+for agents other than the one it is currently acting on. When building a
+manifest or running a quality gate, it can surface relevant peer findings:
+approaches already tried on shared symbols, completed work index entries for
+recently changed files, and active claims held by sibling agents in the same
+swarm. Agents never query each other directly.
+
+#### Responsibilities
 
 1. Consume host context metrics for each Agent Run: estimated provider tokens,
    loaded files, loaded pointers, tool-output volume, active claims, source
    hashes, context packet IDs, provider-visible compaction signals, and recent
    failures.
-2. Query local graph-server through the host daemon for bounded
-   `context_packet`, layered `graph_context`, collaboration packets, run
-   transcripts, active claims, blockers, process liveness, and file hashes.
+2. Run the five-step Context Manifest Builder pipeline for every manifest
+   request, using `code_index` as the structural pointer source.
 3. Query `fumemory` for decisions, failed approaches, verification states,
-   repo/host preferences, prior summaries, source pointers, and handoff
-   packets.
-4. Query the Messaging Service for task-room summaries and explicit operator
-   instructions.
+   prior summaries, source pointers, and handoff packets.
+4. Query the Fleet Context Graph (`openclaw_agent_states`) for cross-agent
+   workspace state and peer findings.
 5. Rank context pointers by task relevance, freshness, source authority,
    sensitivity, token cost, and whether the pointer is required, useful,
    inspect-only, avoid, or expired.
-6. Produce signed context manifests that contain pointer IDs, source URIs,
-   locator JSON, load order, budgets, expiry, file/content hashes, relevance
-   reasons, and explicit omissions.
-7. Write context health events and handoff packets to `fumemory` with source
+6. Write context health events and handoff packets to `fumemory` with source
    event offsets, not raw full transcripts.
-8. Warn at provider-specific soft thresholds, plan handoff near 75k tokens, and
-   request a fresh session near 80k tokens or on critical rot signals.
-9. Coordinate fresh-session handoff through the Fleet Controller, not directly
+7. Warn at 65k–70k tokens, plan handoff near 75k, propose a fresh session
+   near 80k or on critical rot signals.
+8. Coordinate fresh-session handoff through the Fleet Controller, not directly
    through a provider adapter.
-10. Maintain restart cooldowns so context pressure does not create handoff
-    loops.
+9. Enforce restart cooldowns. Require materially changed health evidence
+   before proposing a second handoff for the same run.
+10. Execute SSH recovery actions (health-check, process-check,
+    service-restart, index-update) only after Fleet Controller confirms the
+    target host is stale with no active local file claims.
+11. Write a Completed Work Index entry to `fumemory` on run completion:
+    files changed, symbols affected, approach taken, approaches rejected,
+    verification results, and follow-up pointers.
 
-The Context Manager is not responsible for:
+The CMA is not responsible for:
 
 1. Owning local `AgentRun` status, transcripts, process liveness, or file
    claims.
@@ -486,6 +615,7 @@ The Context Manager is not responsible for:
 4. Letting an external messaging adapter create execution commands.
 5. Writing provider secrets, raw private transcripts, or unrestricted local
    file content into `fumemory`.
+6. Holding a persistent LLM session across fleet events.
 
 ### Module: NATS JetStream And KV
 
@@ -782,6 +912,47 @@ provider_run_refs:
   updated_at
 ```
 
+### Agent State (Fleet Context Graph)
+
+Published to NATS KV bucket `openclaw_agent_states` on every heartbeat
+interval. Expires via TTL when heartbeat stops.
+
+```text
+openclaw_agent_states (NATS KV):
+  agent_id
+  host_id
+  task_id
+  run_id
+  current_subtask          # what the agent is doing right now (short string)
+  active_files_json        # files currently claimed or being edited
+  active_symbols_json      # symbols recently read/modified
+  loaded_context_handles_json
+  estimated_tokens
+  approach_history_json    # approaches tried this run, for CMA dedup
+  last_action_at           # used by Fleet Controller no-progress detector
+```
+
+### Completed Work Index
+
+Written to `fumemory` when a run completes or hands off. Queryable by the
+CMA when building manifests for follow-up tasks on shared symbols.
+
+```text
+completed_work_index (fumemory):
+  work_id
+  host_id
+  task_id
+  run_id
+  completed_at
+  files_changed_json
+  symbols_affected_json
+  approach_taken
+  approaches_rejected_json
+  verification_results_json
+  follow_up_pointers_json
+  trace_id
+```
+
 ### Lease Payload
 
 Use NATS KV for host/repo/task-level leases.
@@ -978,6 +1149,8 @@ openclaw.context.<host_id>.<run_id>.handoff.ack
 openclaw.context.audit
 openclaw.audit.<host_id>
 openclaw.deadletter
+openclaw.mcp.<client_id>.request
+openclaw.mcp.<client_id>.response
 ```
 
 Initial KV buckets:
@@ -992,6 +1165,8 @@ openclaw_messaging_adapters
 openclaw_platform_room_mappings
 openclaw_context_policy
 openclaw_context_leases
+openclaw_agent_states
+openclaw_mcp_clients
 ```
 
 Subject ACL baseline:
@@ -1275,6 +1450,14 @@ Tasks:
 - [ ] Publish message delivery ACKs back to the Messaging Service.
 - [ ] Add replay-safe event sequence numbers.
 - [ ] Add tests for idempotent handling of duplicate task messages.
+- [ ] Publish `openclaw_agent_states` NATS KV entry on every heartbeat for
+      each active agent run: `agent_id`, `host_id`, `task_id`, `run_id`,
+      `current_subtask`, `active_files_json`, `active_symbols_json`,
+      `loaded_context_handles_json`, `estimated_tokens`,
+      `approach_history_json`, `last_action_at`.
+- [ ] Set NATS KV TTL on `openclaw_agent_states` entries to 3× the heartbeat
+      interval so entries expire automatically on heartbeat absence.
+- [ ] Add tests verifying agent state entries expire after missed heartbeats.
 
 Verification:
 
@@ -1284,6 +1467,10 @@ Verification:
 3. Outbox drains after reconnect.
 4. Duplicate message delivery with the same `message_id` and `delivery_id` is
    acknowledged once.
+5. `openclaw_agent_states` entry for a run is visible in NATS KV within one
+   heartbeat interval of run start.
+6. Stopping the host daemon causes the agent state entry to expire within 3×
+   the heartbeat interval.
 
 ### Slice 5 - Fleet Leases And Fencing
 
@@ -1303,12 +1490,22 @@ Tasks:
 - [ ] Fail closed for new cross-host assignments when a conflicting lease
       exists.
 - [ ] Keep file-level claims local to graph-server SQLite.
+- [ ] Add no-progress detection: if `last_action_at` in
+      `openclaw_agent_states` has not advanced beyond a configurable
+      threshold (default 10 minutes) and no terminal status has been
+      reported, the Fleet Controller revokes the lease and marks the task
+      `reassignable`.
+- [ ] Add tests for no-progress detection with a frozen `last_action_at`.
 
 Verification:
 
 1. Two hosts cannot acquire the same exclusive task lease.
 2. A stale lower fencing revision cannot release or overwrite a newer lease.
 3. Local file claims continue to work without NATS.
+4. A task with a frozen `last_action_at` beyond the threshold is marked
+   `reassignable` and its lease is revoked by the Fleet Controller.
+5. A task that completes normally before the threshold is never marked
+   `reassignable`.
 
 ### Slice 6 - Fleet Controller API
 
@@ -1348,7 +1545,7 @@ Verification:
 5. Controller rejects a context handoff restart when the repo/task lease is not
    valid or the restart cooldown is active.
 
-### Slice 7A - Context Manager And fumemory Pointer Store
+### Slice 7A - Context Manager Agent And fumemory Pointer Store
 
 **Files:**
 
@@ -1401,6 +1598,35 @@ Tasks:
 - [ ] Treat compaction as degraded fallback and record a critical
       `context_health_event` when provider compaction happens without a
       Context Manager handoff.
+- [ ] Implement the five-step Context Manifest Builder pipeline: (1) run
+      `code_index doctor` and abort if index is stale; (2) run
+      `code_index impact` on target symbols to build candidate pointer list;
+      (3) run `code_index tests` on affected symbols for verification
+      pointers; (4) run `code_index repo-map --format text --limit 50` for
+      orientation block; (5) query `fumemory` for avoid/decision pointers,
+      prune dead references, rank, budget, and sign.
+- [ ] Implement quality-gate pattern detection in the context probe: zero test
+      runs for complex task, no `code_index impact` call before symbol edits,
+      premature "done" without verification, same approach repeated in
+      `approach_history_json`.
+- [ ] Implement CMA ephemeral LLM invocation: select model tier by signal
+      severity (Kimi K2.6 → Opus → GPT-5.5), enforce 32k/64k/128k input
+      budgets, parse `escalate: bool` from output, re-invoke with next tier
+      if true (max two hops), enforce 90-second cooldown per `run_id` and
+      5-concurrent invocation cap fleet-wide.
+- [ ] Implement context rot prevention at manifest build time: `code_index
+      doctor` gate, dead symbol/path/claim reference pruning from candidate
+      list before signing.
+- [ ] Implement `fumemory` avoid-pointer check at task assignment: hold
+      assignment pending CMA review if a failed approach covers target
+      symbols.
+- [ ] Implement goal-drift detection in quality-gate pass: compare last three
+      tool calls against task acceptance criteria; inject correction pointer
+      into next manifest on drift.
+- [ ] Implement Fleet Context Graph snapshot read: CMA reads all active
+      `openclaw_agent_states` entries before manifest or quality-gate
+      decisions to surface peer findings.
+- [ ] Write Completed Work Index entry to `fumemory` on run completion.
 
 Verification:
 
@@ -1415,6 +1641,16 @@ Verification:
    idempotent replacement.
 7. `fumemory` outage does not block local run completion; host daemon degrades
    to local context packets and reports degraded context health.
+8. Context Manifest Builder aborts and returns an error manifest if
+   `code_index doctor` reports a stale index.
+9. A quality-gate fire with zero test runs triggers a Kimi K2.6 invocation
+   and produces a flag or correction pointer, not a pass.
+10. A Kimi K2.6 invocation returning `escalate: true` triggers an Opus
+    invocation with the same bounded context packet.
+11. A task with a fumemory `avoid` pointer on its target symbols is held
+    pending CMA review before assignment.
+12. Goal drift detected in quality-gate pass injects a correction pointer
+    into the next manifest without blocking the run.
 
 ### Slice 7 - fumemory Sync
 
@@ -1440,6 +1676,12 @@ Tasks:
 - [ ] Queue failed syncs locally.
 - [ ] Add backpressure limits.
 - [ ] Add tests for duplicate sync payloads and retry behavior.
+- [ ] Write a Completed Work Index entry to `fumemory` on run completion:
+      `files_changed_json`, `symbols_affected_json`, `approach_taken`,
+      `approaches_rejected_json`, `verification_results_json`,
+      `follow_up_pointers_json`, and `trace_id`.
+- [ ] Add tests verifying Completed Work Index entries are queryable by
+      symbol and file path for follow-up task manifests.
 
 Verification:
 
@@ -1447,6 +1689,60 @@ Verification:
 2. Duplicate sync payload is safe.
 3. Memory payload can be traced back to the original run.
 4. Raw transcript text is not written to `fumemory` by default.
+5. Completed Work Index entry is written and queryable by symbol within one
+   sync cycle of run completion.
+6. A follow-up task on the same symbols can retrieve the prior approach and
+   verification results from the Completed Work Index via the CMA.
+
+### Slice 12 - Fleet Controller MCP Server
+
+**Milestone 2 only.** Depends on Slice 6 (Fleet Controller API) being
+stable and `openclaw_agent_states` populated by real fleet traffic.
+
+**Files:**
+
+1. Create: `code_index/openclaw_controller/mcp_server.py`
+2. Create: `code_index/openclaw_controller/mcp_tools.py`
+3. Create: `docs/openclaw/fleet-mcp-server.md`
+4. Create: `tests/openclaw_controller/test_mcp_server.py`
+5. Modify: `code_index/openclaw_controller/app.py`
+6. Modify: `pyproject.toml`
+
+Tasks:
+
+- [ ] Implement MCP server alongside the Fleet Controller HTTP API.
+- [ ] Implement read-heavy fleet tools:
+      `fleet_task_status(task_id)`,
+      `fleet_query_agent_states()`,
+      `fleet_submit_handoff(packet)`,
+      `fleet_query_fumemory(query)`,
+      `fleet_get_context_manifest(run_id)`,
+      `fleet_publish_work_summary(summary)`.
+- [ ] Gate all write-path tools through signed command reference validation;
+      return a command reference for the caller to submit — never execute
+      directly.
+- [ ] Add per-client MCP credentials to `openclaw_mcp_clients` KV bucket.
+- [ ] Add tool-level permission scopes: `fleet:read`, `fleet:handoff`,
+      `fleet:summarize`. No MCP client receives `fleet:assign` or
+      `fleet:cancel` directly.
+- [ ] Verify that Claude Code, Kimi, and OpenCode can connect to the MCP
+      server as a remote tool and call `fleet_query_agent_states` without
+      provider adapter changes.
+- [ ] Add integration tests with a fake Fleet Controller and fake NATS KV.
+
+Verification:
+
+1. A Claude Code session with MCP config pointing at the Fleet Controller
+   can call `fleet_task_status` and receive current task state.
+2. A `fleet_query_agent_states` call returns all active agent state entries
+   from NATS KV `openclaw_agent_states`.
+3. `fleet_submit_handoff` returns a signed command reference, not an
+   immediate action.
+4. An MCP client with only `fleet:read` scope cannot call handoff or
+   summarize tools.
+5. An unauthenticated MCP client receives a 401 and no fleet data.
+6. The MCP server being unavailable does not affect task assignment, lease
+   management, or agent runs.
 
 ### Slice 8 - Cursor SDK Provider Adapter
 
@@ -1547,6 +1843,19 @@ Tasks:
 - [ ] Add health check commands.
 - [ ] Add restart, upgrade, and rollback steps.
 - [ ] Add break-glass SSH runbook.
+- [ ] Add CMA SSH recovery allowlist: create a dedicated low-privilege
+      Windows service account (`openclaw-cma`) with an `authorized_keys`
+      entry restricted via `command=` to exactly four commands:
+      `openclaw-health-check`, `openclaw-process-check`,
+      `openclaw-service-restart`, and `openclaw-index-update`. No shell
+      access is granted.
+- [ ] Add Fleet Controller gate: SSH recovery actions require the controller
+      to confirm `host_status = stale` and zero active file claims on the
+      target host before the CMA is permitted to connect.
+- [ ] Add Tailscale network requirement documentation: CMA SSH operates only
+      over Tailscale; no public inbound SSH exposure is permitted.
+- [ ] Add tests verifying the four allowlist commands execute and all other
+      commands are rejected.
 
 Verification:
 
@@ -1554,6 +1863,12 @@ Verification:
 2. Host appears in controller inventory.
 3. SSH access works for admin users over private networking.
 4. Removing the service does not delete repo worktrees or local graph data.
+5. CMA SSH `openclaw-service-restart` restarts the host daemon and the host
+   reappears in fleet inventory within two heartbeat intervals.
+6. Any SSH command outside the four-command allowlist is rejected with a
+   non-zero exit code and no side effects.
+7. CMA SSH is blocked if the Fleet Controller has not confirmed the host as
+   stale, even if the SSH credentials are valid.
 
 ## Runtime Policies
 
@@ -1732,6 +2047,39 @@ Context rot signals:
     - Mitigation: `context_sources.sensitivity`, route scopes, host/repo
       filters, and no raw full transcript sync by default.
 
+20. CMA model costs create unexpected API spend at fleet scale.
+    - Mitigation: Kimi K2.6 as default tier, max 5 concurrent CMA calls,
+      90-second cooldown per `run_id`, 30-second dedup window on identical
+      triggers. Tier 2 and Tier 3 invocations are logged with cost estimates.
+
+21. CMA escalation creates repeated Tier 3 invocations (cost spiral).
+    - Mitigation: max two escalation hops per trigger event, cooldown before
+      re-triggering the same `run_id`, operator alert when Tier 3 fires
+      three times in one session.
+
+22. Fleet Controller MCP server becomes an unauthorized command surface.
+    - Mitigation: read-only tools in Milestone 2 v1, write-path tools return
+      signed command references only, per-client credentials with explicit
+      scope grants, no `fleet:assign` or `fleet:cancel` scope in the first
+      release.
+
+23. `openclaw_agent_states` entries become stale and mislead the CMA.
+    - Mitigation: NATS KV TTL set to 3× heartbeat interval, CMA checks
+      `last_action_at` age before trusting state, entries older than 2×
+      TTL are treated as absent.
+
+24. Context Manifest Builder aborts on stale index at a critical handoff
+    moment, leaving an agent without a valid manifest.
+    - Mitigation: `code_index update --files` is one of the four CMA SSH
+      allowlist commands; CMA triggers index update on stale-index abort and
+      retries manifest build once before escalating to operator.
+
+25. No-progress detector fires on a legitimately slow computation (large
+    test run, long compilation) and revokes the lease prematurely.
+    - Mitigation: configurable threshold per repo and provider, agents can
+      publish a `working_on` heartbeat extension to reset the no-progress
+      timer without advancing `last_action_at`.
+
 ## Success Criteria
 
 1. A Windows PC can enroll as an OpenClaw host with a stable `host_id`.
@@ -1770,21 +2118,91 @@ Context rot signals:
     packet and start a fresh provider session through Fleet Controller policy.
 22. Context health events and handoff packets are traceable to source hashes,
     event offsets, `task_id`, `run_id`, and `host_id`.
-23. System can enable multiple instances of openclaw to communicate and allow for a single message service to relay messages to each openclaw instance.
-24. Messages should be marked as recieved by each of the systems in fumemory, and upon recieving a gateway can claim and write a task to a shared task management system. If another system deems the task partial or does not meet the users needs, they can update this and claim follow up action.
-25. The system should allow for critical review of context rot and prevent this from happening.
-26. There is always a context management and control system in place and this can traverse levels of agents and subagents. This should be a heuristic system managed by an agent and visible in the control system.
-27. The memory-network system should be used to improve context level at the system level, so each instance should be able to run this.
-28. There should be a ssh capability or other cross network, capability to maintain ssh connectivity to the other PCs in the openclaw network that can enhance and has a similar but higher level system of the memory-network, but it would be more of an agent-memory-network.
-29. Agent memory network can be used to monitor all openclaw instances, agents and subagents running in those systems by ssh or other connection methods.
-30. This system is to coordinate multiple instances of openclaw, claude code, kimi cli, opencode and other cli agentic frameworks across a network and allow for easy monitoring of the running systems and is able to recover those systems.
-31. This system should improve the current cross system communication and allow for more powerful integration of multiple systems.
+23. A single OpenClaw Messaging Service routes messages to all host instances
+    over NATS room delivery subjects. No host receives a message directly
+    from another host's adapter. Delivery state is visible per recipient in
+    `openclaw_message_deliveries`.
+24. Message delivery ACKs are stored in `openclaw_message_deliveries` and
+    NATS KV `openclaw_leases`; `fumemory` stores only compact
+    task-completion summaries, not per-host ACK records. A host claiming a
+    task writes an exclusive NATS KV lease. A second host cannot acquire the
+    same lease until the first is released or revoked by the Fleet
+    Controller no-progress detector.
+25. Context rot is blocked at three enforcement points: (1) the Context
+    Manifest Builder runs `code_index doctor` before building any manifest
+    and prunes dead symbol, path, and claim references from candidate
+    pointer lists before signing; (2) the Fleet Controller checks `fumemory`
+    `avoid` pointers before task assignment and holds assignment pending CMA
+    review if a known-failed approach covers the target symbols; (3) the CMA
+    quality-gate detects goal drift by comparing the agent's last three tool
+    calls against the original task acceptance criteria and injects a
+    correction pointer into the next manifest rather than allowing drift to
+    continue.
+26. A Context Manager Agent (CMA) fires as an ephemeral, event-driven LLM
+    invocation on threshold crossing or pattern-signal events. It traverses
+    Swarm Lead and child Agent Run levels via the NATS KV bucket
+    `openclaw_agent_states`. The CMA never holds a long-running session; it
+    fires, acts on bounded input, and exits. CMA decisions, interventions,
+    and escalations are visible in the fleet web UI control panel. The CMA
+    uses a tiered model: Kimi K2.6 for routine manifest building and
+    threshold checks (32k context), Claude Opus for quality-gate passes and
+    dependency review (64k context), and GPT-5.5 for goal drift, repeated
+    handoff failures, and cross-host conflict resolution (128k context).
+    Escalation is automatic on an `escalate: bool` output field, max two
+    hops per trigger event.
+27. `code_index impact`, `code_index tests`, and `code_index repo-map` are
+    the automatic structural pointer sources for every CMA-generated context
+    manifest. The five-step Context Manifest Builder pipeline — impact
+    analysis, verification pointer extraction, repo orientation, fumemory
+    avoid/decision lookup, rank-and-sign — runs before any manifest reaches
+    an agent. No manifest is signed without a passing `code_index doctor`
+    health check on the source host.
+28. The CMA can SSH into confirmed-stale fleet hosts over Tailscale private
+    networking, restricted to a strict four-command allowlist: health-check,
+    process-check, service-restart, and index-update. SSH actions require
+    Fleet Controller confirmation that the target host is stale with no
+    active local file claims before any command executes. SSH never fires on
+    a host with active leases.
+29. The Fleet Context Graph, implemented as NATS KV bucket
+    `openclaw_agent_states`, provides the CMA and Fleet Controller a
+    real-time view of every running agent's active files, active symbols,
+    current sub-task, estimated tokens, and approach history across all
+    fleet hosts. Agents never query each other directly. The CMA acts as the
+    sole knowledge broker, mediating cross-agent knowledge through manifest
+    injection rather than direct agent-to-agent messaging.
+30. Task recovery operates at four independent layers: (1) Windows Service
+    Manager restarts crashed host daemons automatically on process exit;
+    (2) Fleet Controller no-progress detector revokes a task lease when
+    `last_action_at` in `openclaw_agent_states` has not advanced beyond the
+    configured threshold and no terminal status has been reported, then
+    marks the task `reassignable`; (3) the CMA triggers a structured
+    session handoff with a signed handoff packet on context pressure or
+    repeated failure signals; (4) the local-authoritative model keeps local
+    runs alive and progressing during Fleet Controller or NATS outages. Each
+    layer is independently verifiable without the others active.
+31. The Fleet Controller exposes an MCP server with read-heavy fleet tools:
+    `fleet_task_status`, `fleet_query_agent_states`,
+    `fleet_submit_handoff`, `fleet_query_fumemory`,
+    `fleet_get_context_manifest`, and `fleet_publish_work_summary`. Any
+    MCP-compatible provider session — Claude Code, Kimi, OpenCode — can
+    query and participate in fleet state without provider adapter changes.
+    Write operations remain gated through signed command references as
+    before. The MCP server uses per-client credentials and exposes no
+    unrestricted shell or lease-mutation tools.
 
 ## First Milestone Definition
 
-The first milestone should stop before Cursor SDK work.
+Two milestones. Milestone 1 builds the fleet foundation and publishes real
+metrics. Milestone 2 adds the intelligence layer, calibrated against real
+M1 fleet data. The live CMA LLM invocations require real metrics to set
+thresholds — building them before M1 data exists means guessing at every
+threshold and escalation signal.
 
-Milestone 1 scope:
+### Milestone 1 — Fleet Foundation
+
+Stops before Cursor SDK and live CMA LLM invocations.
+
+Scope:
 
 1. Slice 0: broker, identity, security docs and config.
 2. Slice 1: host daemon skeleton.
@@ -1792,13 +2210,18 @@ Milestone 1 scope:
 4. Slice 3: embedded Messaging Service with rooms, message storage, delivery
    records, adapter registry, platform room mappings, external identities, and
    Telegram adapter stubs.
-5. Slice 4: task inbox, host inbox, message ACKs, and event outbox.
-6. Slice 5: minimal host/repo/task leases and fencing before adding a second
-   host.
-7. Slice 6: minimal controller task assignment from signed command references.
-8. Slice 7A passive mode: Context Manager pointer schema, host context metrics,
-   signed manifest stubs, and alert-only health events. No automatic restart
-   until metrics and false positives are understood.
+5. Slice 4: task inbox, host inbox, message ACKs, event outbox, and
+   `openclaw_agent_states` NATS KV publishing with TTL.
+6. Slice 5: minimal host/repo/task leases, fencing, and no-progress
+   detection using `last_action_at`.
+7. Slice 6: minimal controller task assignment from signed command references,
+   context-aware routing using `active_symbols_json`, and avoid-pointer
+   check at assignment.
+8. Slice 7A passive mode: Context Manager pointer schema, host context
+   metrics, Context Manifest Builder pipeline (code_index-integrated),
+   signed manifests, alert-only health events, and quality-gate pattern
+   detection. No live LLM CMA invocations — alerts fire but do not trigger
+   model calls yet.
 
 Milestone 1 demo:
 
@@ -1812,12 +2235,52 @@ Milestone 1 demo:
 7. Host receives task, dispatches local adapter, publishes events, and reports
    final local status.
 8. Telegram receives only the high-signal task status notification.
-9. Host context probe reports estimated tokens, loaded pointers, active claims,
-   and source hashes to the Context Manager.
-10. Context Manager returns a signed pointer-first manifest and does not
-    auto-load long "soul" or global memory files.
+9. `openclaw_agent_states` KV entry is visible for the running agent with
+   current sub-task, active files, symbols, token estimate, and
+   `last_action_at`.
+10. Context Manifest Builder runs the five-step pipeline and returns a signed
+    pointer-first manifest grounded in `code_index` structural analysis.
 11. Stop the network connection during a run and verify local status remains
-   authoritative.
+    authoritative.
+12. Freeze `last_action_at` in the agent state and verify the Fleet
+    Controller marks the task `reassignable` after the no-progress threshold.
+
+### Milestone 2 — Intelligence Layer
+
+Requires stable M1 fleet data to calibrate thresholds and escalation
+signals. Starts after M1 has run at least one real fleet session.
+
+Scope:
+
+1. Slice 7A live CMA: ephemeral LLM invocations with tiered model selection
+   (Kimi K2.6 → Opus → GPT-5.5), escalation on `escalate: bool`, invocation
+   budget enforcement, and full quality-gate enforcement including correction
+   pointer injection.
+2. Slice 7: Completed Work Index in `fumemory`.
+3. Slice 8: Cursor SDK provider adapter.
+4. Slice 9: open source provider adapters (OpenCode, Goose, Aider,
+   OpenHands).
+5. Slice 10: observability and `trace_id` propagation.
+6. Slice 11: Windows installation, operations runbook, and CMA SSH recovery
+   with four-command allowlist.
+7. Slice 12: Fleet Controller MCP server.
+
+Milestone 2 demo:
+
+1. A running agent approaching 75k tokens receives a CMA-generated handoff
+   packet and a fresh provider session starts with only the required
+   pointers — no compaction, no full transcript injection.
+2. A quality-gate fires on a premature "done" signal, the CMA Kimi K2.6
+   invocation returns a correction pointer, and the agent continues with
+   updated guidance.
+3. A follow-up task on the same symbols retrieves the prior approach from
+   the Completed Work Index and the manifest includes an `avoid` pointer for
+   the rejected approach.
+4. A Claude Code session with Fleet Controller MCP config calls
+   `fleet_query_agent_states` and receives the live fleet workspace snapshot.
+5. A stale host receives a CMA SSH `openclaw-service-restart` after Fleet
+   Controller confirmation, reappears in inventory, and resumes task
+   processing.
 
 ## Recommended Next Command Sequence
 
