@@ -525,6 +525,7 @@ class MessagingStore:
         recipient_kind: str | None = None,
         recipient_id: str | None = None,
         delivery_id: str | None = None,
+        delivery_key: str | None = None,
         status: str = "acked",
         error: str | None = None,
     ) -> dict[str, Any]:
@@ -536,6 +537,7 @@ class MessagingStore:
             recipient_kind=recipient_kind,
             recipient_id=recipient_id,
             delivery_id=delivery_id,
+            delivery_key=delivery_key,
         )
         now = _now()
         delivered_at = existing["delivered_at"]
@@ -1183,6 +1185,7 @@ class MessagingStore:
         recipient_kind: str | None,
         recipient_id: str | None,
         delivery_id: str | None,
+        delivery_key: str | None,
     ) -> dict[str, Any]:
         row = None
         if delivery_id:
@@ -1194,16 +1197,31 @@ class MessagingStore:
                 """,
                 (delivery_id, message_id),
             ).fetchone()
-        elif recipient_kind and recipient_id:
+        elif delivery_key:
             row = self.conn.execute(
+                """
+                SELECT * FROM openclaw_message_deliveries
+                 WHERE message_id = ?
+                   AND delivery_key = ?
+                """,
+                (message_id, delivery_key),
+            ).fetchone()
+        elif recipient_kind and recipient_id:
+            rows = self.conn.execute(
                 """
                 SELECT * FROM openclaw_message_deliveries
                  WHERE message_id = ?
                    AND recipient_kind = ?
                    AND recipient_id = ?
+                 ORDER BY delivery_key
                 """,
                 (message_id, recipient_kind, recipient_id),
-            ).fetchone()
+            ).fetchall()
+            if len(rows) > 1:
+                raise MessagingError(
+                    "ambiguous delivery acknowledgement; use delivery_id or delivery_key"
+                )
+            row = rows[0] if rows else None
         if row is None:
             raise KeyError(f"delivery not found for message_id: {message_id}")
         return _delivery(row)

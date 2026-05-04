@@ -45,7 +45,9 @@ Delivery rows carry a normalized delivery key in addition to recipient
 kind/ID. Adapter deliveries include platform target identity in that key so
 two Telegram room targets do not collapse into one delivery. ACK updates are
 monotonic; a late `delivered` report cannot downgrade an already `acked`
-delivery.
+delivery. When a message has multiple deliveries with the same recipient
+kind/ID, ACK calls must identify the exact row with `delivery_id` or
+`delivery_key`; recipient kind/ID alone is rejected as ambiguous.
 
 ## Rooms And Projections
 
@@ -91,10 +93,11 @@ POST /adapters/telegram/webhook
 The dispatcher is intentionally framework-free. A future HTTP server can wrap
 the same router without changing store behavior.
 
-`POST /messages` signs commands only when the request includes a principal
-with `command:write`. Chat messages may be accepted without that principal in
-this slice, but mutating command refs are never created by an anonymous route
-caller.
+`POST /messages` signs commands only when the trusted route context includes a
+principal with `command:write`. A JSON body field named `principal` is ignored
+for authorization because request bodies are untrusted. Chat messages may be
+accepted without a trusted principal in this slice, but mutating command refs
+are never created by an anonymous route caller.
 
 ## Command References
 

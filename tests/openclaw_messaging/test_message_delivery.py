@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from code_index.openclaw_messaging.routes import MessagingRouter
+from code_index.openclaw_messaging.routes import Principal
 from code_index.openclaw_messaging.store import MessagingStore
 from code_index.openclaw_messaging.notifications import notification_rules
 from code_index.openclaw_messaging.notifications import should_notify
@@ -248,7 +249,7 @@ def test_store_requires_explicit_signing_secret(tmp_path: Path) -> None:
         MessagingStore(tmp_path / "messages.db")  # type: ignore[call-arg]
 
 
-def test_route_rejects_unauthenticated_command_signing_but_allows_principal(
+def test_route_rejects_body_principal_but_allows_trusted_context_principal(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -281,7 +282,7 @@ def test_route_rejects_unauthenticated_command_signing_but_allows_principal(
         assert rejected.status_code == 403
         assert store.list_messages(room["room_id"]) == []
 
-        accepted = router.handle(
+        self_asserted = router.handle(
             "POST",
             "/messages",
             {
@@ -298,7 +299,26 @@ def test_route_rejects_unauthenticated_command_signing_but_allows_principal(
                 "target_scope": {"kind": "task", "task_id": "task-123"},
             },
         )
+        assert self_asserted.status_code == 403
+        assert store.list_messages(room["room_id"]) == []
 
+        accepted = router.handle(
+            "POST",
+            "/messages",
+            {
+                "room_id": room["room_id"],
+                "sender_kind": "human",
+                "sender_id": "operator-1",
+                "body": "Assign this task to host-a.",
+                "message_type": "command",
+                "command_type": "assign_task",
+                "target_scope": {"kind": "task", "task_id": "task-123"},
+            },
+            principal=Principal(
+                principal_id="operator-1",
+                scopes=frozenset({"message:write", "command:write"}),
+            ),
+        )
         assert accepted.status_code == 201
         assert accepted.body["command_ref"] is not None
     finally:
@@ -383,6 +403,128 @@ def test_adapter_deliveries_keep_distinct_platform_targets(tmp_path: Path) -> No
             delivery["metadata"]["platform_room_id"] for delivery in deliveries
         ) == ["-1001", "-1002"]
         assert len({delivery["delivery_key"] for delivery in deliveries}) == 2
+    finally:
+        store.close()
+
+
+def test_ack_duplicate_adapter_targets_requires_exact_delivery(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    try:
+        room = store.create_room(
+            room_kind="task",
+            display_name="Task",
+            task_id="task-1",
+            metadata={
+                "default_delivery_targets": [
+                    {
+                        "recipient_kind": "adapter",
+                        "recipient_id": "telegram",
+                        "platform_room_id": "-1001",
+                    },
+                    {
+                        "recipient_kind": "adapter",
+                        "recipient_id": "telegram",
+                        "platform_room_id": "-1002",
+                    },
+                ]
+            },
+        )
+        result = store.create_message(
+            room_id=room["room_id"],
+            sender_kind="human",
+            sender_id="operator-1",
+            body="Notify both Telegram rooms.",
+            target_scope={"kind": "task", "task_id": "task-1"},
+        )
+        message_id = result["message"]["message_id"]
+        deliveries = store.list_deliveries(message_id)
+        first = next(
+            delivery
+            for delivery in deliveries
+            if delivery["metadata"]["platform_room_id"] == "-1001"
+        )
+        second = next(
+            delivery
+            for delivery in deliveries
+            if delivery["metadata"]["platform_room_id"] == "-1002"
+        )
+
+        with pytest.raises(ValueError, match="ambiguous delivery acknowledgement"):
+            store.ack_delivery(
+                message_id=message_id,
+                recipient_kind="adapter",
+                recipient_id="telegram",
+            )
+
+        acked_by_key = store.ack_delivery(
+            message_id=message_id,
+            delivery_key=second["delivery_key"],
+        )
+        acked_by_id = store.ack_delivery(
+            message_id=message_id,
+            delivery_id=first["delivery_id"],
+        )
+        statuses = {
+            delivery["metadata"]["platform_room_id"]: delivery["delivery_status"]
+            for delivery in store.list_deliveries(message_id)
+        }
+
+        assert acked_by_key["delivery_id"] == second["delivery_id"]
+        assert acked_by_id["delivery_id"] == first["delivery_id"]
+        assert statuses == {"-1001": "acked", "-1002": "acked"}
+    finally:
+        store.close()
+
+
+def test_route_ack_duplicate_adapter_targets_requires_exact_delivery(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    router = MessagingRouter(store)
+    try:
+        room = store.create_room(
+            room_kind="task",
+            display_name="Task",
+            task_id="task-1",
+            metadata={
+                "default_delivery_targets": [
+                    {
+                        "recipient_kind": "adapter",
+                        "recipient_id": "telegram",
+                        "platform_room_id": "-1001",
+                    },
+                    {
+                        "recipient_kind": "adapter",
+                        "recipient_id": "telegram",
+                        "platform_room_id": "-1002",
+                    },
+                ]
+            },
+        )
+        result = store.create_message(
+            room_id=room["room_id"],
+            sender_kind="human",
+            sender_id="operator-1",
+            body="Notify both Telegram rooms.",
+            target_scope={"kind": "task", "task_id": "task-1"},
+        )
+        message_id = result["message"]["message_id"]
+        target = store.list_deliveries(message_id)[0]
+
+        ambiguous = router.handle(
+            "POST",
+            f"/messages/{message_id}/ack",
+            {"recipient_kind": "adapter", "recipient_id": "telegram"},
+        )
+        exact = router.handle(
+            "POST",
+            f"/messages/{message_id}/ack",
+            {"delivery_key": target["delivery_key"]},
+        )
+
+        assert ambiguous.status_code == 400
+        assert exact.status_code == 200
+        assert exact.body["delivery"]["delivery_id"] == target["delivery_id"]
     finally:
         store.close()
 

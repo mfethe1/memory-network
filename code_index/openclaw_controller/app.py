@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from code_index.openclaw_messaging.adapter_registry import AdapterRegistry
 from code_index.openclaw_messaging.routes import ApiResponse
 from code_index.openclaw_messaging.routes import MessagingRouter
+from code_index.openclaw_messaging.routes import Principal
 from code_index.openclaw_messaging.store import MessagingStore
 
 
@@ -26,8 +27,15 @@ class OpenClawControllerApp:
         path: str,
         body: Mapping[str, Any] | None = None,
         headers: Mapping[str, Any] | None = None,
+        principal: Principal | None = None,
     ) -> ApiResponse:
-        return self.router.handle(method, path, body, headers=headers)
+        return self.router.handle(
+            method,
+            path,
+            body,
+            headers=headers,
+            principal=principal,
+        )
 
     def close(self) -> None:
         self.store.close()

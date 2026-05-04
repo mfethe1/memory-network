@@ -17,6 +17,12 @@ class ApiResponse:
     body: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class Principal:
+    principal_id: str
+    scopes: frozenset[str]
+
+
 class MessagingRouter:
     def __init__(
         self,
@@ -33,6 +39,7 @@ class MessagingRouter:
         path: str,
         body: Mapping[str, Any] | None = None,
         headers: Mapping[str, Any] | None = None,
+        principal: Principal | None = None,
     ) -> ApiResponse:
         method = method.upper()
         parts = [unquote(part) for part in urlsplit(path).path.strip("/").split("/") if part]
@@ -45,7 +52,10 @@ class MessagingRouter:
                 return ApiResponse(200, {"messages": self.store.list_messages(parts[1])})
             if method == "POST" and parts == ["messages"]:
                 message_type = str(payload.get("message_type") or "chat").strip().lower()
-                if message_type == "command" and not _principal_can_sign_command(payload):
+                if message_type == "command" and not _principal_can_sign_command(
+                    principal,
+                    payload,
+                ):
                     return ApiResponse(403, {"error": "command signing requires command:write principal"})
                 result = self.store.create_message(
                     room_id=str(payload.get("room_id") or ""),
@@ -73,6 +83,7 @@ class MessagingRouter:
                 delivery = self.store.ack_delivery(
                     message_id=parts[1],
                     delivery_id=_string_or_none(payload.get("delivery_id")),
+                    delivery_key=_string_or_none(payload.get("delivery_key")),
                     recipient_kind=_string_or_none(payload.get("recipient_kind")),
                     recipient_id=_string_or_none(payload.get("recipient_id")),
                     status=str(payload.get("status") or "acked"),
@@ -125,19 +136,13 @@ def _string_or_none(value: Any) -> str | None:
     return text or None
 
 
-def _principal_can_sign_command(payload: Mapping[str, Any]) -> bool:
-    principal = payload.get("principal")
-    if not isinstance(principal, Mapping):
+def _principal_can_sign_command(
+    principal: Principal | None,
+    payload: Mapping[str, Any],
+) -> bool:
+    if principal is None:
         return False
-    scopes = principal.get("scopes")
-    if isinstance(scopes, str):
-        scope_set = {scopes}
-    elif isinstance(scopes, list):
-        scope_set = {str(scope) for scope in scopes}
-    else:
-        scope_set = set()
-    if "command:write" not in scope_set:
+    if "command:write" not in principal.scopes:
         return False
-    principal_id = _string_or_none(principal.get("principal_id"))
     sender_id = _string_or_none(payload.get("sender_id"))
-    return not principal_id or not sender_id or principal_id == sender_id
+    return not principal.principal_id or not sender_id or principal.principal_id == sender_id
