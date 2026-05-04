@@ -1,5 +1,8 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "dockerfilePath": "deploy/railway/Dockerfile"
+  },
   "deploy": {
     "startCommand": "code-index-openclaw-controller --serve",
     "healthcheckPath": "/ready",

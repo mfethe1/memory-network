@@ -47,9 +47,9 @@ Fleet MCP:
 
 Railway sets `PORT` automatically. When a volume is attached, Railway also sets `RAILWAY_VOLUME_MOUNT_PATH`.
 
-Both OpenClaw Python services should set:
+Both OpenClaw Python services use `deploy/railway/Dockerfile`, which installs:
 
-- `RAILPACK_INSTALL_COMMAND=python -m pip install -e ".[openclaw]"`
+- `python -m pip install ".[openclaw]"`
 
 The `openclaw` optional dependency group installs the HTTP MCP SDK and the
 NATS client required by production readiness checks.
