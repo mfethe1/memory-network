@@ -18,22 +18,31 @@ Slice 7A builds manifests locally and passively.
    - Create a compact orientation pointer.
 5. Pointer store query
    - Add avoid and decision pointers, prune blocked/dead context, rank,
-     budget, and sign.
+     budget, apply `ContextRetrievalPolicy`, and sign.
 
 Tests inject a fake probe. The default probe shells out only when explicitly
 used.
 
 ## Manifest Shape
 
-The signed payload contains:
+Milestone 1 stores the signature as explicit fields on the manifest row, not as
+a nested envelope. `signed_payload` is canonical JSON. `signature_key_id` names
+the local key, and `signature` is the hex HMAC-SHA256 of `signed_payload`.
+Verification parses the payload, checks the key ID, rejects expired manifests,
+compares the HMAC with `compare_digest`, and confirms stored row fields match
+the signed payload.
+
+The canonical `signed_payload` contains:
 
 ```text
-manifest_id
+schema_version
+status
 host_id
 repo_id
 task_id
 run_id
 provider
+route_scope
 pointer_ids
 required_pointer_ids
 load_order
@@ -43,8 +52,6 @@ source_hashes
 peer_agent_states
 expires_at
 request_hash
-signature_key_id
-signature
 ```
 
 The signature is a local HMAC in Milestone 1. It is sufficient for replay and
@@ -57,6 +64,11 @@ required pointers exceed the configured budget, the builder returns an error
 manifest instead of signing a partial manifest. Optional pointers are added in
 rank order until the budget is reached; skipped pointers are recorded in
 `omitted_context`.
+
+All required IDs are still subject to sensitivity policy. A foreign
+`host_private` or `provider_private` pointer is treated as unavailable for that
+manifest request and yields a `missing_required_pointer` error instead of being
+signed.
 
 ## Long Context Rules
 
@@ -78,7 +90,10 @@ default hot-load prompts.
 
 The builder hashes the manifest request and stores the generated manifest in
 the local context store. Replaying the same request returns the same manifest.
-Handoff packets use the same pattern with a deterministic packet hash.
+Signed successful manifests replay idempotently. Error manifests, such as a
+stale doctor result, are replaceable so the same request can recover after the
+index is repaired. Handoff packets use the same pattern with a deterministic
+packet hash.
 
 ## Fleet Context Graph
 

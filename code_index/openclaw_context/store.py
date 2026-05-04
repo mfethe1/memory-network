@@ -30,11 +30,30 @@ class SQLiteContextStore:
             self._conn = sqlite3.connect(str(path))
             self._owns_conn = True
         self._conn.row_factory = sqlite3.Row
+        self._configure_connection()
         self._ensure_schema()
 
     def close(self) -> None:
         if self._owns_conn:
             self._conn.close()
+
+    def sqlite_pragmas(self) -> dict[str, Any]:
+        """Return operational SQLite pragmas used for local durability checks."""
+
+        return {
+            "journal_mode": str(
+                self._conn.execute("PRAGMA journal_mode").fetchone()[0]
+            ).lower(),
+            "busy_timeout": int(
+                self._conn.execute("PRAGMA busy_timeout").fetchone()[0] or 0
+            ),
+            "foreign_keys": int(
+                self._conn.execute("PRAGMA foreign_keys").fetchone()[0] or 0
+            ),
+            "synchronous": int(
+                self._conn.execute("PRAGMA synchronous").fetchone()[0] or 0
+            ),
+        }
 
     def upsert_context_source(
         self,
@@ -516,15 +535,39 @@ class SQLiteContextStore:
             """
             INSERT INTO context_manifests(
                 manifest_id, request_hash, status, host_id, repo_id, task_id,
-                run_id, provider, pointer_ids_json, required_pointer_ids_json,
-                load_order_json, omitted_json, token_budget_json,
+                run_id, provider, route_scope, pointer_ids_json,
+                required_pointer_ids_json, load_order_json, omitted_json, token_budget_json,
                 estimated_tokens, source_hashes_json, peer_agent_states_json,
                 expires_at, signature_key_id, signature, signed_payload,
                 error_kind, error_message, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(request_hash) DO UPDATE SET
-                manifest_id = context_manifests.manifest_id
+                manifest_id = excluded.manifest_id,
+                status = excluded.status,
+                host_id = excluded.host_id,
+                repo_id = excluded.repo_id,
+                task_id = excluded.task_id,
+                run_id = excluded.run_id,
+                provider = excluded.provider,
+                route_scope = excluded.route_scope,
+                pointer_ids_json = excluded.pointer_ids_json,
+                required_pointer_ids_json = excluded.required_pointer_ids_json,
+                load_order_json = excluded.load_order_json,
+                omitted_json = excluded.omitted_json,
+                token_budget_json = excluded.token_budget_json,
+                estimated_tokens = excluded.estimated_tokens,
+                source_hashes_json = excluded.source_hashes_json,
+                peer_agent_states_json = excluded.peer_agent_states_json,
+                expires_at = excluded.expires_at,
+                signature_key_id = excluded.signature_key_id,
+                signature = excluded.signature,
+                signed_payload = excluded.signed_payload,
+                error_kind = excluded.error_kind,
+                error_message = excluded.error_message,
+                created_at = excluded.created_at
+            WHERE context_manifests.status != 'signed'
+               OR excluded.status = 'signed'
             """,
             (
                 manifest.manifest_id,
@@ -535,6 +578,7 @@ class SQLiteContextStore:
                 manifest.task_id,
                 manifest.run_id,
                 manifest.provider,
+                manifest.route_scope,
                 canonical_json(list(manifest.pointer_ids)),
                 canonical_json(list(manifest.required_pointer_ids)),
                 canonical_json(list(manifest.load_order)),
@@ -558,6 +602,15 @@ class SQLiteContextStore:
             assert saved is not None
             return saved
         return manifest
+
+    def _configure_connection(self) -> None:
+        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._conn.execute("PRAGMA synchronous = NORMAL")
+        try:
+            self._conn.execute("PRAGMA journal_mode = WAL").fetchone()
+        except sqlite3.DatabaseError:
+            pass
 
     def _ensure_schema(self) -> None:
         self._conn.executescript(
@@ -670,6 +723,7 @@ class SQLiteContextStore:
                 task_id TEXT NOT NULL,
                 run_id TEXT NOT NULL,
                 provider TEXT NOT NULL,
+                route_scope TEXT NOT NULL DEFAULT 'local',
                 pointer_ids_json TEXT NOT NULL DEFAULT '[]',
                 required_pointer_ids_json TEXT NOT NULL DEFAULT '[]',
                 load_order_json TEXT NOT NULL DEFAULT '[]',
@@ -688,7 +742,19 @@ class SQLiteContextStore:
             );
             """
         )
+        self._ensure_context_manifest_columns()
         self._conn.commit()
+
+    def _ensure_context_manifest_columns(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(context_manifests)")
+        }
+        if "route_scope" not in columns:
+            self._conn.execute(
+                "ALTER TABLE context_manifests "
+                "ADD COLUMN route_scope TEXT NOT NULL DEFAULT 'local'"
+            )
 
 
 def _source_from_row(row: sqlite3.Row) -> ContextSource:
@@ -773,6 +839,7 @@ def _manifest_from_row(row: sqlite3.Row) -> ContextManifest:
         task_id=row["task_id"],
         run_id=row["run_id"],
         provider=row["provider"],
+        route_scope=row["route_scope"],
         pointer_ids=string_tuple(row["pointer_ids_json"]),
         required_pointer_ids=string_tuple(row["required_pointer_ids_json"]),
         load_order=string_tuple(row["load_order_json"]),

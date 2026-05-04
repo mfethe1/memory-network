@@ -270,6 +270,7 @@ class ContextManifest:
     task_id: str
     run_id: str
     provider: str
+    route_scope: str = "local"
     pointer_ids: tuple[str, ...] = ()
     required_pointer_ids: tuple[str, ...] = ()
     load_order: tuple[str, ...] = ()
@@ -296,6 +297,7 @@ class ContextManifest:
             "task_id": self.task_id,
             "run_id": self.run_id,
             "provider": self.provider,
+            "route_scope": self.route_scope,
             "pointer_ids": list(self.pointer_ids),
             "required_pointer_ids": list(self.required_pointer_ids),
             "load_order": list(self.load_order),

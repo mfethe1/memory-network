@@ -8,6 +8,7 @@ from code_index.openclaw_context.manifest import CodeIndexContextProbe
 from code_index.openclaw_context.manifest import ContextManifestBuilder
 from code_index.openclaw_context.manifest import FleetContextGraphReader
 from code_index.openclaw_context.manifest import ManifestRequest
+from code_index.openclaw_context.manifest import verify_context_manifest
 from code_index.openclaw_context.models import ContextHealthEvent
 from code_index.openclaw_context.models import ContextManifest
 from code_index.openclaw_context.models import ContextPointer
@@ -40,4 +41,5 @@ __all__ = [
     "hold_assignment_for_avoid_pointers",
     "maybe_propose_handoff",
     "record_quality_gate_events",
+    "verify_context_manifest",
 ]

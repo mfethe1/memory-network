@@ -156,6 +156,14 @@ class DisabledGraphServerClient:
         )
 
 
+class UnavailableContextStore:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    def list_context_pointers(self) -> list[Any]:
+        raise RuntimeError(f"context store unavailable: {self.error}") from self.error
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="code-index-openclaw-hostd",
@@ -855,7 +863,15 @@ def _configured_context_probe(config: HostDaemonConfig) -> Any:
     from code_index.openclaw_hostd.context_probe import HostContextProbe
 
     repo_root = config.repo_roots[0] if config.repo_roots else None
-    return HostContextProbe(repo_root=repo_root)
+    context_store = None
+    if config.context_store_path is not None:
+        try:
+            from code_index.openclaw_context.store import SQLiteContextStore
+
+            context_store = SQLiteContextStore(config.context_store_path)
+        except Exception as exc:
+            context_store = UnavailableContextStore(exc)
+    return HostContextProbe(repo_root=repo_root, context_store=context_store)
 
 
 def _context_probe_payload(

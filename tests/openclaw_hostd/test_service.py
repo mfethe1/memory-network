@@ -1031,3 +1031,51 @@ def test_daemon_loop_without_nats_runs_one_heartbeat_safely(tmp_path: Path) -> N
         sleep=lambda seconds: None,
         max_iterations=1,
     )
+
+
+def test_configured_context_store_unavailable_emits_degraded_context_health(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    unavailable_path = tmp_path / "context-store-is-directory"
+    unavailable_path.mkdir()
+    base = _config(tmp_path)
+    config = HostDaemonConfig(
+        state_dir=base.state_dir,
+        host_identity_path=base.host_identity_path,
+        repo_roots=base.repo_roots,
+        graph_server_url=base.graph_server_url,
+        graph_server_token=base.graph_server_token,
+        ssh_hostname=base.ssh_hostname,
+        heartbeat_interval_seconds=base.heartbeat_interval_seconds,
+        nats_url=base.nats_url,
+        fleet_lease_store_path=base.fleet_lease_store_path,
+        config_path=base.config_path,
+        context_store_path=unavailable_path,
+    )
+
+    payload = service.run_once(
+        config,
+        as_json=True,
+        context_probe=service._configured_context_probe(config),
+        active_agent_runs=[
+            AgentRunState(
+                agent_id="agent-1",
+                task_id="task-1",
+                run_id="run-1",
+            )
+        ],
+    )
+    capsys.readouterr()
+
+    assert payload["context"]["metrics"][0]["degraded_reasons"] == [
+        "fumemory_unavailable"
+    ]
+    assert payload["context"]["health_flags"] == [
+        {
+            "run_id": "run-1",
+            "severity": "warning",
+            "event_kind": "context_manager_degraded",
+            "reasons": ["fumemory_unavailable"],
+        }
+    ]

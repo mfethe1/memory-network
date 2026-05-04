@@ -37,7 +37,8 @@ context_manifests
 
 The first six tables mirror the planned fumemory shape for M1. The
 `context_manifests` table is local replay storage for signed manifest
-idempotency.
+idempotency. The SQLite store enables WAL mode, `busy_timeout`, foreign-key
+checks, and `synchronous=NORMAL` for local durability and concurrent readers.
 
 Sources represent handles to existing local state, not duplicated state. The
 host probe exposes handles for:
@@ -60,6 +61,17 @@ Pointers can use these sensitivity values:
 - `host_private`: visible only on the same host, including cross-provider.
 - `provider_private`: visible only to the same host and provider.
 - `external_blocked`: visible internally but never to external messaging.
+
+Manifest building uses the same `ContextRetrievalPolicy` as direct pointer
+retrieval. Both target-symbol candidates and explicitly requested required
+pointer IDs are checked against the request host, provider, and route scope
+before they can be signed into a manifest.
+
+Hostd can attach passive context metrics with `--probe-context`. Setting
+`OPENCLAW_HOSTD_CONTEXT_STORE_PATH` or `context_store_path` in the hostd JSON
+config asks the probe to check that local store. If the store is unavailable,
+hostd reports `context_manager_degraded` health data and continues normal
+heartbeat/task execution.
 
 ## Context Health
 

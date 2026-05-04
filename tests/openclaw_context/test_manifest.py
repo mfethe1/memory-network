@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -7,6 +9,8 @@ from typing import Any
 from code_index.openclaw_context.manifest import CodeIndexContextProbe
 from code_index.openclaw_context.manifest import ContextManifestBuilder
 from code_index.openclaw_context.manifest import ManifestRequest
+from code_index.openclaw_context.manifest import verify_context_manifest
+from code_index.openclaw_context.models import canonical_json
 from code_index.openclaw_hostd.leases import InMemoryFleetLeaseStore
 from code_index.openclaw_context.store import SQLiteContextStore
 
@@ -198,6 +202,201 @@ def test_manifest_builder_aborts_with_error_manifest_when_doctor_reports_stale(
         assert manifest.error_kind == "stale_index"
         assert manifest.pointer_ids == ()
         assert [name for name, _ in probe.calls] == ["doctor"]
+    finally:
+        store.close()
+
+
+def test_manifest_builder_replaces_stale_doctor_error_after_recovery(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteContextStore(tmp_path / "context.db")
+    try:
+        probe = FakeProbe(doctor_ok=False)
+        builder = ContextManifestBuilder(
+            store=store,
+            probe=probe,
+            signing_secret="test-secret",
+            now=lambda: NOW,
+        )
+        request = _request()
+
+        stale = builder.build_manifest(request)
+        probe.doctor_ok = True
+        repaired = builder.build_manifest(request)
+
+        assert stale.status == "error"
+        assert stale.error_kind == "stale_index"
+        assert repaired.status == "signed"
+        assert repaired.request_hash == stale.request_hash
+        assert store.get_manifest_by_request_hash(stale.request_hash or "") == repaired
+    finally:
+        store.close()
+
+
+def test_manifest_builder_filters_candidates_and_required_pointers_by_policy(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteContextStore(tmp_path / "context.db")
+    try:
+        visible = store.upsert_context_pointer(
+            source_uri="file://repo/pkg/service.py",
+            source_kind="code",
+            content_hash="sha256:visible",
+            locator={"path": "pkg/service.py"},
+            summary="visible repo pointer",
+            sensitivity="repo",
+            host_id="host-b",
+            provider="claude",
+            target_symbols=["pkg.service.handle"],
+        )
+        host_private = store.upsert_context_pointer(
+            source_uri="memo://host-private",
+            source_kind="run_metadata",
+            content_hash="sha256:host-private",
+            locator={"id": "host-private"},
+            summary="foreign host-private pointer",
+            sensitivity="host_private",
+            host_id="host-b",
+            provider="claude",
+            target_symbols=["pkg.service.handle"],
+        )
+        provider_private = store.upsert_context_pointer(
+            source_uri="memo://provider-private",
+            source_kind="transcript",
+            content_hash="sha256:provider-private",
+            locator={"id": "provider-private"},
+            summary="foreign provider-private pointer",
+            sensitivity="provider_private",
+            host_id="host-b",
+            provider="claude",
+            target_symbols=["pkg.service.handle"],
+        )
+        builder = ContextManifestBuilder(
+            store=store,
+            probe=FakeProbe(),
+            signing_secret="test-secret",
+            now=lambda: NOW,
+        )
+
+        manifest = builder.build_manifest(_request())
+        required_private = builder.build_manifest(
+            _request(required_pointer_ids=(host_private.pointer_id,))
+        )
+
+        assert manifest.status == "signed"
+        assert visible.pointer_id in manifest.pointer_ids
+        assert host_private.pointer_id not in manifest.pointer_ids
+        assert provider_private.pointer_id not in manifest.pointer_ids
+        assert required_private.status == "error"
+        assert required_private.error_kind == "missing_required_pointer"
+        assert host_private.pointer_id not in required_private.pointer_ids
+    finally:
+        store.close()
+
+
+def test_manifest_verification_rejects_wrong_key_expiry_and_tampering(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteContextStore(tmp_path / "context.db")
+    try:
+        store.upsert_context_pointer(
+            source_uri="file://repo/pkg/service.py",
+            source_kind="code",
+            content_hash="sha256:service-v1",
+            locator={"path": "pkg/service.py"},
+            summary="service implementation",
+            sensitivity="repo",
+            target_symbols=["pkg.service.handle"],
+        )
+        builder = ContextManifestBuilder(
+            store=store,
+            probe=FakeProbe(),
+            signing_secret="test-secret",
+            signature_key_id="test-key",
+            now=lambda: NOW,
+        )
+
+        manifest = builder.build_manifest(_request())
+        tampered_payload = dict(
+            json.loads(manifest.signed_payload or "{}"),
+            pointer_ids=["ptr_tampered"],
+        )
+        tampered_signature = replace(manifest, signature="0" * 64)
+        tampered_payload_manifest = replace(
+            manifest,
+            signed_payload=canonical_json(tampered_payload),
+        )
+        tampered_row = replace(manifest, pointer_ids=("ptr_tampered",))
+
+        assert verify_context_manifest(
+            manifest,
+            signing_secret="test-secret",
+            signature_key_id="test-key",
+            now=lambda: NOW,
+        )
+        assert not verify_context_manifest(
+            manifest,
+            signing_secret="test-secret",
+            signature_key_id="wrong-key",
+            now=lambda: NOW,
+        )
+        assert not verify_context_manifest(
+            manifest,
+            signing_secret="test-secret",
+            signature_key_id="test-key",
+            now=lambda: NOW + timedelta(hours=1),
+        )
+        assert not verify_context_manifest(
+            tampered_signature,
+            signing_secret="test-secret",
+            signature_key_id="test-key",
+            now=lambda: NOW,
+        )
+        assert not verify_context_manifest(
+            tampered_payload_manifest,
+            signing_secret="test-secret",
+            signature_key_id="test-key",
+            now=lambda: NOW,
+        )
+        assert not verify_context_manifest(
+            tampered_row,
+            signing_secret="test-secret",
+            signature_key_id="test-key",
+            now=lambda: NOW,
+        )
+    finally:
+        store.close()
+
+
+def test_manifest_builder_prunes_dead_reference_pointers(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteContextStore(tmp_path / "context.db")
+    try:
+        dead = store.upsert_context_pointer(
+            source_uri="file://repo/pkg/deleted.py",
+            source_kind="code",
+            content_hash="sha256:deleted",
+            locator={"path": "pkg/deleted.py", "exists": False},
+            summary="deleted implementation",
+            tokens_estimate=10,
+            sensitivity="repo",
+            target_symbols=["pkg.service.handle"],
+        )
+        builder = ContextManifestBuilder(
+            store=store,
+            probe=FakeProbe(),
+            signing_secret="test-secret",
+            now=lambda: NOW,
+        )
+
+        manifest = builder.build_manifest(_request())
+
+        assert manifest.status == "signed"
+        assert dead.pointer_id not in manifest.pointer_ids
+        assert {
+            item["pointer_id"]: item["reason"] for item in manifest.omitted_context
+        }[dead.pointer_id] == "dead_reference"
     finally:
         store.close()
 

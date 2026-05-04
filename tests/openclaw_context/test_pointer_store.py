@@ -53,6 +53,21 @@ def test_pointer_store_dedupes_by_source_uri_content_hash_and_locator(
         store.close()
 
 
+def test_sqlite_context_store_uses_durable_concurrency_pragmas(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteContextStore(tmp_path / "context.db")
+    try:
+        pragmas = store.sqlite_pragmas()
+
+        assert pragmas["journal_mode"] == "wal"
+        assert pragmas["busy_timeout"] >= 5000
+        assert pragmas["foreign_keys"] == 1
+        assert pragmas["synchronous"] in {1, 2}
+    finally:
+        store.close()
+
+
 def test_sensitivity_filters_local_cross_provider_cross_host_and_external_routes(
     tmp_path: Path,
 ) -> None:

@@ -15,6 +15,8 @@ from typing import Any, Callable
 from code_index.openclaw_context.models import ContextManifest
 from code_index.openclaw_context.models import ContextPointer
 from code_index.openclaw_context.models import canonical_json
+from code_index.openclaw_context.policy import ContextRetrievalPolicy
+from code_index.openclaw_context.policy import pointer_visible
 
 
 LONG_CONTEXT_SOURCE_KINDS = {
@@ -36,6 +38,7 @@ class ManifestRequest:
     token_budget: int = 8_000
     required_pointer_ids: tuple[str, ...] = ()
     expires_at: datetime | str | None = None
+    route_scope: str = "local"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -48,6 +51,7 @@ class ManifestRequest:
             "token_budget": int(self.token_budget),
             "required_pointer_ids": list(self.required_pointer_ids),
             "expires_at": _datetime_text(self.expires_at),
+            "route_scope": self.route_scope,
         }
 
 
@@ -274,6 +278,7 @@ class ContextManifestBuilder:
             "task_id": request.task_id,
             "run_id": request.run_id,
             "provider": request.provider,
+            "route_scope": request.route_scope,
             "pointer_ids": list(pointer_ids),
             "required_pointer_ids": list(required_ids),
             "load_order": list(pointer_ids),
@@ -299,6 +304,7 @@ class ContextManifestBuilder:
             task_id=request.task_id,
             run_id=request.run_id,
             provider=request.provider,
+            route_scope=request.route_scope,
             pointer_ids=pointer_ids,
             required_pointer_ids=required_ids,
             load_order=pointer_ids,
@@ -323,14 +329,20 @@ class ContextManifestBuilder:
         tests: dict[str, Any],
         repo_map: str,
     ) -> list[ContextPointer]:
+        policy = ContextRetrievalPolicy(
+            host_id=request.host_id,
+            provider=request.provider,
+            route_scope=request.route_scope,
+        )
         candidates = self.store.list_context_pointers(
-            target_symbols=tuple(request.target_symbols)
+            policy=policy,
+            target_symbols=tuple(request.target_symbols),
         )
         required = [
             pointer
             for pointer_id in request.required_pointer_ids
             for pointer in [self.store.get_context_pointer(pointer_id)]
-            if pointer is not None
+            if pointer is not None and pointer_visible(pointer, policy)
         ]
         generated = [
             self.store.upsert_context_pointer(
@@ -456,12 +468,80 @@ class ContextManifestBuilder:
             task_id=request.task_id,
             run_id=request.run_id,
             provider=request.provider,
+            route_scope=request.route_scope,
             token_budget={"max_tokens": int(request.token_budget), "estimated_tokens": 0},
             expires_at=_datetime_text(request.expires_at),
             error_kind=error_kind,
             error_message=error_message,
             created_at=_datetime_text(self.now()),
         )
+
+
+def verify_context_manifest(
+    manifest: ContextManifest,
+    *,
+    signing_secret: str,
+    signature_key_id: str = "local",
+    now: Callable[[], datetime] | None = None,
+) -> bool:
+    if manifest.status != "signed":
+        return False
+    if not manifest.signed_payload or not manifest.signature:
+        return False
+    if manifest.signature_key_id != signature_key_id:
+        return False
+
+    try:
+        payload = json.loads(manifest.signed_payload)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if canonical_json(payload) != manifest.signed_payload:
+        return False
+
+    expires_at = _parse_datetime(manifest.expires_at)
+    if expires_at is None:
+        return False
+    current = now() if now is not None else datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    if expires_at <= current.astimezone(timezone.utc):
+        return False
+
+    expected_signature = hmac.new(
+        signing_secret.encode("utf-8"),
+        manifest.signed_payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, manifest.signature):
+        return False
+
+    expected = {
+        "schema_version": 1,
+        "status": manifest.status,
+        "host_id": manifest.host_id,
+        "repo_id": manifest.repo_id,
+        "task_id": manifest.task_id,
+        "run_id": manifest.run_id,
+        "provider": manifest.provider,
+        "route_scope": manifest.route_scope,
+        "pointer_ids": list(manifest.pointer_ids),
+        "required_pointer_ids": list(manifest.required_pointer_ids),
+        "load_order": list(manifest.load_order),
+        "omitted_context": [dict(item) for item in manifest.omitted_context],
+        "token_budget": dict(manifest.token_budget or {}),
+        "source_hashes": dict(manifest.source_hashes or {}),
+        "peer_agent_states": [dict(item) for item in manifest.peer_agent_states],
+        "expires_at": manifest.expires_at,
+        "request_hash": manifest.request_hash,
+    }
+    if set(payload) != set(expected):
+        return False
+    for key, value in expected.items():
+        if payload.get(key) != value:
+            return False
+    return True
 
 
 def _doctor_ok(result: dict[str, Any]) -> bool:
@@ -559,3 +639,15 @@ def _datetime_text(value: datetime | str | None) -> str | None:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).isoformat()
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
