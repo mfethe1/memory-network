@@ -42,13 +42,23 @@ class OpenClawControllerApp:
                 body,
                 principal=principal,
             )
-        return self.router.handle(
+        response = self.router.handle(
             method,
             path,
             body,
             headers=headers,
             principal=principal,
         )
+        if self.fleet_controller is not None and _is_telegram_webhook_path(
+            method,
+            path,
+        ):
+            return _with_auto_assignment(
+                response,
+                controller=self.fleet_controller,
+                store=self.store,
+            )
+        return response
 
     def close(self) -> None:
         self.store.close()
@@ -143,6 +153,23 @@ class FleetRouter:
                     )
                 result = self.controller.assign_task_from_command_ref(command_ref)
                 return ApiResponse(_assignment_status_code(result), result.to_dict())
+            if method == "POST" and parts == ["fleet", "task-claims"]:
+                claimant_host_id = _claimant_host_id(principal, payload)
+                if claimant_host_id is None:
+                    return _forbidden()
+                message_id = _optional_text(payload.get("message_id"))
+                if message_id is None:
+                    return ApiResponse(400, {"error": "message_id is required"})
+                result = self.controller.claim_message_as_task(
+                    message_id,
+                    claimant_host_id=claimant_host_id,
+                )
+                response_body = result.to_dict()
+                if response_body.get("assignment") is not None:
+                    response_body["deliveries"] = (
+                        self.controller.messaging_store.list_deliveries(message_id)
+                    )
+                return ApiResponse(_assignment_status_code(result), response_body)
             if method == "POST" and parts == ["fleet", "handoffs"]:
                 if not _principal_has_scope(
                     principal,
@@ -213,6 +240,34 @@ def _is_fleet_path(path: str) -> bool:
     return bool(parts and parts[0] == "fleet")
 
 
+def _is_telegram_webhook_path(method: str, path: str) -> bool:
+    parts = [part for part in urlsplit(path).path.strip("/").split("/") if part]
+    return method.upper() == "POST" and parts == ["adapters", "telegram", "webhook"]
+
+
+def _with_auto_assignment(
+    response: ApiResponse,
+    *,
+    controller: FleetController,
+    store: MessagingStore,
+) -> ApiResponse:
+    if response.status_code >= 400 or not response.body.get("created"):
+        return response
+    command_ref = response.body.get("command_ref")
+    if not isinstance(command_ref, Mapping):
+        return response
+    if str(command_ref.get("command_type") or "").strip() != "assign_task":
+        return response
+    result = controller.assign_task_from_command_ref(command_ref)
+    body = dict(response.body)
+    auto_assignment = result.to_dict()
+    message_id = _optional_text(command_ref.get("message_id"))
+    if message_id is not None:
+        auto_assignment["deliveries"] = store.list_deliveries(message_id)
+    body["auto_assignment"] = auto_assignment
+    return ApiResponse(response.status_code, body)
+
+
 def _object(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
@@ -241,6 +296,25 @@ def _principal_can_ingest_host(
         return False
     host_id = _optional_text(payload.get("host_id"))
     return host_id is not None and principal.principal_id == host_id
+
+
+def _claimant_host_id(
+    principal: Principal | None,
+    payload: Mapping[str, Any],
+) -> str | None:
+    if principal is None:
+        return None
+    requested = _optional_text(payload.get("claimant_host_id")) or _optional_text(
+        payload.get("host_id")
+    )
+    scopes = set(principal.scopes)
+    if "host:ingest" in scopes:
+        if requested is not None and requested != principal.principal_id:
+            return None
+        return principal.principal_id
+    if scopes & {"command:write", "controller:write", "fleet:assign"}:
+        return requested
+    return None
 
 
 def _forbidden() -> ApiResponse:

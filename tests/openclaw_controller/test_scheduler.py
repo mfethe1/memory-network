@@ -78,6 +78,7 @@ def _host(
     *,
     repo_root: str = r"E:\Projects\repo-a",
     providers: list[str] | None = None,
+    host_aliases: list[str] | None = None,
     now: datetime = NOW,
 ) -> None:
     controller.record_host_heartbeat(
@@ -85,6 +86,7 @@ def _host(
             "kind": "openclaw.host_heartbeat",
             "schema_version": 1,
             "host_id": host_id,
+            "host_aliases": list(host_aliases or []),
             "heartbeat_interval_seconds": 10,
             "generated_at": now.isoformat(),
             "capabilities": {
@@ -138,6 +140,7 @@ def _command(
     *,
     task_id: str = "task-123",
     host_id: str = "host-a",
+    host_alias: str | None = None,
     body: str = "Implement the task.",
     repo_root: str = r"E:\Projects\repo-a",
     provider: str = "codex",
@@ -153,6 +156,9 @@ def _command(
     }
     if required_provider_capabilities is not None:
         assignment["required_provider_capabilities"] = required_provider_capabilities
+    metadata: dict[str, Any] = {}
+    if host_alias is not None:
+        metadata["routing"] = {"host_alias": host_alias}
     room = store.create_room(
         room_kind="task",
         display_name=f"Task {task_id}",
@@ -172,9 +178,54 @@ def _command(
         message_type="command",
         command_type="assign_task",
         target_scope={"kind": "task", "task_id": task_id},
+        metadata=metadata,
         expires_at=expires_at,
     )
     return result["command_ref"]
+
+
+def _claimable_message(
+    store: MessagingStore,
+    *,
+    body: str = "please check my email",
+    repo_root: str = r"E:\Projects\repo-a",
+    provider: str = "codex",
+    host_alias: str | None = None,
+    recipients: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    routing = {"host_alias": host_alias} if host_alias else {}
+    room = store.create_room(
+        room_kind="fleet",
+        display_name="Fleet",
+        metadata={
+            "default_delivery_targets": recipients or [],
+            "assignment": {
+                "repo_root": repo_root,
+                "provider": provider,
+                "selected_paths": ["code_index/openclaw_controller/app.py"],
+                "selected_nodes": ["openclaw_controller.app"],
+            },
+        },
+    )
+    metadata: dict[str, Any] = {
+        "claimable_work": {"status": "pending", "source": "telegram"}
+    }
+    if routing:
+        metadata["routing"] = routing
+    return store.create_message(
+        room_id=room["room_id"],
+        sender_kind="human",
+        sender_id="operator-1",
+        body=body,
+        message_type="chat",
+        adapter_id="telegram",
+        platform_ref={
+            "platform_room_id": "-100123",
+            "platform_message_id": "200",
+            "platform_event_id": "100",
+        },
+        metadata=metadata,
+    )["message"]
 
 
 def test_controller_assigns_task_only_to_eligible_host_and_publishes_nats_shape(
@@ -215,6 +266,94 @@ def test_controller_assigns_task_only_to_eligible_host_and_publishes_nats_shape(
                     "selected_nodes": ["openclaw_controller.app"],
                 },
             )
+        ]
+    finally:
+        store.close()
+
+
+def test_claimable_message_claim_assigns_the_claimant_host(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    try:
+        controller, nats, _leases = _controller(store)
+        _host(controller, "host-a", host_aliases=["rosie"])
+        _host(controller, "host-z", host_aliases=["lenny"])
+        message = _claimable_message(store)
+
+        result = controller.claim_message_as_task(
+            message["message_id"],
+            claimant_host_id="host-z",
+            now=NOW,
+        )
+
+        command_ref = store.get_command_ref_for_message(message["message_id"])
+        assert result.status == "assigned"
+        assert result.assignment is not None
+        assert result.assignment.host_id == "host-z"
+        assert result.assignment.task_id == f"telegram-msg:{message['message_id']}"
+        assert command_ref is not None
+        assert command_ref["status"] == "assigned"
+        assert [subject for subject, _payload in nats.published] == [
+            "openclaw.task.host-z.assigned"
+        ]
+    finally:
+        store.close()
+
+
+def test_host_alias_assignment_resolves_to_alias_host_without_fallback(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        controller, nats, _leases = _controller(store)
+        _host(controller, "host-a", host_aliases=["rosie"])
+        _host(controller, "host-z", host_aliases=["lenny"])
+        command_ref = _command(store, host_id="host-a", host_alias="lenny")
+
+        result = controller.assign_task_from_command_ref(command_ref, now=NOW)
+
+        assert result.status == "assigned"
+        assert result.assignment is not None
+        assert result.assignment.host_id == "host-z"
+        assert [subject for subject, _payload in nats.published] == [
+            "openclaw.task.host-z.assigned"
+        ]
+    finally:
+        store.close()
+
+
+def test_racing_claimable_message_claims_publish_one_task(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    try:
+        nats = ReentrantNats()
+        controller, _publisher, _leases = _controller(store, nats=nats)
+        _host(controller, "host-a", host_aliases=["rosie"])
+        _host(controller, "host-z", host_aliases=["lenny"])
+        message = _claimable_message(store)
+        losing_result = None
+
+        def lenny_claim() -> None:
+            nonlocal losing_result
+            losing_result = controller.claim_message_as_task(
+                message["message_id"],
+                claimant_host_id="host-z",
+                now=NOW,
+            )
+
+        nats.on_first_publish = lenny_claim
+
+        winning_result = controller.claim_message_as_task(
+            message["message_id"],
+            claimant_host_id="host-a",
+            now=NOW,
+        )
+
+        assert winning_result.status == "assigned"
+        assert losing_result is not None
+        assert losing_result.status == "rejected"
+        assert losing_result.rejection is not None
+        assert losing_result.rejection.reason == "command_ref_claimed"
+        assert [subject for subject, _payload in nats.published] == [
+            "openclaw.task.host-a.assigned"
         ]
     finally:
         store.close()

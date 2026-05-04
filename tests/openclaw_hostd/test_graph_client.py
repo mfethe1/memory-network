@@ -33,6 +33,17 @@ class FakeGraphServerState:
             "ok": True,
             "run": {"run_id": "local-run-1", "status": "queued"},
         }
+        self.agent_preflight_status = HTTPStatus.OK
+        self.agent_preflight_payload: dict[str, Any] = {
+            "ok": True,
+            "preflight": {
+                "preflight_id": "pf_local_1",
+                "status": "clear",
+                "can_dispatch": True,
+                "requires_confirmation": False,
+                "warnings": [],
+            },
+        }
         self.agent_board_status = HTTPStatus.OK
         self.agent_board_payload: dict[str, Any] = {
             "kind": "code_index_agent_kanban",
@@ -104,6 +115,12 @@ class FakeGraphServerHandler(BaseHTTPRequestHandler):
         self.state.requests.append(self._request_record("POST", payload=payload))
         if not self._is_authorized():
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
+        if self.path == "/api/agent-task-preflight":
+            self._send_json(
+                self.state.agent_preflight_status,
+                self.state.agent_preflight_payload,
+            )
             return
         if self.path == "/api/agent-runs":
             self._send_json(self.state.agent_run_status, self.state.agent_run_payload)
@@ -288,6 +305,21 @@ def test_submit_task_posts_openclaw_task_payload_to_agent_runs() -> None:
     assert fake.state.requests == [
         {
             "method": "POST",
+            "path": "/api/agent-task-preflight",
+            "payload": {
+                "task_id": "task-123",
+                "host_id": "host_0123456789abcdef0123456789abcdef",
+                "message": "Inspect selected files.",
+                "run_id": "run-task-123",
+                "selected_paths": [
+                    "code_index/openclaw_hostd/service.py",
+                    "tests/x.py",
+                ],
+                "provider": "codex",
+            },
+        },
+        {
+            "method": "POST",
             "path": "/api/agent-runs",
             "payload": {
                 "task_id": "task-123",
@@ -298,6 +330,91 @@ def test_submit_task_posts_openclaw_task_payload_to_agent_runs() -> None:
                     "code_index/openclaw_hostd/service.py",
                     "tests/x.py",
                 ],
+                "provider": "codex",
+                "preflight": {
+                    "preflight_id": "pf_local_1",
+                    "status": "clear",
+                    "can_dispatch": True,
+                    "requires_confirmation": False,
+                    "warnings": [],
+                },
+            },
+        },
+    ]
+
+
+def test_submit_task_confirms_preflight_when_graph_server_requires_it() -> None:
+    with RunningFakeGraphServer() as fake:
+        fake.state.agent_preflight_payload = {
+            "ok": True,
+            "preflight": {
+                "preflight_id": "pf_needs_confirmation",
+                "status": "needs_confirmation",
+                "can_dispatch": True,
+                "requires_confirmation": True,
+                "warnings": [{"kind": "critical_care", "severity": "warning"}],
+            },
+        }
+
+        result = GraphServerClient(fake.base_url).submit_task(
+            task_id="task-123",
+            host_id="host_0123456789abcdef0123456789abcdef",
+            message="Inspect selected files.",
+            selected_paths=("code_index/openclaw_hostd/service.py",),
+            provider="codex",
+        )
+
+    assert result.ok is True
+    assert fake.state.requests[-1] == {
+        "method": "POST",
+        "path": "/api/agent-runs",
+        "payload": {
+            "task_id": "task-123",
+            "host_id": "host_0123456789abcdef0123456789abcdef",
+            "message": "Inspect selected files.",
+            "selected_paths": ["code_index/openclaw_hostd/service.py"],
+            "provider": "codex",
+            "preflight": {
+                "preflight_id": "pf_needs_confirmation",
+                "status": "needs_confirmation",
+                "can_dispatch": True,
+                "requires_confirmation": True,
+                "warnings": [{"kind": "critical_care", "severity": "warning"}],
+            },
+            "preflight_confirmed": True,
+        },
+    }
+
+
+def test_submit_task_returns_preflight_failure_without_dispatching_run() -> None:
+    with RunningFakeGraphServer() as fake:
+        fake.state.agent_preflight_status = HTTPStatus.PRECONDITION_REQUIRED
+        fake.state.agent_preflight_payload = {
+            "ok": False,
+            "error": "preflight confirmation is required",
+            "kind": "code_index_graph_preflight_rejection",
+        }
+
+        result = GraphServerClient(fake.base_url).submit_task(
+            task_id="task-123",
+            host_id="host_0123456789abcdef0123456789abcdef",
+            message="Inspect selected files.",
+            selected_paths=("code_index/openclaw_hostd/service.py",),
+            provider="codex",
+        )
+
+    assert result.ok is False
+    assert result.status_code == HTTPStatus.PRECONDITION_REQUIRED
+    assert result.error == "preflight confirmation is required"
+    assert fake.state.requests == [
+        {
+            "method": "POST",
+            "path": "/api/agent-task-preflight",
+            "payload": {
+                "task_id": "task-123",
+                "host_id": "host_0123456789abcdef0123456789abcdef",
+                "message": "Inspect selected files.",
+                "selected_paths": ["code_index/openclaw_hostd/service.py"],
                 "provider": "codex",
             },
         }

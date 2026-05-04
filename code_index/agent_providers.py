@@ -12,6 +12,8 @@ from typing import Any
 
 CAPABILITY_COMMAND_PRESET = "command_preset"
 CAPABILITY_CUSTOM_COMMAND = "custom_command"
+CAPABILITY_TASK_RUN = "task_run"
+CAPABILITY_FRESH_SESSION = "fresh_session"
 CAPABILITY_INLINE_PROVIDER_PROMPT = "inline_provider_prompt"
 CAPABILITY_PROVIDER_PROMPT_FILE = "provider_prompt_file"
 CAPABILITY_LAST_MESSAGE_FILE = "last_message_file"
@@ -19,6 +21,8 @@ CAPABILITY_MCP_CONFIG_FILE = "mcp_config_file"
 CAPABILITY_TASK_JSON_FILE = "task_json_file"
 CAPABILITY_JSON_OUTPUT = "json_output"
 CAPABILITY_STREAM_JSON_OUTPUT = "stream_json_output"
+CAPABILITY_PROVIDER_EVENT_PARSER = "provider_event_parser"
+CAPABILITY_GENERIC_TEXT_PARSER = "generic_text_parser"
 PROVIDER_SPECS_ENV_VAR = "CODE_INDEX_AGENT_PROVIDER_SPECS"
 
 
@@ -191,12 +195,19 @@ def _kimi_command_preset() -> str:
 
 
 def _builtin_provider_specs() -> tuple[AgentProviderSpec, ...]:
+    task_run_caps = frozenset({CAPABILITY_TASK_RUN, CAPABILITY_FRESH_SESSION})
     return (
         AgentProviderSpec(
             id="custom",
             display_name="Custom",
             command_preset=None,
-            capabilities=frozenset({CAPABILITY_CUSTOM_COMMAND}),
+            capabilities=frozenset(
+                {
+                    CAPABILITY_CUSTOM_COMMAND,
+                    CAPABILITY_GENERIC_TEXT_PARSER,
+                    *task_run_caps,
+                }
+            ),
         ),
         AgentProviderSpec(
             id="claude",
@@ -207,10 +218,11 @@ def _builtin_provider_specs() -> tuple[AgentProviderSpec, ...]:
             ),
             capabilities=frozenset(
                 {
-                    CAPABILITY_COMMAND_PRESET,
                     CAPABILITY_PROVIDER_PROMPT_FILE,
                     CAPABILITY_MCP_CONFIG_FILE,
                     CAPABILITY_STREAM_JSON_OUTPUT,
+                    CAPABILITY_PROVIDER_EVENT_PARSER,
+                    *task_run_caps,
                 }
             ),
         ),
@@ -223,10 +235,11 @@ def _builtin_provider_specs() -> tuple[AgentProviderSpec, ...]:
             ),
             capabilities=frozenset(
                 {
-                    CAPABILITY_COMMAND_PRESET,
                     CAPABILITY_PROVIDER_PROMPT_FILE,
                     CAPABILITY_LAST_MESSAGE_FILE,
                     CAPABILITY_JSON_OUTPUT,
+                    CAPABILITY_PROVIDER_EVENT_PARSER,
+                    *task_run_caps,
                 }
             ),
         ),
@@ -236,10 +249,11 @@ def _builtin_provider_specs() -> tuple[AgentProviderSpec, ...]:
             command_preset=_kimi_command_preset(),
             capabilities=frozenset(
                 {
-                    CAPABILITY_COMMAND_PRESET,
                     CAPABILITY_PROVIDER_PROMPT_FILE,
                     CAPABILITY_MCP_CONFIG_FILE,
                     CAPABILITY_STREAM_JSON_OUTPUT,
+                    CAPABILITY_PROVIDER_EVENT_PARSER,
+                    *task_run_caps,
                 }
             ),
         ),
@@ -252,10 +266,70 @@ def _builtin_provider_specs() -> tuple[AgentProviderSpec, ...]:
             ),
             capabilities=frozenset(
                 {
-                    CAPABILITY_COMMAND_PRESET,
                     CAPABILITY_INLINE_PROVIDER_PROMPT,
                     CAPABILITY_TASK_JSON_FILE,
                     CAPABILITY_JSON_OUTPUT,
+                    CAPABILITY_PROVIDER_EVENT_PARSER,
+                    *task_run_caps,
+                }
+            ),
+        ),
+        AgentProviderSpec(
+            id="cursor",
+            display_name="Cursor",
+            command_preset=(
+                "cursor-agent-sidecar run --root {root} --task-json {task_json} "
+                "--provider-prompt-file {provider_prompt_file} "
+                "--mcp-config-file {mcp_config_file}"
+            ),
+            capabilities=frozenset(
+                {
+                    CAPABILITY_PROVIDER_PROMPT_FILE,
+                    CAPABILITY_MCP_CONFIG_FILE,
+                    CAPABILITY_TASK_JSON_FILE,
+                    CAPABILITY_STREAM_JSON_OUTPUT,
+                    CAPABILITY_PROVIDER_EVENT_PARSER,
+                    *task_run_caps,
+                }
+            ),
+        ),
+        AgentProviderSpec(
+            id="goose",
+            display_name="Goose",
+            command_preset="goose run --instructions {provider_prompt_file} --no-session",
+            capabilities=frozenset(
+                {
+                    CAPABILITY_PROVIDER_PROMPT_FILE,
+                    CAPABILITY_GENERIC_TEXT_PARSER,
+                    *task_run_caps,
+                }
+            ),
+        ),
+        AgentProviderSpec(
+            id="aider",
+            display_name="Aider",
+            command_preset=(
+                "aider --yes-always --message-file {provider_prompt_file} "
+                "{selected_paths}"
+            ),
+            capabilities=frozenset(
+                {
+                    CAPABILITY_PROVIDER_PROMPT_FILE,
+                    CAPABILITY_GENERIC_TEXT_PARSER,
+                    *task_run_caps,
+                }
+            ),
+        ),
+        AgentProviderSpec(
+            id="openhands",
+            display_name="OpenHands",
+            command_preset="openhands --headless --json -f {provider_prompt_file}",
+            capabilities=frozenset(
+                {
+                    CAPABILITY_PROVIDER_PROMPT_FILE,
+                    CAPABILITY_JSON_OUTPUT,
+                    CAPABILITY_PROVIDER_EVENT_PARSER,
+                    *task_run_caps,
                 }
             ),
         ),

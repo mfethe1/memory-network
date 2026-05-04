@@ -1,0 +1,21 @@
+{
+  "name": "code-index-sandcastle",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sandcastle orchestration for code_index",
+  "type": "module",
+  "scripts": {
+    "sandcastle:build": "docker build -t sandcastle:code-index -f .sandcastle/Dockerfile .",
+    "sandcastle:run": "npx tsx .sandcastle/main.ts",
+    "sandcastle:interactive": "npx tsx .sandcastle/interactive.ts",
+    "sandcastle:plan": "npx tsx .sandcastle/main.ts --plan",
+    "sandcastle:implement": "npx tsx .sandcastle/main.ts --implement",
+    "sandcastle:review": "npx tsx .sandcastle/main.ts --review"
+  },
+  "devDependencies": {
+    "@ai-hero/sandcastle": "^0.5.7",
+    "@types/node": "^25.6.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}

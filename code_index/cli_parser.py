@@ -25,6 +25,7 @@ from code_index.commands import (
     import_scip_cmd,
     init_cmd,
     install_hooks_cmd,
+    mcp_fleet_serve,
     mcp_serve_cmd,
     query_cmd,
     rebuild_fts_cmd,
@@ -887,6 +888,49 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_mcp.set_defaults(func=mcp_serve_cmd.run)
+
+    p_fleet_mcp = subparsers.add_parser(
+        "fleet-mcp-serve",
+        help="OpenClaw Fleet Controller MCP server with read-heavy fleet tools.",
+    )
+    p_fleet_mcp.add_argument(
+        "--describe",
+        action="store_true",
+        help="print the fleet tool surface as JSON and exit",
+    )
+    p_fleet_mcp.add_argument(
+        "--transport",
+        default="stdio",
+        choices=["stdio", "http"],
+        help="MCP transport for the fleet server (default: stdio)",
+    )
+    p_fleet_mcp.add_argument(
+        "--host",
+        default=None,
+        help="HTTP host (default: 127.0.0.1; requires --allow-remote otherwise)",
+    )
+    p_fleet_mcp.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="HTTP port (default: 8766)",
+    )
+    p_fleet_mcp.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="allow non-loopback HTTP bind",
+    )
+    p_fleet_mcp.add_argument(
+        "--token",
+        default=None,
+        help="bearer token override for HTTP transport",
+    )
+    p_fleet_mcp.add_argument(
+        "--db",
+        default=None,
+        help="optional SQLite context-store path for fumemory queries",
+    )
+    p_fleet_mcp.set_defaults(func=mcp_fleet_serve.run)
 
     # New commands registered via module-level register_parser for cleaner
     # expansion. Existing commands above will migrate to this pattern over time.

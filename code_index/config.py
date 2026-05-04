@@ -58,7 +58,10 @@ class Config:
 def find_root(start: Path) -> Path | None:
     """Walk upward looking for an existing .code_index/."""
     start = start.resolve()
+    home = Path.home().resolve()
     for candidate in (start, *start.parents):
+        if candidate == home and start != home:
+            continue
         if (candidate / CONFIG_DIRNAME).is_dir():
             return candidate
     return None

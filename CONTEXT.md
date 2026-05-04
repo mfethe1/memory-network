@@ -12,6 +12,21 @@ _Avoid_: Code Index, graph-server, control plane when referring to the whole pro
 A requested unit of coding work, including the prompt and the context needed to understand what should be done.
 _Avoid_: Run, session
 
+**Claimable Work**:
+A message or request that is visible to eligible hosts but is not yet owned by a
+specific **Agent Run**.
+_Avoid_: Broadcast task, loose chat when execution may happen
+
+**Task Claim**:
+The Fleet Controller action that turns **Claimable Work** into one leased
+**Agent Task** on one host.
+_Avoid_: Assignment when the host has not won the lease yet
+
+**Host Alias**:
+A human-readable routing name for an OpenClaw host, such as `rosie` or `lenny`.
+It resolves to a stable host ID before any task is assigned.
+_Avoid_: Host ID, hostname, authorization key
+
 **Agent Run**:
 A coding session in which a specific agent works on an **Agent Task**.
 _Avoid_: Task, prompt
@@ -45,6 +60,14 @@ _Avoid_: Run status
 - **Graph Agent Companion** uses codebase indexing, graph context, retrieval, leases, and run transcripts to supervise coding agents.
 - An **Agent Task** can have one or more **Agent Runs**.
 - An **Agent Run** belongs to exactly one **Agent Task**.
+- **Claimable Work** may become an **Agent Task** only after a successful
+  **Task Claim**.
+- A **Task Claim** must acquire the central task lease before any **Agent Run**
+  starts.
+- Two hosts may observe the same **Claimable Work**, but only one host may win
+  the **Task Claim** for it.
+- A **Host Alias** can target **Claimable Work** to one host, but it is not used
+  as an authorization key.
 - An **Agent Task** may use an **Agent Swarm** as its execution strategy.
 - An **Agent Swarm** coordinates multiple **Agent Runs** for the same **Agent Task**.
 - An **Agent Swarm** may have one **Swarm Lead** and multiple worker **Agent Runs**.
@@ -102,6 +125,12 @@ _Avoid_: Run status
 >
 > **Dev:** "Should graph-server own run orchestration?"
 > **Domain expert:** "No. graph-server can invoke the **Run Orchestrator**, but the orchestration rules belong in a shared core that the CLI can also run."
+>
+> **Dev:** "If I post 'please check my email' without tagging anyone, should both Rosie and Lenny run it?"
+> **Domain expert:** "No. The message is **Claimable Work**. Rosie and Lenny may both see it, but the first eligible host to make a **Task Claim** wins the central task lease and the other host must stand down."
+>
+> **Dev:** "Does `@rosie` mean the task is authorized by the name Rosie?"
+> **Domain expert:** "No. `@rosie` is a **Host Alias**. The Fleet Controller resolves it to a stable host ID and still uses signed commands, delivery records, and leases for authorization and execution."
 
 ## Flagged ambiguities
 
@@ -111,3 +140,9 @@ _Avoid_: Run status
 - "stale" and "orphaned" were treated like statuses. Resolved: durable **Agent Run Status** is separate from derived **Run Health**.
 - "swarm" was introduced alongside a specific model. Resolved: **Agent Swarm** is the coordinated team strategy for an **Agent Task**; provider/model selection is separate.
 - Swarm coordination and run lifecycle supervision were conflated. Resolved: **Swarm Lead** coordinates work content; **Run Orchestrator** manages deterministic lifecycle and safety.
+- "Rosie" and "Lenny" were introduced as host-facing names. Resolved: they are
+  **Host Aliases** that route messages to stable host IDs, not separate
+  Telegram bots or authorization identities.
+- Untagged Telegram requests were ambiguous between chat and task assignment.
+  Resolved: untagged actionable requests become **Claimable Work** that can be
+  claimed by exactly one host through a **Task Claim**.

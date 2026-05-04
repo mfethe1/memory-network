@@ -14,6 +14,7 @@ from code_index.openclaw_controller.models import HostInventoryRecord
 from code_index.openclaw_controller.models import Rejection
 from code_index.openclaw_controller.models import TaskAssignment
 from code_index.openclaw_hostd.leases import LeaseConflictError
+from code_index.openclaw_messaging.models import MessagingError
 from code_index.openclaw_messaging.store import MessagingStore
 
 
@@ -123,6 +124,7 @@ class FleetController:
         self,
         command_ref: Mapping[str, Any],
         *,
+        claimant_host_id: str | None = None,
         now: datetime | None = None,
     ) -> AssignmentResult:
         timestamp = _utc(now)
@@ -176,9 +178,11 @@ class FleetController:
                 message_id=stored_command["message_id"],
             )
 
+        host_delivery_ids = self._host_delivery_ids(stored_command["message_id"])
         selected_host, rejection = self._select_host(
             details,
-            message_id=stored_command["message_id"],
+            explicit_host_delivery_ids=host_delivery_ids,
+            claimant_host_id=claimant_host_id,
             now=timestamp,
         )
         if selected_host is None:
@@ -194,12 +198,13 @@ class FleetController:
             host_id=selected_host.host_id,
         )
         if delivery is None:
-            return self._reject_claimed_assignment(
-                stored_command["command_id"],
-                reason="delivery_missing",
-                message="originating message has no delivery record for selected host",
-                message_id=stored_command["message_id"],
-                details={"host_id": selected_host.host_id},
+            delivery = self.messaging_store.ensure_message_delivery(
+                stored_command["message_id"],
+                {
+                    "recipient_kind": "host",
+                    "recipient_id": selected_host.host_id,
+                },
+                command_id=stored_command["command_id"],
             )
 
         existing_repo_lease = self.lease_store.get_active_lease(
@@ -302,6 +307,32 @@ class FleetController:
                 ),
                 "assignment": assignment.to_dict(),
             },
+        )
+
+    def claim_message_as_task(
+        self,
+        message_id: str,
+        *,
+        claimant_host_id: str,
+        now: datetime | None = None,
+    ) -> AssignmentResult:
+        timestamp = _utc(now)
+        message_id = _required_text(message_id, "message_id")
+        claimant = _required_text(claimant_host_id, "claimant_host_id")
+        try:
+            promoted = self.messaging_store.promote_message_to_assign_task_command_ref(
+                message_id,
+            )
+        except (KeyError, MessagingError) as exc:
+            return self._assignment_rejected(
+                reason="claim_not_allowed",
+                message=str(exc),
+                message_id=message_id,
+            )
+        return self.assign_task_from_command_ref(
+            promoted["command_ref"],
+            claimant_host_id=claimant,
+            now=timestamp,
         )
 
     def submit_handoff_proposal(
@@ -464,16 +495,25 @@ class FleetController:
             assignment.update(room_metadata["assignment"])
         if isinstance(message_metadata.get("assignment"), Mapping):
             assignment.update(message_metadata["assignment"])
+        routing = (
+            message_metadata.get("routing")
+            if isinstance(message_metadata.get("routing"), Mapping)
+            else {}
+        )
         task_id = _optional_text(command.get("task_id"))
         if task_id is None:
             target_scope = message.get("target_scope")
             if isinstance(target_scope, Mapping):
                 task_id = _optional_text(target_scope.get("task_id"))
+        assignment_message = _optional_text(assignment.get("message"))
         return AssignmentDetails(
             task_id=_required_text(task_id, "task_id"),
             repo_root=_required_text(assignment.get("repo_root"), "repo_root"),
             provider=_required_text(assignment.get("provider"), "provider"),
-            message=_required_text(message.get("body"), "message"),
+            message=assignment_message
+            or _required_text(message.get("body"), "message"),
+            host_alias=_optional_text(routing.get("host_alias"))
+            or _optional_text(assignment.get("host_alias")),
             selected_paths=_string_tuple(assignment.get("selected_paths")),
             selected_nodes=_string_tuple(assignment.get("selected_nodes")),
             required_provider_capabilities=_first_string_tuple(
@@ -496,15 +536,73 @@ class FleetController:
         self,
         details: AssignmentDetails,
         *,
-        message_id: str,
+        explicit_host_delivery_ids: frozenset[str],
+        claimant_host_id: str | None = None,
         now: datetime,
     ) -> tuple[HostInventoryRecord | None, Rejection]:
+        alias_host, alias_rejection = self._resolve_alias_host(details.host_alias)
+        if alias_rejection is not None:
+            return None, alias_rejection
+
+        claimant = _optional_text(claimant_host_id)
+        if claimant is not None:
+            host = self._hosts.get(claimant)
+            if host is None:
+                return None, Rejection(
+                    reason="claimant_not_found",
+                    message="claimant host is not registered",
+                    details={"claimant_host_id": claimant},
+                )
+            if alias_host is not None and host.host_id != alias_host.host_id:
+                return None, Rejection(
+                    reason="claimant_alias_mismatch",
+                    message="claimant does not match the requested host alias",
+                    details={
+                        "claimant_host_id": claimant,
+                        "host_alias": details.host_alias,
+                        "resolved_host_id": alias_host.host_id,
+                    },
+                )
+            delivery_scope = (
+                frozenset()
+                if details.host_alias
+                else explicit_host_delivery_ids
+            )
+            reason = self._host_rejection_reason(
+                host,
+                details,
+                explicit_host_delivery_ids=delivery_scope,
+                now=now,
+            )
+            if reason is not None:
+                return None, _host_failure_rejection(
+                    host.host_id,
+                    reason,
+                    details={"claimant_host_id": claimant},
+                )
+            return host, Rejection("", "")
+
+        if alias_host is not None:
+            reason = self._host_rejection_reason(
+                alias_host,
+                details,
+                explicit_host_delivery_ids=frozenset(),
+                now=now,
+            )
+            if reason is not None:
+                return None, _host_failure_rejection(
+                    alias_host.host_id,
+                    reason,
+                    details={"host_alias": details.host_alias},
+                )
+            return alias_host, Rejection("", "")
+
         failures: list[dict[str, str]] = []
         for host in sorted(self._hosts.values(), key=lambda item: item.host_id):
             reason = self._host_rejection_reason(
                 host,
                 details,
-                message_id=message_id,
+                explicit_host_delivery_ids=explicit_host_delivery_ids,
                 now=now,
             )
             if reason is not None:
@@ -523,12 +621,41 @@ class FleetController:
             details={"candidates": failures},
         )
 
+    def _resolve_alias_host(
+        self,
+        host_alias: str | None,
+    ) -> tuple[HostInventoryRecord | None, Rejection | None]:
+        alias = _optional_text(host_alias)
+        if alias is None:
+            return None, None
+        matches = [
+            host
+            for host in sorted(self._hosts.values(), key=lambda item: item.host_id)
+            if alias.lower() in {item.lower() for item in host.host_aliases}
+        ]
+        if not matches:
+            return None, Rejection(
+                reason="host_alias_unknown",
+                message="requested host alias does not resolve to a registered host",
+                details={"host_alias": alias},
+            )
+        if len(matches) > 1:
+            return None, Rejection(
+                reason="host_alias_ambiguous",
+                message="requested host alias resolves to multiple hosts",
+                details={
+                    "host_alias": alias,
+                    "host_ids": [host.host_id for host in matches],
+                },
+            )
+        return matches[0], None
+
     def _host_rejection_reason(
         self,
         host: HostInventoryRecord,
         details: AssignmentDetails,
         *,
-        message_id: str | None = None,
+        explicit_host_delivery_ids: frozenset[str] = frozenset(),
         now: datetime,
     ) -> str | None:
         if host.health_at(now) != HOST_HEALTHY:
@@ -542,10 +669,10 @@ class FleetController:
             details.required_provider_capabilities,
         ):
             return "provider_capability_missing"
-        if message_id is not None and self._host_delivery(
-            message_id,
-            host_id=host.host_id,
-        ) is None:
+        if (
+            explicit_host_delivery_ids
+            and host.host_id not in explicit_host_delivery_ids
+        ):
             return "delivery_missing"
         repo_lease = self.lease_store.get_active_lease(
             "repo",
@@ -592,6 +719,13 @@ class FleetController:
             if delivery["recipient_kind"] == "host" and delivery["recipient_id"] == host_id:
                 return delivery
         return None
+
+    def _host_delivery_ids(self, message_id: str) -> frozenset[str]:
+        return frozenset(
+            str(delivery["recipient_id"])
+            for delivery in self.messaging_store.list_deliveries(message_id)
+            if delivery["recipient_kind"] == "host"
+        )
 
     def _task_publish_payload(
         self,
@@ -873,6 +1007,31 @@ def _dominant_rejection_reason(failures: list[dict[str, str]]) -> str:
         if reason in reasons:
             return reason
     return "no_eligible_hosts"
+
+
+def _host_failure_rejection(
+    host_id: str,
+    reason: str,
+    *,
+    details: Mapping[str, Any] | None = None,
+) -> Rejection:
+    messages = {
+        "host_health": "host is not healthy",
+        "repo_root_mismatch": "host cannot access the requested repo root",
+        "provider_unavailable": "host does not expose the requested provider",
+        "provider_capability_missing": "host provider is missing a required capability",
+        "delivery_missing": "host is outside the message delivery scope",
+        "repo_lease_conflict": "repo lease is held by another host",
+        "task_lease_conflict": "task lease is already active",
+    }
+    payload = {"host_id": host_id}
+    if details:
+        payload.update(dict(details))
+    return Rejection(
+        reason=reason,
+        message=messages.get(reason, "host is not eligible for this task"),
+        details=payload,
+    )
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:

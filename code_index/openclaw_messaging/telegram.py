@@ -12,6 +12,9 @@ from code_index.openclaw_messaging.store import MessagingStore
 from code_index.openclaw_messaging.store import adapter_idempotency_key
 
 
+HOST_ALIAS_MENTIONS = frozenset({"rosie", "lenny"})
+
+
 class TelegramAdapter(MessagingAdapter):
     adapter_id = "telegram"
     adapter_type = "telegram"
@@ -34,6 +37,12 @@ class TelegramAdapter(MessagingAdapter):
         if not text:
             text = "[unsupported Telegram message]"
         message_type = "command" if text.startswith("/") else "chat"
+        target_scope = _command_target_scope(text) if message_type == "command" else {}
+        metadata = (
+            _command_metadata(text)
+            if message_type == "command"
+            else _message_metadata(text)
+        )
         platform_ref = {
             "platform_room_id": platform_room_id,
             "platform_thread_id": platform_thread_id,
@@ -51,11 +60,13 @@ class TelegramAdapter(MessagingAdapter):
             sender_id=str(kwargs.get("sender_id") or f"telegram:{platform_user_id}"),
             body=text,
             message_type=message_type,
+            target_scope=target_scope,
             adapter_id=self.adapter_id,
             platform_ref=platform_ref,
             idempotency_key=adapter_idempotency_key(self.adapter_id, platform_ref),
             command_type=_command_type(text) if message_type == "command" else None,
             platform_user_id=platform_user_id,
+            metadata=metadata,
         )
 
     def render_outbound(self, delivery: Mapping[str, Any]) -> dict[str, Any]:
@@ -165,8 +176,7 @@ def _thread_id(message: Mapping[str, Any]) -> str | None:
 
 
 def _command_type(text: str) -> str:
-    command = text.strip().split(maxsplit=1)[0].lower()
-    command = command.split("@", 1)[0]
+    command = _command_name(text)
     if command in {"/assign", "/task"}:
         return "assign_task"
     if command == "/cancel":
@@ -176,6 +186,73 @@ def _command_type(text: str) -> str:
     if command == "/checkpoint":
         return "checkpoint"
     return "run_message"
+
+
+def _command_target_scope(text: str) -> dict[str, str]:
+    parts = text.strip().split(maxsplit=2)
+    if len(parts) < 2:
+        return {}
+    if _command_name(text) not in {"/assign", "/task"}:
+        return {}
+    task_id = str(parts[1] or "").strip()
+    return {"kind": "task", "task_id": task_id} if task_id else {}
+
+
+def _command_metadata(text: str) -> dict[str, dict[str, str]]:
+    parts = text.strip().split(maxsplit=2)
+    if len(parts) < 3:
+        return {}
+    if _command_name(text) not in {"/assign", "/task"}:
+        return {}
+    task_message = str(parts[2] or "").strip()
+    host_alias, task_message = _consume_host_alias(task_message)
+    metadata: dict[str, dict[str, str]] = {}
+    if task_message:
+        metadata["assignment"] = {"message": task_message}
+    if host_alias:
+        metadata["routing"] = {"host_alias": host_alias}
+    return metadata
+
+
+def _message_metadata(text: str) -> dict[str, dict[str, str]]:
+    host_alias, remaining = _consume_host_alias(text)
+    metadata: dict[str, dict[str, str]] = {}
+    if host_alias:
+        metadata["routing"] = {"host_alias": host_alias}
+    if _is_claimable_text(text, remaining=remaining, has_host_alias=bool(host_alias)):
+        metadata["claimable_work"] = {"status": "pending", "source": "telegram"}
+    return metadata
+
+
+def _command_name(text: str) -> str:
+    command = text.strip().split(maxsplit=1)[0].lower()
+    return command.split("@", 1)[0]
+
+
+def _consume_host_alias(text: str) -> tuple[str | None, str]:
+    body = str(text or "").strip()
+    if not body.startswith("@"):
+        return None, body
+    parts = body.split(maxsplit=1)
+    mention = parts[0].removeprefix("@").rstrip(":").lower()
+    if mention not in HOST_ALIAS_MENTIONS:
+        return None, body
+    remaining = parts[1].strip() if len(parts) > 1 else ""
+    return mention, remaining
+
+
+def _is_claimable_text(
+    text: str,
+    *,
+    remaining: str,
+    has_host_alias: bool,
+) -> bool:
+    body = str(text or "").strip()
+    if not body or body == "[unsupported Telegram message]" or body.startswith("/"):
+        return False
+    if body.startswith("@") and not has_host_alias:
+        return False
+    return bool(remaining if has_host_alias else body)
 
 
 def _object(value: Any) -> dict[str, Any]:

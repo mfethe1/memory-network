@@ -290,6 +290,134 @@ def test_replayed_telegram_update_does_not_duplicate_commands_or_deliveries(
         store.close()
 
 
+def test_telegram_host_alias_mentions_are_routing_metadata(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    try:
+        AdapterRegistry(store).register_defaults()
+        store.set_adapter_command_promotion("telegram", enabled=True)
+        room = store.create_room(
+            room_kind="task",
+            display_name="Task",
+            task_id="task-1",
+            metadata={
+                "default_delivery_targets": [
+                    {"recipient_kind": "host", "recipient_id": "host-a"}
+                ]
+            },
+        )
+        store.map_platform_room(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            room_id=room["room_id"],
+            route_policy={
+                "command_promotion": {
+                    "enabled": True,
+                    "allowed_command_types": ["assign_task"],
+                    "allowed_target_kinds": ["task"],
+                }
+            },
+        )
+        store.link_external_identity(
+            adapter_id="telegram",
+            platform_user_id="42",
+            openclaw_identity_id="operator-1",
+            scopes=("message:write", "command:write"),
+            display_name="Operator",
+        )
+
+        chat = handle_telegram_webhook(
+            store,
+            _telegram_update(text="@rosie please check my email"),
+            secret_token=TELEGRAM_SECRET,
+            provided_secret_token=TELEGRAM_SECRET,
+        )
+        command = handle_telegram_webhook(
+            store,
+            _telegram_update(
+                update_id=101,
+                message_id=201,
+                text="/assign task-1 @lenny repair the inbox test",
+            ),
+            secret_token=TELEGRAM_SECRET,
+            provided_secret_token=TELEGRAM_SECRET,
+        )
+
+        assert chat["message"]["body"] == "@rosie please check my email"
+        assert chat["message"]["metadata"]["routing"]["host_alias"] == "rosie"
+        assert command["message"]["body"] == (
+            "/assign task-1 @lenny repair the inbox test"
+        )
+        assert command["message"]["target_scope"] == {
+            "kind": "task",
+            "task_id": "task-1",
+        }
+        assert command["command_ref"]["task_id"] == "task-1"
+        assert command["message"]["metadata"]["routing"]["host_alias"] == "lenny"
+        assert command["message"]["metadata"]["assignment"]["message"] == (
+            "repair the inbox test"
+        )
+    finally:
+        store.close()
+
+
+def test_untagged_telegram_message_promotes_to_one_claimable_command_ref(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        AdapterRegistry(store).register_defaults()
+        room = store.create_room(
+            room_kind="fleet",
+            display_name="Fleet",
+            metadata={
+                "assignment": {
+                    "repo_root": r"E:\Projects\repo-a",
+                    "provider": "codex",
+                }
+            },
+        )
+        store.map_platform_room(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            room_id=room["room_id"],
+        )
+
+        first = handle_telegram_webhook(
+            store,
+            _telegram_update(text="please check my email"),
+            secret_token=TELEGRAM_SECRET,
+            provided_secret_token=TELEGRAM_SECRET,
+        )
+        replay = handle_telegram_webhook(
+            store,
+            _telegram_update(text="please check my email"),
+            secret_token=TELEGRAM_SECRET,
+            provided_secret_token=TELEGRAM_SECRET,
+        )
+        message_id = first["message"]["message_id"]
+
+        promoted = store.promote_message_to_assign_task_command_ref(message_id)
+        promoted_again = store.promote_message_to_assign_task_command_ref(message_id)
+
+        assert first["created"] is True
+        assert replay["created"] is False
+        assert first["command_ref"] is None
+        assert first["message"]["message_type"] == "chat"
+        assert first["message"]["metadata"]["claimable_work"]["status"] == "pending"
+        assert promoted["created"] is True
+        assert promoted_again["created"] is False
+        assert promoted_again["command_ref"]["command_id"] == (
+            promoted["command_ref"]["command_id"]
+        )
+        assert promoted["command_ref"]["command_type"] == "assign_task"
+        assert promoted["command_ref"]["task_id"] == f"telegram-msg:{message_id}"
+        assert len(store.list_messages(room["room_id"])) == 1
+        assert len(store.list_command_refs()) == 1
+        assert store.verify_command_ref(promoted["command_ref"]) is True
+    finally:
+        store.close()
+
+
 def test_telegram_adapter_renders_outbound_notification_payload() -> None:
     adapter = TelegramAdapter()
 

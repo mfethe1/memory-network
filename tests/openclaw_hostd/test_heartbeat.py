@@ -139,7 +139,17 @@ def test_heartbeat_reports_host_capabilities_without_secrets(tmp_path: Path) -> 
     provider_ids = {
         provider["id"] for provider in payload["capabilities"]["providers"]
     }
-    assert {"custom", "claude", "codex", "kimi", "opencode"} <= provider_ids
+    assert {
+        "custom",
+        "claude",
+        "codex",
+        "kimi",
+        "opencode",
+        "cursor",
+        "goose",
+        "aider",
+        "openhands",
+    } <= provider_ids
 
     rendered = json.dumps(payload)
     assert "super-secret" not in rendered

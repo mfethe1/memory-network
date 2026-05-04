@@ -365,16 +365,16 @@ def test_graph_ui_refreshes_provider_registry_without_touching_runs(
             page.get_by_role("button", name="Chat").click()
             assert page.locator("#agent-provider").input_value() == "codex"
             assert page.locator('#agent-provider option[value="opencode"]').count() == 1
-            assert page.locator('#agent-provider option[value="aider"]').count() == 0
+            assert page.locator('#agent-provider option[value="aider"]').count() == 1
 
             original_payload = agent_providers.provider_registry_payload
 
-            def provider_registry_with_aider() -> list[dict[str, object]]:
+            def provider_registry_with_example() -> list[dict[str, object]]:
                 return original_payload() + [
                     {
-                        "id": "aider",
-                        "display_name": "Aider",
-                        "command_preset": "aider --message {provider_prompt}",
+                        "id": "example",
+                        "display_name": "Example Agent",
+                        "command_preset": "example-agent --message-file {provider_prompt_file}",
                         "capabilities": ["command_preset", "provider_prompt_file"],
                     }
                 ]
@@ -382,12 +382,12 @@ def test_graph_ui_refreshes_provider_registry_without_touching_runs(
             monkeypatch.setattr(
                 agent_providers,
                 "provider_registry_payload",
-                provider_registry_with_aider,
+                provider_registry_with_example,
             )
 
             page.evaluate("() => refreshAgentProviders({ force: true })")
 
-            page.locator('#agent-provider option[value="aider"]').wait_for(
+            page.locator('#agent-provider option[value="example"]').wait_for(
                 state="attached",
                 timeout=10000,
             )

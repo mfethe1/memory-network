@@ -24,3 +24,14 @@ benchmarks/fastapi/
 
 # Claude Code context
 .claude_context_tree
+
+# Node / Sandcastle
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Sandcastle secrets
+.sandcastle/.env
+.sandcastle/logs/
+.sandcastle/worktrees/

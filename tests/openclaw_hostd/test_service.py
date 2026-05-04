@@ -274,6 +274,22 @@ def test_daemon_loop_uses_connected_nats_for_subscriptions_outbox_and_agent_stat
         f"openclaw.deliver.{HOST_ID}.tasks",
         f"openclaw.host.{HOST_ID}.inbox",
     }
+    assert [subject for subject, _payload in transport.published] == [
+        f"openclaw.host.{HOST_ID}.heartbeat",
+        f"openclaw.host.{HOST_ID}.capabilities",
+    ]
+    heartbeat_payload = transport.published[0][1]
+    capabilities_payload = transport.published[1][1]
+    assert heartbeat_payload["kind"] == "openclaw.host_heartbeat"
+    assert heartbeat_payload["host_id"] == HOST_ID
+    assert capabilities_payload == {
+        "kind": "openclaw.host_capabilities",
+        "schema_version": 1,
+        "generated_at": heartbeat_payload["generated_at"],
+        "host_id": HOST_ID,
+        "ssh_hostname": heartbeat_payload["ssh_hostname"],
+        "capabilities": heartbeat_payload["capabilities"],
+    }
     assert outbox.drain_calls >= 1
     assert transport.kv_entries == [
         (

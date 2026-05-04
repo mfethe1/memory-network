@@ -714,11 +714,112 @@ def _tool_call_event_type(tool_calls: list[dict[str, Any]]) -> str:
 
 def _provider_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
     return (
-        _codex_jsonl_output_event(payload)
+        _cursor_jsonl_output_event(payload)
+        or _codex_jsonl_output_event(payload)
         or _claude_jsonl_output_event(payload)
         or _kimi_jsonl_output_event(payload)
         or _opencode_jsonl_output_event(payload)
+        or _openhands_jsonl_output_event(payload)
     )
+
+
+def _cursor_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
+    provider = str(
+        payload.get("provider") or payload.get("source") or payload.get("adapter") or ""
+    ).strip().lower()
+    if provider not in {"cursor", "cursor_sidecar", "cursor-sidecar"}:
+        return None
+
+    event_type = str(payload.get("event") or payload.get("type") or "").strip().lower()
+    provider_payload: dict[str, Any] = {
+        "provider_event": f"cursor.{event_type or 'event'}",
+    }
+    run_id = str(payload.get("run_id") or payload.get("cursor_run_id") or "").strip()
+    if run_id:
+        provider_payload["run_id"] = run_id
+
+    message = str(payload.get("message") or payload.get("text") or "").strip()
+    role = str(payload.get("role") or "").strip().lower()
+    status = str(payload.get("status") or "").strip().lower()
+    if role:
+        provider_payload["role"] = role
+
+    if event_type in {"run.started", "started"}:
+        return {
+            "event_type": "status",
+            "message": message or "Cursor run started.",
+            "file_path": None,
+            "symbol_path": None,
+            "status": status or None,
+            "payload": provider_payload,
+        }
+
+    if event_type in {"run.completed", "completed"}:
+        return {
+            "event_type": "status",
+            "message": message or "Cursor run completed.",
+            "file_path": None,
+            "symbol_path": None,
+            "status": "completed",
+            "payload": provider_payload,
+        }
+
+    if event_type in {"run.failed", "failed", "error"}:
+        return {
+            "event_type": "status",
+            "message": message or "Cursor run failed.",
+            "file_path": None,
+            "symbol_path": None,
+            "status": "failed",
+            "payload": provider_payload,
+        }
+
+    if event_type in {"assistant", "assistant.message", "message"} and message:
+        return {
+            "event_type": "decision" if role in {"", "assistant"} else "note",
+            "message": message,
+            "file_path": None,
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+
+    if event_type in {"tool.call", "tool_call"}:
+        tool_name = str(payload.get("tool_name") or payload.get("name") or "tool").strip()
+        arguments = (
+            payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+        )
+        tool_call = {"name": tool_name, "arguments": arguments}
+        provider_payload["tool_calls"] = [
+            {
+                "name": tool_name,
+                "arguments": arguments,
+            }
+        ]
+        tool_message = message or f"Cursor requested tool call: {tool_name}"
+        return {
+            "event_type": _tool_call_event_type([tool_call]),
+            "message": tool_message,
+            "file_path": _tool_call_file_path([tool_call]),
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+
+    if event_type in {"tool.result", "tool_result"}:
+        tool_name = str(payload.get("tool_name") or payload.get("name") or "tool").strip()
+        output = str(payload.get("output") or payload.get("result") or "").strip()
+        provider_payload["tool_name"] = tool_name or "tool"
+        return {
+            "event_type": "tool",
+            "message": message or output or f"Cursor tool returned: {tool_name or 'tool'}",
+            "file_path": None,
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+
+    return None
 
 
 def _codex_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -811,6 +912,11 @@ def _claude_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None
     event_type = str(payload.get("type") or "").strip()
     if event_type not in {"system", "assistant", "user", "result"} and not isinstance(
         payload.get("message"), dict
+    ):
+        return None
+    if event_type == "result" and not any(
+        key in payload
+        for key in ("session_id", "sessionID", "subtype", "result", "is_error", "usage")
     ):
         return None
     session_id = str(payload.get("session_id") or payload.get("sessionID") or "").strip()
@@ -1091,6 +1197,92 @@ def _opencode_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | No
         }
 
     return None
+
+
+def _openhands_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
+    event_type = str(payload.get("type") or "").strip().lower()
+    if event_type not in {"action", "observation", "status", "result", "error"}:
+        return None
+
+    provider_payload: dict[str, Any] = {
+        "provider_event": f"openhands.{event_type}",
+    }
+
+    if event_type == "error":
+        message = str(payload.get("content") or payload.get("message") or "OpenHands error").strip()
+        return {
+            "event_type": "status",
+            "message": message or "OpenHands error",
+            "file_path": None,
+            "symbol_path": None,
+            "status": "failed",
+            "payload": provider_payload,
+        }
+
+    if event_type == "status":
+        status = str(payload.get("status") or "").strip().lower() or None
+        message = str(payload.get("content") or payload.get("message") or "OpenHands status update.").strip()
+        return {
+            "event_type": "status",
+            "message": message or "OpenHands status update.",
+            "file_path": None,
+            "symbol_path": None,
+            "status": status,
+            "payload": provider_payload,
+        }
+
+    if event_type == "result":
+        content = str(payload.get("content") or payload.get("message") or "").strip()
+        success = payload.get("success")
+        status = "completed" if success is not False else "failed"
+        return {
+            "event_type": "status",
+            "message": content or f"OpenHands run {status}.",
+            "file_path": None,
+            "symbol_path": None,
+            "status": status,
+            "payload": provider_payload,
+        }
+
+    if event_type == "observation":
+        content = str(payload.get("content") or payload.get("message") or "").strip()
+        return {
+            "event_type": "tool",
+            "message": content or "OpenHands observation.",
+            "file_path": str(payload.get("path") or payload.get("file") or "").strip()
+            or None,
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+
+    action = str(payload.get("action") or "").strip().lower()
+    path = str(payload.get("path") or payload.get("file") or "").strip() or None
+    command = str(payload.get("command") or "").strip()
+    content = str(payload.get("content") or payload.get("message") or "").strip()
+    if action in {"write", "edit", "patch", "replace"}:
+        local_event_type = "edit"
+    elif action in {"read", "open"}:
+        local_event_type = "read"
+    elif action in {"run", "bash", "shell", "test"}:
+        local_event_type = "test" if "pytest" in command or action == "test" else "tool"
+    else:
+        local_event_type = "tool"
+    message = content or f"OpenHands action: {action or 'action'}"
+    if command:
+        message = f"{message}\n$ {command}" if content else f"OpenHands action: {action}\n$ {command}"
+    return {
+        "event_type": local_event_type,
+        "message": message,
+        "file_path": path,
+        "symbol_path": None,
+        "status": None,
+        "payload": {
+            **provider_payload,
+            "action": action,
+            "command": command,
+        },
+    }
 
 
 def _parse_output_event(

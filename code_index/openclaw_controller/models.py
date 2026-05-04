@@ -67,6 +67,7 @@ class HostInventoryRecord:
     host_id: str
     repo_roots: tuple[RepoRoot, ...]
     providers: tuple[ProviderCapability, ...]
+    host_aliases: tuple[str, ...] = ()
     heartbeat_interval_seconds: int = 10
     last_heartbeat_at: datetime | None = None
     status: str = HOST_HEALTHY
@@ -96,6 +97,7 @@ class HostInventoryRecord:
             host_id=_required_text(payload.get("host_id"), "host_id"),
             repo_roots=repo_roots,
             providers=providers,
+            host_aliases=_host_alias_tuple(payload, capabilities),
             heartbeat_interval_seconds=max(
                 1,
                 _int_or_default(payload.get("heartbeat_interval_seconds"), 10),
@@ -158,6 +160,7 @@ class HostInventoryRecord:
                 else None
             ),
             "heartbeat_interval_seconds": self.heartbeat_interval_seconds,
+            "host_aliases": list(self.host_aliases),
             "repo_roots": [root.to_dict() for root in self.repo_roots],
             "providers": [provider.to_dict() for provider in self.providers],
             "context_health": dict(context_health or {}),
@@ -171,6 +174,7 @@ class AssignmentDetails:
     repo_root: str
     provider: str
     message: str
+    host_alias: str | None = None
     selected_paths: tuple[str, ...] = ()
     selected_nodes: tuple[str, ...] = ()
     required_provider_capabilities: tuple[str, ...] = ()
@@ -281,6 +285,24 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
         seen.add(text)
         result.append(text)
     return tuple(result)
+
+
+def _host_alias_tuple(
+    payload: Mapping[str, Any],
+    capabilities: Mapping[str, Any],
+) -> tuple[str, ...]:
+    for value in (
+        payload.get("host_aliases"),
+        payload.get("aliases"),
+        payload.get("host_alias"),
+        capabilities.get("host_aliases"),
+        capabilities.get("aliases"),
+        capabilities.get("host_alias"),
+    ):
+        aliases = _string_tuple(value)
+        if aliases:
+            return tuple(alias.strip().lower() for alias in aliases if alias.strip())
+    return ()
 
 
 def _required_text(value: object, field_name: str) -> str:

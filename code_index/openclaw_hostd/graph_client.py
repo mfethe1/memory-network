@@ -123,6 +123,24 @@ class GraphServerClient:
         agent_name_text = str(agent_name or "").strip()
         if agent_name_text:
             payload["agent_name"] = agent_name_text
+        preflight_response = self._request_json(
+            "POST",
+            "/api/agent-task-preflight",
+            payload,
+        )
+        if not preflight_response.ok:
+            return preflight_response
+        preflight = preflight_response.payload.get("preflight")
+        if not isinstance(preflight, dict):
+            return GraphServerResponse(
+                ok=False,
+                status_code=preflight_response.status_code,
+                payload=preflight_response.payload,
+                error="graph-server preflight response missing preflight",
+            )
+        payload["preflight"] = dict(preflight)
+        if preflight.get("requires_confirmation"):
+            payload["preflight_confirmed"] = True
         return self._request_json("POST", "/api/agent-runs", payload)
 
     def get_run_status(

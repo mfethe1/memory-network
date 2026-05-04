@@ -806,6 +806,14 @@ def run_once(
         )
     if nats_client is not None:
         try:
+            publish_host_snapshot(nats_client, host_id=identity.host_id, payload=payload)
+        except Exception as exc:
+            _logger_warning(
+                logger or get_logger(),
+                "OpenClaw host heartbeat publish failed; continuing heartbeat loop: %s",
+                exc,
+            )
+        try:
             publish_agent_state_entries(
                 nats_client,
                 host_id=identity.host_id,
@@ -820,6 +828,26 @@ def run_once(
             )
     _emit_payload(payload, as_json=as_json)
     return payload
+
+
+def publish_host_snapshot(
+    nats_client: Any,
+    *,
+    host_id: str,
+    payload: Mapping[str, Any],
+) -> None:
+    nats_client.publish(f"openclaw.host.{host_id}.heartbeat", dict(payload))
+    nats_client.publish(
+        f"openclaw.host.{host_id}.capabilities",
+        {
+            "kind": "openclaw.host_capabilities",
+            "schema_version": 1,
+            "generated_at": payload.get("generated_at"),
+            "host_id": host_id,
+            "ssh_hostname": payload.get("ssh_hostname"),
+            "capabilities": dict(payload.get("capabilities") or {}),
+        },
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -518,6 +518,47 @@ class MessagingStore:
             )
         ]
 
+    def ensure_message_delivery(
+        self,
+        message_id: str,
+        recipient: Mapping[str, Any],
+        *,
+        command_id: str | None = None,
+    ) -> dict[str, Any]:
+        self.get_message(message_id)
+        recipients = normalize_recipient_list([dict(recipient)])
+        if not recipients:
+            raise MessagingError("recipient is required")
+        normalized = recipients[0]
+        delivery_key = _delivery_key(normalized)
+        existing = self.conn.execute(
+            """
+            SELECT * FROM openclaw_message_deliveries
+             WHERE message_id = ?
+               AND delivery_key = ?
+            """,
+            (message_id, delivery_key),
+        ).fetchone()
+        if existing is not None:
+            return _delivery(existing)
+        with self._transaction():
+            self._create_deliveries_locked(
+                message_id=message_id,
+                recipients=[normalized],
+                command_id=command_id,
+            )
+        row = self.conn.execute(
+            """
+            SELECT * FROM openclaw_message_deliveries
+             WHERE message_id = ?
+               AND delivery_key = ?
+            """,
+            (message_id, delivery_key),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("message delivery was not persisted")
+        return _delivery(row)
+
     def ack_delivery(
         self,
         *,
@@ -577,6 +618,67 @@ class MessagingStore:
                 "SELECT * FROM openclaw_command_refs ORDER BY created_at, command_id"
             )
         ]
+
+    def promote_message_to_assign_task_command_ref(
+        self,
+        message_id: str,
+        *,
+        task_id: str | None = None,
+        target_host_id: str | None = None,
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        message = self.get_message(message_id)
+        existing = self.get_command_ref_for_message(message_id)
+        if existing is not None:
+            return {
+                "created": False,
+                "message": message,
+                "command_ref": existing,
+            }
+        if not _message_is_claimable_work(message):
+            raise MessagingError("message is not claimable work")
+
+        effective_task_id = _clean(task_id) or f"telegram-msg:{message_id}"
+        target_scope = {"kind": "task", "task_id": effective_task_id}
+        host_id = _clean(target_host_id)
+        if host_id is not None:
+            target_scope["host_id"] = host_id
+        now = _now()
+        created = False
+        try:
+            with self._transaction():
+                existing_row = self.conn.execute(
+                    "SELECT * FROM openclaw_command_refs WHERE message_id = ?",
+                    (message_id,),
+                ).fetchone()
+                if existing_row is not None:
+                    command = _command(existing_row)
+                else:
+                    created = True
+                    command = self._create_command_ref_locked(
+                        message_id=message_id,
+                        command_type="assign_task",
+                        target_scope=target_scope,
+                        sender_id=message["sender_id"],
+                        body=message["body"],
+                        created_at=now,
+                        expires_at=expires_at,
+                    )
+        except sqlite3.IntegrityError:
+            existing = self.get_command_ref_for_message(message_id)
+            if existing is None:
+                raise
+            return {
+                "created": False,
+                "message": self.get_message(message_id),
+                "command_ref": existing,
+            }
+
+        return {
+            "created": created,
+            "message": self.get_message(message_id),
+            "command_ref": command,
+        }
 
     def mark_command_ref_status(
         self,
@@ -1374,6 +1476,16 @@ def _message(row: sqlite3.Row) -> dict[str, Any]:
         "created_at": row["created_at"],
         "metadata": _load(row["metadata_json"], {}),
     }
+
+
+def _message_is_claimable_work(message: Mapping[str, Any]) -> bool:
+    metadata = message.get("metadata") if isinstance(message.get("metadata"), Mapping) else {}
+    claimable = (
+        metadata.get("claimable_work")
+        if isinstance(metadata.get("claimable_work"), Mapping)
+        else {}
+    )
+    return str(claimable.get("status") or "").strip().lower() == "pending"
 
 
 def _delivery(row: sqlite3.Row) -> dict[str, Any]:

@@ -62,3 +62,22 @@ python -m code_index agent-adapter --list-providers --json
   and refactor planning.
 - Use `sandcastle-orchestration` only for repeatable, sandboxed,
   branch-aware AFK agent workflows.
+
+## Sandcastle Setup
+
+This repo includes a cross-platform `.sandcastle/` configuration for
+branch-safe AFK agent runs via Docker (Windows WSL2/macOS/Linux) or Podman.
+
+```bash
+# Configure
+npm install
+cp .sandcastle/.env.example .sandcastle/.env
+# Edit .sandcastle/.env and add ANTHROPIC_API_KEY
+
+# Run
+npm run sandcastle:plan
+npm run sandcastle:implement
+npm run sandcastle:review
+```
+
+See `.sandcastle/README.md` for full platform-specific instructions.

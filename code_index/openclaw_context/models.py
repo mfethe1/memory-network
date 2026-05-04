@@ -262,6 +262,42 @@ class HandoffPacket:
 
 
 @dataclass(frozen=True)
+class CMAInvocationRecord:
+    invocation_id: str
+    run_id: str
+    task_id: str
+    trigger_event_kind: str
+    tier: int
+    model_id: str
+    status: str
+    decision_kind: str | None = None
+    correction_pointer_ids: tuple[str, ...] = ()
+    rationale: str = ""
+    escalate: bool = False
+    observed_tokens: int = 0
+    budget_tokens: int = 0
+    created_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "invocation_id": self.invocation_id,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "trigger_event_kind": self.trigger_event_kind,
+            "tier": self.tier,
+            "model_id": self.model_id,
+            "status": self.status,
+            "decision_kind": self.decision_kind,
+            "correction_pointer_ids": list(self.correction_pointer_ids),
+            "rationale": self.rationale,
+            "escalate": self.escalate,
+            "observed_tokens": self.observed_tokens,
+            "budget_tokens": self.budget_tokens,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass(frozen=True)
 class ContextManifest:
     manifest_id: str
     status: str

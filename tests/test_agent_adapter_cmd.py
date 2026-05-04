@@ -52,6 +52,25 @@ def test_resolve_agent_command_uses_provider_presets(monkeypatch):
         "--file {task_json} {provider_prompt}",
         "opencode",
     )
+    assert resolve_agent_command(provider="cursor") == (
+        "cursor-agent-sidecar run --root {root} --task-json {task_json} "
+        "--provider-prompt-file {provider_prompt_file} "
+        "--mcp-config-file {mcp_config_file}",
+        "cursor",
+    )
+    assert resolve_agent_command(provider="goose") == (
+        "goose run --instructions {provider_prompt_file} --no-session",
+        "goose",
+    )
+    assert resolve_agent_command(provider="aider") == (
+        "aider --yes-always --message-file {provider_prompt_file} "
+        "{selected_paths}",
+        "aider",
+    )
+    assert resolve_agent_command(provider="openhands") == (
+        "openhands --headless --json -f {provider_prompt_file}",
+        "openhands",
+    )
 
 
 def test_resolve_agent_command_explicit_provider_overrides_env_command(monkeypatch):
@@ -63,6 +82,10 @@ def test_resolve_agent_command_explicit_provider_overrides_env_command(monkeypat
     )
     assert resolve_agent_command(provider="kimi")[1] == "kimi"
     assert resolve_agent_command(provider="opencode")[1] == "opencode"
+    assert resolve_agent_command(provider="cursor")[1] == "cursor"
+    assert resolve_agent_command(provider="goose")[1] == "goose"
+    assert resolve_agent_command(provider="aider")[1] == "aider"
+    assert resolve_agent_command(provider="openhands")[1] == "openhands"
 
 
 def test_resolve_agent_command_rejects_unknown_provider(monkeypatch):
@@ -78,12 +101,20 @@ def test_agent_provider_registry_exposes_commands_and_capabilities():
         "codex",
         "kimi",
         "opencode",
+        "cursor",
+        "goose",
+        "aider",
+        "openhands",
     ]
     assert agent_providers.provider_choices(include_custom=False) == [
         "claude",
         "codex",
         "kimi",
         "opencode",
+        "cursor",
+        "goose",
+        "aider",
+        "openhands",
     ]
     assert agent_providers.is_known_provider(" CLAUDE ")
     assert agent_providers.require_provider("codex").display_name == "Codex"
@@ -98,14 +129,35 @@ def test_agent_provider_registry_exposes_commands_and_capabilities():
         == "opencode run --dir {root} --format json "
         "--file {task_json} {provider_prompt}"
     )
+    assert (
+        agent_providers.provider_command_template("cursor")
+        == "cursor-agent-sidecar run --root {root} --task-json {task_json} "
+        "--provider-prompt-file {provider_prompt_file} "
+        "--mcp-config-file {mcp_config_file}"
+    )
     assert agent_providers.provider_has_capability(
         "custom", agent_providers.CAPABILITY_CUSTOM_COMMAND
+    )
+    assert agent_providers.provider_has_capability(
+        "claude", agent_providers.CAPABILITY_TASK_RUN
     )
     assert agent_providers.provider_has_capability(
         "kimi", agent_providers.CAPABILITY_MCP_CONFIG_FILE
     )
     assert agent_providers.provider_has_capability(
         "opencode", agent_providers.CAPABILITY_TASK_JSON_FILE
+    )
+    assert agent_providers.provider_has_capability(
+        "cursor", agent_providers.CAPABILITY_PROVIDER_EVENT_PARSER
+    )
+    assert agent_providers.provider_has_capability(
+        "goose", agent_providers.CAPABILITY_GENERIC_TEXT_PARSER
+    )
+    assert agent_providers.provider_has_capability(
+        "aider", agent_providers.CAPABILITY_FRESH_SESSION
+    )
+    assert agent_providers.provider_has_capability(
+        "openhands", agent_providers.CAPABILITY_JSON_OUTPUT
     )
     payload = {
         provider["id"]: provider
@@ -115,6 +167,10 @@ def test_agent_provider_registry_exposes_commands_and_capabilities():
     assert payload["custom"]["command_preset"] is None
     assert payload["kimi"]["command_preset"].startswith("kimi --work-dir")
     assert payload["opencode"]["display_name"] == "OpenCode"
+    assert payload["cursor"]["display_name"] == "Cursor"
+    assert "task_run" in payload["aider"]["capabilities"]
+    assert "generic_text_parser" in payload["goose"]["capabilities"]
+    assert "provider_event_parser" in payload["openhands"]["capabilities"]
 
 
 def test_agent_provider_registry_loads_optional_json_specs(tmp_path, monkeypatch):
@@ -124,9 +180,9 @@ def test_agent_provider_registry_loads_optional_json_specs(tmp_path, monkeypatch
         {
           "providers": [
             {
-              "id": "aider",
-              "display_name": "Aider",
-              "command_preset": "aider --message {provider_prompt}",
+              "id": "example",
+              "display_name": "Example Agent",
+              "command_preset": "example-agent --message-file {provider_prompt_file}",
               "capabilities": ["provider_prompt_file", "json_output"]
             }
           ]
@@ -145,28 +201,32 @@ def test_agent_provider_registry_loads_optional_json_specs(tmp_path, monkeypatch
             "codex",
             "kimi",
             "opencode",
+            "cursor",
+            "goose",
             "aider",
+            "openhands",
+            "example",
         ]
-        assert agent_providers.provider_display_name("aider") == "Aider"
+        assert agent_providers.provider_display_name("example") == "Example Agent"
         assert (
-            agent_providers.provider_command_template("aider")
-            == "aider --message {provider_prompt}"
+            agent_providers.provider_command_template("example")
+            == "example-agent --message-file {provider_prompt_file}"
         )
-        assert resolve_agent_command(provider="aider") == (
-            "aider --message {provider_prompt}",
-            "aider",
-        )
-        assert agent_providers.provider_has_capability(
-            "aider", agent_providers.CAPABILITY_PROVIDER_PROMPT_FILE
+        assert resolve_agent_command(provider="example") == (
+            "example-agent --message-file {provider_prompt_file}",
+            "example",
         )
         assert agent_providers.provider_has_capability(
-            "aider", agent_providers.CAPABILITY_COMMAND_PRESET
+            "example", agent_providers.CAPABILITY_PROVIDER_PROMPT_FILE
+        )
+        assert agent_providers.provider_has_capability(
+            "example", agent_providers.CAPABILITY_COMMAND_PRESET
         )
         payload = {
             provider["id"]: provider
             for provider in agent_providers.provider_registry_payload()
         }
-        assert payload["aider"]["display_name"] == "Aider"
+        assert payload["example"]["display_name"] == "Example Agent"
     finally:
         monkeypatch.delenv(agent_providers.PROVIDER_SPECS_ENV_VAR, raising=False)
         importlib.reload(agent_providers)
@@ -184,6 +244,8 @@ def test_agent_adapter_cli_lists_provider_registry(capsys):
     providers = {provider["id"]: provider for provider in payload["providers"]}
     assert providers["codex"]["display_name"] == "Codex"
     assert providers["opencode"]["command_preset"].startswith("opencode run")
+    assert providers["cursor"]["command_preset"].startswith("cursor-agent-sidecar run")
+    assert providers["openhands"]["command_preset"].startswith("openhands --headless")
 
 
 def test_parse_output_event_accepts_json_event_line():
@@ -342,6 +404,60 @@ def test_parse_output_event_accepts_opencode_json_error():
     assert parsed["status"] == "failed"
     assert "Rate limit exceeded" in parsed["message"]
     assert parsed["payload"]["provider_event"] == "opencode.error"
+
+
+def test_parse_output_event_accepts_cursor_sidecar_assistant_message():
+    parsed = _parse_output_event(
+        (
+            '{"provider":"cursor","event":"assistant.message","role":"assistant",'
+            '"run_id":"run_123","message":"Changed pkg/a.py\\nTests passed."}'
+        ),
+        stream_name="stdout",
+        command_label="cursor-agent-sidecar run",
+    )
+    assert parsed["event_type"] == "decision"
+    assert parsed["message"] == "Changed pkg/a.py\nTests passed."
+    assert parsed["payload"]["provider_event"] == "cursor.assistant.message"
+    assert parsed["payload"]["run_id"] == "run_123"
+
+
+def test_parse_output_event_accepts_cursor_sidecar_tool_call():
+    parsed = _parse_output_event(
+        (
+            '{"provider":"cursor","event":"tool.call","tool_name":"Edit",'
+            '"arguments":{"file_path":"pkg/a.py"}}'
+        ),
+        stream_name="stdout",
+        command_label="cursor-agent-sidecar run",
+    )
+    assert parsed["event_type"] == "edit"
+    assert parsed["file_path"] == "pkg/a.py"
+    assert "Cursor requested tool call" in parsed["message"]
+    assert parsed["payload"]["provider_event"] == "cursor.tool.call"
+
+
+def test_parse_output_event_accepts_openhands_json_action():
+    parsed = _parse_output_event(
+        '{"type":"action","action":"write","path":"pkg/a.py","content":"Creating file"}',
+        stream_name="stdout",
+        command_label="openhands --headless --json",
+    )
+    assert parsed["event_type"] == "edit"
+    assert parsed["file_path"] == "pkg/a.py"
+    assert parsed["message"] == "Creating file"
+    assert parsed["payload"]["provider_event"] == "openhands.action"
+
+
+def test_parse_output_event_accepts_openhands_json_result():
+    parsed = _parse_output_event(
+        '{"type":"result","success":true,"content":"Task completed"}',
+        stream_name="stdout",
+        command_label="openhands --headless --json",
+    )
+    assert parsed["event_type"] == "status"
+    assert parsed["status"] == "completed"
+    assert parsed["message"] == "Task completed"
+    assert parsed["payload"]["provider_event"] == "openhands.result"
 
 
 def test_format_command_provider_prompt_mentions_graph_context(tmp_path: Path):

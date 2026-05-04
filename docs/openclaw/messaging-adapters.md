@@ -76,6 +76,35 @@ For Telegram, `platform_event_id` is the update ID when available, falling
 back to the message ID. A replayed update returns the existing message,
 deliveries, and command ref.
 
+The host-claim routing extension must recognize:
+
+```text
+/assign <task_id> <task prompt>
+/task <task_id> <task prompt>
+@rosie <task prompt>
+@lenny <task prompt>
+/assign <task_id> @rosie <task prompt>
+/task <task_id> @lenny <task prompt>
+```
+
+The `/assign` and `/task` forms set the message target scope to `task` and put
+the prompt text in message metadata for the Fleet Controller assignment
+payload. The mention forms add a host-alias routing hint. The original Telegram
+text remains the room message body for audit and command-signature
+verification.
+
+Host aliases are resolved by the Fleet Controller after identity and route
+policy validation. The Telegram adapter must not turn `@rosie` or `@lenny` into
+host IDs by itself, and it must not create separate command paths per host.
+
+An untagged, actionable message in a mapped fleet or task room is claimable
+work. The adapter stores it as one OpenClaw message and leaves claiming to the
+Fleet Controller and host daemons. Eligible hosts may observe the same message,
+but only the host that wins the central task lease may start an Agent Run.
+Hosts claim stored Telegram work through the Fleet Controller task-claim route;
+the route promotes the existing message to one signed command reference and
+assigns the claimant host when it is eligible.
+
 Outbound rendering returns a Bot API-shaped payload:
 
 ```json

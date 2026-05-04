@@ -204,6 +204,48 @@ OpenClaw messaging review additions accepted:
    transport, Fleet Controller owns assignments and leases, and `fumemory`
    stores explicit checkpoints instead of raw chat.
 
+Rosie/Lenny Telegram routing additions accepted:
+
+1. `@rosie` and `@lenny` are host aliases. They are routing names that resolve
+   to stable host IDs before scheduling; they are not Telegram identities,
+   host IDs, hostnames, or authorization keys.
+2. Explicit mentions are hard routing hints. A message or `/assign` command
+   mentioning `@rosie` or `@lenny` must create or constrain a host delivery for
+   the resolved host before the Fleet Controller attempts assignment.
+3. Untagged actionable Telegram messages become claimable work, not immediate
+   duplicate assignments. Eligible hosts may observe the message, but a host
+   must win a Fleet Controller task claim before starting an Agent Run.
+4. The anti-duplicate guarantee is the central task lease keyed by the
+   deterministic task ID for the message or command reference. The first
+   eligible host that wins the lease receives the assignment; later claims
+   receive an already-claimed or lease-conflict result and must not dispatch.
+5. The single Telegram Messaging Service remains canonical. Do not create
+   separate Telegram bots, direct host command paths, or per-host command
+   parsers for Rosie and Lenny.
+
+Grilling result for Rosie/Lenny duplicate prevention:
+
+1. The durable anti-duplicate mechanism should reuse the existing
+   `openclaw_command_refs` state transition and the existing Fleet Controller
+   task lease. Do not add a second independent "claim table" unless
+   `openclaw_command_refs` cannot model the message claim.
+2. Explicit `/assign` commands already have the right shape: signed command
+   refs are atomically claimed before assignment, and task leases protect the
+   host inbox if a duplicate publish slips through.
+3. Untagged Telegram messages are the open gap. Today they are stored as
+   `chat` messages and do not create a command ref. A host claim must promote
+   the stored message into exactly one pending `assign_task` command ref for
+   the same `message_id`.
+4. The claim promotion must derive a deterministic task ID when the human did
+   not supply one, for example `telegram-msg:<message_id>` or another stable
+   message-ref ID chosen by the implementation.
+5. Fleet Controller assignment must become claimant-aware. A claim from Lenny
+   must assign Lenny if Lenny is eligible and delivery-visible; it must not
+   silently assign Rosie because Rosie sorts earlier in host inventory.
+6. The first valid claimant wins `pending -> active -> assigned`; later claims
+   return `command_ref_claimed`, `command_ref_consumed`,
+   `task_lease_conflict`, or `already_claimed` and must not start local work.
+
 Multi-service messaging additions accepted:
 
 1. Keep one canonical OpenClaw Messaging Service store for rooms, messages,
@@ -1404,6 +1446,12 @@ Tasks:
 - [ ] Convert mutating messages into signed command references instead of
       directly publishing host tasks from Telegram, Slack, Discord, Matrix,
       email, webhook, or UI code.
+- [x] Parse Telegram host-alias mentions such as `@rosie` and `@lenny` into
+      message metadata routing hints without treating the alias as a host ID or
+      authorization identity.
+- [x] Store untagged actionable Telegram messages as claimable work and add a
+      promotion path that creates one pending `assign_task` command reference
+      for the existing `message_id` when a valid host claims it.
 - [ ] Add Telegram inbound webhook handling and outbound notification delivery.
 - [ ] Add stub adapter registrations for Slack, Discord, Matrix, email, and
       generic webhook with no command-promotion permissions by default.
@@ -1421,11 +1469,15 @@ Verification:
 2. A Telegram reply creates the same message envelope as a web UI message.
 3. A Telegram update replay does not create duplicate commands or deliveries.
 4. Mutating messages require a signed command reference before host delivery.
-5. A task room can show all Agent Swarm child runs without sending separate
+5. An untagged actionable Telegram message can be claimed once and cannot
+   create duplicate command refs on webhook replay or host race.
+6. `@rosie` and `@lenny` mentions are preserved as host-alias routing hints
+   after identity and route-policy checks.
+7. A task room can show all Agent Swarm child runs without sending separate
    Telegram messages to each one.
-6. A Slack or Discord-looking inbound payload cannot create a command until the
+8. A Slack or Discord-looking inbound payload cannot create a command until the
    sender is linked to an OpenClaw identity and policy allows promotion.
-7. A generic webhook can create an inbound message but cannot create a command.
+9. A generic webhook can create an inbound message but cannot create a command.
 
 ### Slice 4 - NATS Event Outbox And Task Inbox
 
@@ -1526,6 +1578,11 @@ Tasks:
 - [ ] Accept signed command references from the Messaging Service.
 - [ ] Add host eligibility filtering by repo root, provider capability, health,
       and lease availability.
+- [x] Resolve host aliases such as `rosie` and `lenny` to stable Fleet
+      Controller host IDs before assignment and reject unknown or stale aliases.
+- [x] Add claimant-aware assignment so a claim from a delivery-visible eligible
+      host assigns that claimant instead of selecting the first sorted eligible
+      host.
 - [ ] Add NATS task publish.
 - [ ] Return assignment and rejection results in a shape the Messaging Service
       can attach to the originating room message.
@@ -1544,6 +1601,12 @@ Verification:
 4. Controller rejects unsigned or expired command references.
 5. Controller rejects a context handoff restart when the repo/task lease is not
    valid or the restart cooldown is active.
+6. When Rosie and Lenny both observe the same claimable message, one claimant
+   receives exactly one assignment publish and the other receives a consumed or
+   lease-conflict rejection.
+7. A claimant that is not in the host delivery set, lacks repo/provider
+   eligibility, or does not match the explicit host alias cannot steal the
+   claim.
 
 ### Slice 7A - Context Manager Agent And fumemory Pointer Store
 

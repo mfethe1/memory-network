@@ -16,6 +16,7 @@ from code_index.openclaw_messaging.routes import Principal
 
 
 SIGNING_SECRET = "test-secret"
+TELEGRAM_SECRET = "telegram-secret"
 NOW = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
 INGEST_PRINCIPAL = Principal(
     principal_id="host-a",
@@ -147,6 +148,23 @@ def _command_ref(app: Any, *, task_id: str = "task-123") -> dict[str, Any]:
     return response.body["command_ref"]
 
 
+def _telegram_update(
+    *,
+    update_id: int = 100,
+    message_id: int = 200,
+    text: str = "/assign task-123 Implement the task.",
+) -> dict[str, object]:
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": message_id,
+            "chat": {"id": -100123, "type": "group", "title": "OpenClaw Fleet"},
+            "from": {"id": 42, "username": "operator", "first_name": "Operator"},
+            "text": text,
+        },
+    }
+
+
 def test_fleet_task_route_assigns_eligible_host_and_preserves_messaging_routes(
     tmp_path: Path,
 ) -> None:
@@ -186,6 +204,173 @@ def test_fleet_task_route_assigns_eligible_host_and_preserves_messaging_routes(
         assert nats.published[0][1]["provider"] == "codex"
         assert rooms.status_code == 200
         assert len(rooms.body["rooms"]) == 1
+    finally:
+        app.close()
+
+
+def test_single_telegram_chat_assigns_task_to_eligible_host_without_predelegation(
+    tmp_path: Path,
+) -> None:
+    nats = FakeNats()
+    app = create_app(
+        tmp_path / "messages.db",
+        signing_secret=SIGNING_SECRET,
+        telegram_secret_token=TELEGRAM_SECRET,
+        lease_store=InMemoryFleetLeaseStore(),
+        nats_client=nats,
+    )
+    try:
+        app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            _heartbeat("host-a"),
+            principal=FLEET_INGEST_PRINCIPAL,
+        )
+        app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            _heartbeat("host-b"),
+            principal=FLEET_INGEST_PRINCIPAL,
+        )
+        app.store.set_adapter_command_promotion("telegram", enabled=True)
+        fleet_room = app.store.create_room(
+            room_kind="fleet",
+            display_name="OpenClaw Fleet",
+            metadata={
+                "assignment": {
+                    "repo_root": r"E:\Projects\repo-a",
+                    "provider": "codex",
+                    "selected_paths": ["code_index/openclaw_controller/app.py"],
+                }
+            },
+        )
+        app.store.map_platform_room(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            room_id=fleet_room["room_id"],
+            route_policy={
+                "command_promotion": {
+                    "enabled": True,
+                    "allowed_command_types": ["assign_task"],
+                    "allowed_target_kinds": ["task"],
+                }
+            },
+        )
+        app.store.link_external_identity(
+            adapter_id="telegram",
+            platform_user_id="42",
+            openclaw_identity_id="operator-1",
+            scopes=("message:write", "command:write"),
+            display_name="Operator",
+        )
+
+        response = app.handle_request(
+            "POST",
+            "/adapters/telegram/webhook",
+            _telegram_update(),
+            headers={"X-Telegram-Bot-Api-Secret-Token": TELEGRAM_SECRET},
+        )
+
+        assert response.status_code == 201
+        assert response.body["message"]["target_scope"] == {
+            "kind": "task",
+            "task_id": "task-123",
+        }
+        assert response.body["command_ref"]["command_type"] == "assign_task"
+        assert response.body["auto_assignment"]["status"] == "assigned"
+        assert response.body["auto_assignment"]["assignment"]["host_id"] == "host-a"
+        assert [subject for subject, _payload in nats.published] == [
+            "openclaw.task.host-a.assigned"
+        ]
+        assert nats.published[0][1]["message"] == "Implement the task."
+        assert [
+            (delivery["recipient_kind"], delivery["recipient_id"])
+            for delivery in response.body["auto_assignment"]["deliveries"]
+        ] == [("host", "host-a")]
+    finally:
+        app.close()
+
+
+def test_host_task_claim_route_assigns_the_claimant_for_untagged_telegram_work(
+    tmp_path: Path,
+) -> None:
+    nats = FakeNats()
+    app = create_app(
+        tmp_path / "messages.db",
+        signing_secret=SIGNING_SECRET,
+        telegram_secret_token=TELEGRAM_SECRET,
+        lease_store=InMemoryFleetLeaseStore(),
+        nats_client=nats,
+    )
+    try:
+        app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            _heartbeat("host-a"),
+            principal=FLEET_INGEST_PRINCIPAL,
+        )
+        app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            _heartbeat("host-z"),
+            principal=FLEET_INGEST_PRINCIPAL,
+        )
+        fleet_room = app.store.create_room(
+            room_kind="fleet",
+            display_name="OpenClaw Fleet",
+            metadata={
+                "assignment": {
+                    "repo_root": r"E:\Projects\repo-a",
+                    "provider": "codex",
+                    "selected_paths": ["code_index/openclaw_controller/app.py"],
+                }
+            },
+        )
+        app.store.map_platform_room(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            room_id=fleet_room["room_id"],
+        )
+        message_response = app.handle_request(
+            "POST",
+            "/adapters/telegram/webhook",
+            _telegram_update(text="please check my email"),
+            headers={"X-Telegram-Bot-Api-Secret-Token": TELEGRAM_SECRET},
+        )
+        message_id = message_response.body["message"]["message_id"]
+
+        spoofed = app.handle_request(
+            "POST",
+            "/fleet/task-claims",
+            {
+                "message_id": message_id,
+                "claimant_host_id": "host-a",
+            },
+            principal=Principal(
+                principal_id="host-z",
+                scopes=frozenset({"host:ingest"}),
+            ),
+        )
+        claimed = app.handle_request(
+            "POST",
+            "/fleet/task-claims",
+            {"message_id": message_id},
+            principal=Principal(
+                principal_id="host-z",
+                scopes=frozenset({"host:ingest"}),
+            ),
+        )
+
+        assert message_response.status_code == 201
+        assert message_response.body["command_ref"] is None
+        assert spoofed.status_code == 403
+        assert claimed.status_code == 202
+        assert claimed.body["status"] == "assigned"
+        assert claimed.body["assignment"]["host_id"] == "host-z"
+        assert claimed.body["assignment"]["task_id"] == f"telegram-msg:{message_id}"
+        assert [subject for subject, _payload in nats.published] == [
+            "openclaw.task.host-z.assigned"
+        ]
     finally:
         app.close()
 

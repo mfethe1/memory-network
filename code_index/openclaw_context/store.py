@@ -5,15 +5,21 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 from typing import Any
 
+from code_index.openclaw_context.completed_work import CompletedWorkEntry
+from code_index.openclaw_context.completed_work import normalize_completed_work_file_path
+from code_index.openclaw_context.models import CMAInvocationRecord
 from code_index.openclaw_context.models import ContextHealthEvent
 from code_index.openclaw_context.models import ContextManifest
 from code_index.openclaw_context.models import ContextPointer
 from code_index.openclaw_context.models import ContextSource
 from code_index.openclaw_context.models import HandoffPacket
 from code_index.openclaw_context.models import canonical_json
+from code_index.openclaw_context.models import json_tuple
 from code_index.openclaw_context.models import mapping_tuple
 from code_index.openclaw_context.models import string_tuple
 from code_index.openclaw_context.models import utc_now_iso
@@ -522,6 +528,209 @@ class SQLiteContextStore:
         ).fetchall()
         return [_handoff_from_row(row) for row in rows]
 
+    def record_completed_work(self, entry: CompletedWorkEntry) -> CompletedWorkEntry:
+        now = utc_now_iso()
+        self._conn.execute(
+            """
+            INSERT INTO completed_work_index(
+                work_id, idempotency_key, host_id, repo_id, task_id, run_id,
+                completed_at, files_changed_json, symbols_affected_json,
+                approach_taken, approaches_rejected_json,
+                verification_results_json, follow_up_pointers_json, trace_id,
+                source_event_offsets_json, metadata_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(idempotency_key) DO UPDATE SET
+                updated_at = excluded.updated_at
+            """,
+            (
+                entry.work_id,
+                entry.idempotency_key,
+                entry.host_id,
+                entry.repo_id,
+                entry.task_id,
+                entry.run_id,
+                entry.completed_at or now,
+                canonical_json(list(entry.files_changed)),
+                canonical_json(list(entry.symbols_affected)),
+                entry.approach_taken,
+                canonical_json(list(entry.approaches_rejected)),
+                canonical_json(entry.verification_results or {}),
+                canonical_json([dict(pointer) for pointer in entry.follow_up_pointers]),
+                entry.trace_id,
+                canonical_json(entry.source_event_offsets or {}),
+                canonical_json(entry.metadata or {}),
+                now,
+                now,
+            ),
+        )
+        row = self._conn.execute(
+            "SELECT * FROM completed_work_index WHERE idempotency_key = ?",
+            (entry.idempotency_key,),
+        ).fetchone()
+        assert row is not None
+        work_id = row["work_id"]
+        self._conn.execute(
+            "DELETE FROM completed_work_files WHERE work_id = ?",
+            (work_id,),
+        )
+        self._conn.execute(
+            "DELETE FROM completed_work_symbols WHERE work_id = ?",
+            (work_id,),
+        )
+        self._conn.executemany(
+            """
+            INSERT OR IGNORE INTO completed_work_files(
+                work_id, file_path, normalized_file_path
+            )
+            VALUES (?, ?, ?)
+            """,
+            [
+                (work_id, path, normalize_completed_work_file_path(path))
+                for path in entry.files_changed
+            ],
+        )
+        self._conn.executemany(
+            """
+            INSERT OR IGNORE INTO completed_work_symbols(work_id, symbol)
+            VALUES (?, ?)
+            """,
+            [(work_id, symbol) for symbol in entry.symbols_affected],
+        )
+        self._conn.commit()
+        saved = self.get_completed_work(work_id)
+        assert saved is not None
+        return saved
+
+    def get_completed_work(self, work_id: str) -> CompletedWorkEntry | None:
+        row = self._conn.execute(
+            "SELECT * FROM completed_work_index WHERE work_id = ?",
+            (work_id,),
+        ).fetchone()
+        return _completed_work_from_row(row) if row is not None else None
+
+    def list_completed_work_by_symbol(self, symbol: str) -> list[CompletedWorkEntry]:
+        rows = self._conn.execute(
+            """
+            SELECT completed_work_index.*
+              FROM completed_work_index
+              JOIN completed_work_symbols
+                ON completed_work_symbols.work_id = completed_work_index.work_id
+             WHERE completed_work_symbols.symbol = ?
+             ORDER BY completed_work_index.completed_at DESC,
+                      completed_work_index.work_pk DESC
+            """,
+            (str(symbol or "").strip(),),
+        ).fetchall()
+        return [_completed_work_from_row(row) for row in rows]
+
+    def list_completed_work_by_file(self, file_path: str) -> list[CompletedWorkEntry]:
+        rows = self._conn.execute(
+            """
+            SELECT completed_work_index.*
+              FROM completed_work_index
+              JOIN completed_work_files
+                ON completed_work_files.work_id = completed_work_index.work_id
+             WHERE completed_work_files.normalized_file_path = ?
+             ORDER BY completed_work_index.completed_at DESC,
+                      completed_work_index.work_pk DESC
+            """,
+            (normalize_completed_work_file_path(file_path),),
+        ).fetchall()
+        return [_completed_work_from_row(row) for row in rows]
+
+    def record_cma_invocation(self, record: CMAInvocationRecord) -> CMAInvocationRecord:
+        now = record.created_at or utc_now_iso()
+        self._conn.execute(
+            """
+            INSERT INTO cma_invocations(
+                invocation_id, run_id, task_id, trigger_event_kind, tier,
+                model_id, status, decision_kind, correction_pointer_ids_json,
+                rationale, escalate, observed_tokens, budget_tokens, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(invocation_id) DO UPDATE SET
+                run_id = excluded.run_id,
+                task_id = excluded.task_id,
+                trigger_event_kind = excluded.trigger_event_kind,
+                tier = excluded.tier,
+                model_id = excluded.model_id,
+                status = excluded.status,
+                decision_kind = excluded.decision_kind,
+                correction_pointer_ids_json = excluded.correction_pointer_ids_json,
+                rationale = excluded.rationale,
+                escalate = excluded.escalate,
+                observed_tokens = excluded.observed_tokens,
+                budget_tokens = excluded.budget_tokens,
+                created_at = excluded.created_at
+            """,
+            (
+                record.invocation_id,
+                record.run_id,
+                record.task_id,
+                record.trigger_event_kind,
+                record.tier,
+                record.model_id,
+                record.status,
+                record.decision_kind,
+                canonical_json(list(record.correction_pointer_ids)),
+                record.rationale,
+                1 if record.escalate else 0,
+                record.observed_tokens,
+                record.budget_tokens,
+                now,
+            ),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT * FROM cma_invocations WHERE invocation_id = ?",
+            (record.invocation_id,),
+        ).fetchone()
+        assert row is not None
+        return _cma_invocation_from_row(row)
+
+    def list_cma_invocations(self, run_id: str | None = None) -> list[CMAInvocationRecord]:
+        if run_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM cma_invocations ORDER BY invocation_pk ASC"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM cma_invocations
+                 WHERE run_id = ?
+                 ORDER BY invocation_pk ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        return [_cma_invocation_from_row(row) for row in rows]
+
+    def count_active_cma_invocations(self, window_seconds: float = 600.0) -> int:
+        cutoff = datetime.now(timezone.utc).timestamp() - max(
+            0.0,
+            float(window_seconds),
+        )
+        active = 0
+        for record in self.list_cma_invocations():
+            if record.status not in {"invoked", "escalated"}:
+                continue
+            created = _iso_timestamp(record.created_at)
+            if created is not None and created >= cutoff:
+                active += 1
+        return active
+
+    def last_cma_invocation_for_run(self, run_id: str) -> CMAInvocationRecord | None:
+        row = self._conn.execute(
+            """
+            SELECT * FROM cma_invocations
+             WHERE run_id = ?
+             ORDER BY created_at DESC, invocation_pk DESC
+             LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        return _cma_invocation_from_row(row) if row is not None else None
+
     def get_manifest_by_request_hash(self, request_hash: str) -> ContextManifest | None:
         row = self._conn.execute(
             "SELECT * FROM context_manifests WHERE request_hash = ?",
@@ -740,6 +949,67 @@ class SQLiteContextStore:
                 error_message TEXT,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS completed_work_index(
+                work_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_id TEXT NOT NULL UNIQUE,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                host_id TEXT,
+                repo_id TEXT,
+                task_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                files_changed_json TEXT NOT NULL DEFAULT '[]',
+                symbols_affected_json TEXT NOT NULL DEFAULT '[]',
+                approach_taken TEXT NOT NULL DEFAULT '',
+                approaches_rejected_json TEXT NOT NULL DEFAULT '[]',
+                verification_results_json TEXT NOT NULL DEFAULT '{}',
+                follow_up_pointers_json TEXT NOT NULL DEFAULT '[]',
+                trace_id TEXT,
+                source_event_offsets_json TEXT NOT NULL DEFAULT '{}',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS completed_work_files(
+                file_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_id TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                normalized_file_path TEXT NOT NULL,
+                UNIQUE(work_id, normalized_file_path)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_completed_work_files_path
+                ON completed_work_files(normalized_file_path);
+
+            CREATE TABLE IF NOT EXISTS completed_work_symbols(
+                symbol_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                UNIQUE(work_id, symbol)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_completed_work_symbols_symbol
+                ON completed_work_symbols(symbol);
+
+            CREATE TABLE IF NOT EXISTS cma_invocations(
+                invocation_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+                invocation_id TEXT NOT NULL UNIQUE,
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                trigger_event_kind TEXT NOT NULL,
+                tier INTEGER NOT NULL DEFAULT 1,
+                model_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                decision_kind TEXT,
+                correction_pointer_ids_json TEXT NOT NULL DEFAULT '[]',
+                rationale TEXT NOT NULL DEFAULT '',
+                escalate INTEGER NOT NULL DEFAULT 0,
+                observed_tokens INTEGER NOT NULL DEFAULT 0,
+                budget_tokens INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
             """
         )
         self._ensure_context_manifest_columns()
@@ -829,6 +1099,29 @@ def _handoff_from_row(row: sqlite3.Row) -> HandoffPacket:
     )
 
 
+def _completed_work_from_row(row: sqlite3.Row) -> CompletedWorkEntry:
+    return CompletedWorkEntry(
+        work_id=row["work_id"],
+        idempotency_key=row["idempotency_key"],
+        host_id=row["host_id"],
+        repo_id=row["repo_id"],
+        task_id=row["task_id"],
+        run_id=row["run_id"],
+        completed_at=row["completed_at"],
+        files_changed=string_tuple(row["files_changed_json"]),
+        symbols_affected=string_tuple(row["symbols_affected_json"]),
+        approach_taken=row["approach_taken"] or "",
+        approaches_rejected=json_tuple(row["approaches_rejected_json"]),
+        verification_results=_json_dict(row["verification_results_json"]),
+        follow_up_pointers=mapping_tuple(row["follow_up_pointers_json"]),
+        trace_id=row["trace_id"],
+        source_event_offsets=_json_dict(row["source_event_offsets_json"]),
+        metadata=_json_dict(row["metadata_json"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
 def _manifest_from_row(row: sqlite3.Row) -> ContextManifest:
     return ContextManifest(
         manifest_id=row["manifest_id"],
@@ -858,6 +1151,25 @@ def _manifest_from_row(row: sqlite3.Row) -> ContextManifest:
     )
 
 
+def _cma_invocation_from_row(row: sqlite3.Row) -> CMAInvocationRecord:
+    return CMAInvocationRecord(
+        invocation_id=row["invocation_id"],
+        run_id=row["run_id"],
+        task_id=row["task_id"],
+        trigger_event_kind=row["trigger_event_kind"],
+        tier=int(row["tier"] or 1),
+        model_id=row["model_id"],
+        status=row["status"],
+        decision_kind=row["decision_kind"],
+        correction_pointer_ids=string_tuple(row["correction_pointer_ids_json"]),
+        rationale=row["rationale"] or "",
+        escalate=bool(row["escalate"]),
+        observed_tokens=int(row["observed_tokens"] or 0),
+        budget_tokens=int(row["budget_tokens"] or 0),
+        created_at=row["created_at"],
+    )
+
+
 def _json_dict(value: str | None) -> dict[str, Any]:
     if not value:
         return {}
@@ -866,6 +1178,18 @@ def _json_dict(value: str | None) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _iso_timestamp(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).timestamp()
 
 
 def _id(prefix: str, value: str) -> str:

@@ -22,6 +22,12 @@ It does not assign work to hosts, acquire leases, publish host tasks directly,
 or own local Agent Run status. Those are later Fleet Controller and host daemon
 responsibilities.
 
+When embedded in `OpenClawControllerApp`, a newly created Telegram
+`assign_task` command reference is handed to the Fleet Controller immediately.
+That app-level handoff keeps scheduling and leases in the Fleet Controller
+while allowing one Telegram intake chat to submit work without a second manual
+API call.
+
 ## Storage
 
 The SQLite schema is created by `code_index.openclaw_messaging.store`:
@@ -75,6 +81,73 @@ not a fan-out rule to Telegram; adapter notification targets remain explicit.
 scopes. It returns the expected recipients before send. Task rooms can include
 both delivery targets and notification targets, allowing one room message to
 fan out to host/run recipients while sending a single adapter notification.
+
+For automatic fleet pickup, a command message can omit host delivery targets.
+The Fleet Controller treats existing host delivery records as explicit
+predelegation; if none exist, it chooses an eligible host and creates the host
+delivery record during assignment. This lets a single Telegram-mapped fleet
+room accept `/assign <task_id> <task prompt>` and still preserve per-recipient
+delivery state for the selected host.
+
+## Host Aliases And Claimable Work
+
+Telegram-facing names such as `@rosie` and `@lenny` are host aliases. They are
+not host IDs, Telegram identities, or authorization keys. Before execution, the
+Fleet Controller resolves a host alias to one stable host ID and records the
+chosen host in delivery and lease state.
+
+Explicit mentions are hard routing hints:
+
+```text
+@rosie please check my email
+@lenny summarize the fleet state
+/assign task-123 @rosie repair the failing inbox test
+```
+
+After identity and room policy validation, an explicit alias creates or
+constrains the host delivery record for that message. Scheduling still goes
+through the Fleet Controller. If the resolved host is stale, lacks the repo or
+provider capability, or conflicts with an active lease, the message is rejected
+or left unclaimed rather than falling through to another host silently.
+
+Untagged actionable messages become claimable work:
+
+```text
+please check my email
+look into the latest failed run
+```
+
+Claimable work is visible to eligible hosts in the mapped room. Rosie and Lenny
+may both observe the same message and use their local memory, capabilities, and
+current context to decide whether they can handle it. A host must make a task
+claim before starting an Agent Run. The claim path acquires the central task
+lease for the deterministic task ID derived from the message or command
+reference. The first eligible host that wins the lease receives the task
+assignment; later claims get a `task_lease_conflict` or already-claimed result
+and must not dispatch a local run.
+
+The Messaging Service remains the room and delivery layer. It stores the
+incoming Telegram message once, stores host-visible delivery records for the
+claim opportunity, and records claim/assignment/rejection events in the room
+timeline. It does not let Rosie and Lenny each create separate tasks from the
+same untagged message.
+
+Implementation status:
+
+1. Existing `openclaw_command_refs` rows already act as single-use controller
+   command claims for explicit mutating commands. `claim_command_ref` flips a
+   pending command to active before the Fleet Controller publishes work.
+2. Existing task leases already prevent duplicate Agent Runs if two hosts ever
+   receive or replay the same task assignment.
+3. Untagged Telegram messages marked as claimable work can be promoted into one
+   pending `assign_task` command reference for the same message, using a
+   deterministic task ID such as `telegram-msg:<message_id>` when no task ID
+   was supplied.
+4. The Fleet Controller claim path accepts a `claimant_host_id`, verifies that
+   host is eligible and delivery-visible, and assigns that same host instead of
+   sorting all eligible hosts. Replayed or racing claims reuse the existing
+   command-ref state and return claimed/consumed results without publishing a
+   second task.
 
 ## Routes
 
