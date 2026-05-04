@@ -1,0 +1,197 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from code_index.openclaw_messaging.adapter_registry import AdapterRegistry
+from code_index.openclaw_messaging.store import MessagingStore
+from code_index.openclaw_messaging.telegram import TelegramAdapter
+from code_index.openclaw_messaging.telegram import handle_telegram_webhook
+
+
+def _telegram_update(
+    *,
+    update_id: int = 100,
+    message_id: int = 200,
+    text: str = "Please check this.",
+) -> dict[str, object]:
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": message_id,
+            "chat": {"id": -100123, "type": "group", "title": "OpenClaw"},
+            "from": {"id": 42, "username": "operator", "first_name": "Operator"},
+            "text": text,
+            "reply_to_message": {"message_id": 99},
+        },
+    }
+
+
+def test_telegram_reply_creates_same_canonical_envelope_as_web_ui_message(
+    tmp_path: Path,
+) -> None:
+    store = MessagingStore(tmp_path / "messages.db")
+    try:
+        AdapterRegistry(store).register_defaults()
+        room = store.create_room(room_kind="task", display_name="Task", task_id="task-1")
+        store.map_platform_room(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            room_id=room["room_id"],
+        )
+        store.link_external_identity(
+            adapter_id="telegram",
+            platform_user_id="42",
+            openclaw_identity_id="operator-1",
+            scopes=("message:write",),
+            display_name="Operator",
+        )
+
+        web_message = store.create_message(
+            room_id=room["room_id"],
+            sender_kind="human",
+            sender_id="operator-1",
+            body="Please check this.",
+            message_type="chat",
+            target_scope={"kind": "task", "task_id": "task-1"},
+        )["message"]
+        telegram_message = handle_telegram_webhook(
+            store,
+            _telegram_update(text="Please check this."),
+        )["message"]
+
+        comparable_keys = (
+            "room_id",
+            "sender_kind",
+            "sender_id",
+            "message_type",
+            "body",
+            "target_scope",
+        )
+        assert {key: web_message[key] for key in comparable_keys} == {
+            key: telegram_message[key] for key in comparable_keys
+        }
+        assert telegram_message["adapter_id"] == "telegram"
+        assert telegram_message["platform_ref"]["platform_message_id"] == "200"
+    finally:
+        store.close()
+
+
+def test_platform_room_mapping_upsert_is_idempotent_for_default_thread(
+    tmp_path: Path,
+) -> None:
+    store = MessagingStore(tmp_path / "messages.db")
+    try:
+        first_room = store.create_room(room_kind="task", display_name="First")
+        second_room = store.create_room(room_kind="task", display_name="Second")
+        thread_room = store.create_room(room_kind="task", display_name="Thread")
+
+        first = store.map_platform_room(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            room_id=first_room["room_id"],
+        )
+        second = store.map_platform_room(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            room_id=second_room["room_id"],
+        )
+        thread = store.map_platform_room(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            platform_thread_id="99",
+            room_id=thread_room["room_id"],
+        )
+
+        assert second["mapping_id"] == first["mapping_id"]
+        assert thread["mapping_id"] != second["mapping_id"]
+        assert store.find_platform_room_mapping(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+        )["room_id"] == second_room["room_id"]
+        assert store.find_platform_room_mapping(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            platform_thread_id="99",
+        )["room_id"] == thread_room["room_id"]
+    finally:
+        store.close()
+
+
+def test_replayed_telegram_update_does_not_duplicate_commands_or_deliveries(
+    tmp_path: Path,
+) -> None:
+    store = MessagingStore(tmp_path / "messages.db", signing_secret="test-secret")
+    try:
+        AdapterRegistry(store).register_defaults()
+        store.set_adapter_command_promotion("telegram", enabled=True)
+        room = store.create_room(
+            room_kind="task",
+            display_name="Task",
+            task_id="task-1",
+            metadata={
+                "default_delivery_targets": [
+                    {"recipient_kind": "host", "recipient_id": "host-a"},
+                    {"recipient_kind": "run", "recipient_id": "run-a"},
+                ]
+            },
+        )
+        store.map_platform_room(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            room_id=room["room_id"],
+        )
+        store.link_external_identity(
+            adapter_id="telegram",
+            platform_user_id="42",
+            openclaw_identity_id="operator-1",
+            scopes=("message:write", "command:write"),
+            display_name="Operator",
+        )
+
+        first = handle_telegram_webhook(
+            store,
+            _telegram_update(text="/assign task-1 host-a"),
+        )
+        second = handle_telegram_webhook(
+            store,
+            _telegram_update(text="/assign task-1 host-a"),
+        )
+
+        message_id = first["message"]["message_id"]
+        assert second["message"]["message_id"] == message_id
+        assert first["created"] is True
+        assert second["created"] is False
+        assert len(store.list_messages(room["room_id"])) == 1
+        assert len(store.list_deliveries(message_id)) == 2
+        assert len(store.list_command_refs()) == 1
+        assert store.verify_command_ref(store.list_command_refs()[0]) is True
+    finally:
+        store.close()
+
+
+def test_telegram_adapter_renders_outbound_notification_payload() -> None:
+    adapter = TelegramAdapter()
+
+    rendered = adapter.render_outbound(
+        {
+            "message": {
+                "body": "Task completed.",
+                "message_type": "alert",
+                "metadata": {"severity": "completed"},
+            },
+            "delivery": {
+                "recipient_kind": "adapter",
+                "recipient_id": "telegram",
+                "metadata": {"platform_room_id": "-100123"},
+            },
+        }
+    )
+
+    assert rendered == {
+        "method": "sendMessage",
+        "payload": {
+            "chat_id": "-100123",
+            "text": "[completed] Task completed.",
+            "disable_web_page_preview": True,
+        },
+    }
