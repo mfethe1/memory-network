@@ -8,7 +8,7 @@ import json
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -25,6 +25,7 @@ LONG_CONTEXT_SOURCE_KINDS = {
     "raw_transcript",
     "project_context",
 }
+DEFAULT_MANIFEST_TTL = timedelta(minutes=30)
 
 
 @dataclass(frozen=True)
@@ -204,14 +205,17 @@ class ContextManifestBuilder:
     def build_manifest(self, request: ManifestRequest) -> ContextManifest:
         request_hash = _sha(canonical_json(request.to_dict()))
         cached = self.store.get_manifest_by_request_hash(request_hash)
-        if cached is not None and cached.status == "signed":
+        if cached is not None and cached.status == "signed" and cached.expires_at:
             return cached
+        build_now = self.now()
+        expires_at = _effective_expires_at(request.expires_at, build_now)
 
         doctor = self.probe.doctor()
         if not _doctor_ok(doctor):
             manifest = self._error_manifest(
                 request,
                 request_hash=request_hash,
+                expires_at=expires_at,
                 error_kind="stale_index",
                 error_message="code_index doctor reported a stale or unhealthy index",
             )
@@ -236,6 +240,7 @@ class ContextManifestBuilder:
             manifest = self._error_manifest(
                 request,
                 request_hash=request_hash,
+                expires_at=expires_at,
                 error_kind="missing_required_pointer",
                 error_message="required context pointer was not found",
             )
@@ -250,6 +255,7 @@ class ContextManifestBuilder:
             manifest = self._error_manifest(
                 request,
                 request_hash=request_hash,
+                expires_at=expires_at,
                 error_kind="required_budget_exceeded",
                 error_message="required context pointers exceed the configured budget",
             )
@@ -286,7 +292,7 @@ class ContextManifestBuilder:
             "token_budget": token_budget,
             "source_hashes": source_hashes,
             "peer_agent_states": [dict(item) for item in peer_states],
-            "expires_at": _datetime_text(request.expires_at),
+            "expires_at": expires_at,
             "request_hash": request_hash,
         }
         signed_payload = canonical_json(payload)
@@ -313,11 +319,11 @@ class ContextManifestBuilder:
             estimated_tokens=estimated_tokens,
             source_hashes=source_hashes,
             peer_agent_states=peer_states,
-            expires_at=_datetime_text(request.expires_at),
+            expires_at=expires_at,
             signature_key_id=self.signature_key_id,
             signature=signature,
             signed_payload=signed_payload,
-            created_at=_datetime_text(self.now()),
+            created_at=_datetime_text(build_now),
         )
         return self.store.store_manifest(manifest)
 
@@ -456,6 +462,7 @@ class ContextManifestBuilder:
         request: ManifestRequest,
         *,
         request_hash: str,
+        expires_at: str,
         error_kind: str,
         error_message: str,
     ) -> ContextManifest:
@@ -470,7 +477,7 @@ class ContextManifestBuilder:
             provider=request.provider,
             route_scope=request.route_scope,
             token_budget={"max_tokens": int(request.token_budget), "estimated_tokens": 0},
-            expires_at=_datetime_text(request.expires_at),
+            expires_at=expires_at,
             error_kind=error_kind,
             error_message=error_message,
             created_at=_datetime_text(self.now()),
@@ -639,6 +646,15 @@ def _datetime_text(value: datetime | str | None) -> str | None:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).isoformat()
+
+
+def _effective_expires_at(value: datetime | str | None, now: datetime) -> str:
+    explicit = _datetime_text(value)
+    if explicit is not None:
+        return explicit
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return (now.astimezone(timezone.utc) + DEFAULT_MANIFEST_TTL).isoformat()
 
 
 def _parse_datetime(value: str | None) -> datetime | None:

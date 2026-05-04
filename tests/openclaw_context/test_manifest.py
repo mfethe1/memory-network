@@ -368,6 +368,41 @@ def test_manifest_verification_rejects_wrong_key_expiry_and_tampering(
         store.close()
 
 
+def test_manifest_default_expiry_is_signed_and_verifiable(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteContextStore(tmp_path / "context.db")
+    try:
+        builder = ContextManifestBuilder(
+            store=store,
+            probe=FakeProbe(),
+            signing_secret="test-secret",
+            signature_key_id="test-key",
+            now=lambda: NOW,
+        )
+        request = ManifestRequest(
+            host_id="host-a",
+            repo_id="repo-a",
+            task_id="task-default-expiry",
+            run_id="run-default-expiry",
+            provider="codex",
+            target_symbols=("pkg.service.handle",),
+        )
+
+        manifest = builder.build_manifest(request)
+
+        assert manifest.status == "signed"
+        assert manifest.expires_at == (NOW + timedelta(minutes=30)).isoformat()
+        assert verify_context_manifest(
+            manifest,
+            signing_secret="test-secret",
+            signature_key_id="test-key",
+            now=lambda: NOW,
+        )
+    finally:
+        store.close()
+
+
 def test_manifest_builder_prunes_dead_reference_pointers(
     tmp_path: Path,
 ) -> None:

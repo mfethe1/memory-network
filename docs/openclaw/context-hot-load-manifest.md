@@ -32,6 +32,10 @@ Verification parses the payload, checks the key ID, rejects expired manifests,
 compares the HMAC with `compare_digest`, and confirms stored row fields match
 the signed payload.
 
+If `ManifestRequest.expires_at` is omitted, the builder assigns a conservative
+30-minute expiry from build time before signing. This keeps default manifests
+ergonomic while still making every signed manifest verifiable and expiring.
+
 The canonical `signed_payload` contains:
 
 ```text
