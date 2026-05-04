@@ -57,6 +57,46 @@ def _write_host_identity_atomic(path: Path, identity: HostIdentity) -> None:
             pass
 
 
+def _wait_for_identity_retry(
+    deadline: float,
+    *,
+    path: Path,
+    cause: BaseException,
+) -> None:
+    if time.monotonic() >= deadline:
+        raise TimeoutError(
+            f"timed out waiting for readable host identity: {path}"
+        ) from cause
+    time.sleep(IDENTITY_CREATE_RETRY_SECONDS)
+
+
+def _read_existing_host_identity(
+    path: Path,
+    *,
+    lock_path: Path,
+    deadline: float,
+) -> tuple[HostIdentity | None, bool]:
+    try:
+        file_present = path.is_file()
+    except OSError as exc:
+        _wait_for_identity_retry(deadline, path=path, cause=exc)
+        return None, True
+
+    if not file_present:
+        return None, False
+
+    try:
+        return _read_host_identity(path), True
+    except (OSError, json.JSONDecodeError) as exc:
+        _wait_for_identity_retry(deadline, path=path, cause=exc)
+        return None, True
+    except ValueError as exc:
+        if not lock_path.exists():
+            raise
+        _wait_for_identity_retry(deadline, path=path, cause=exc)
+        return None, True
+
+
 def load_or_create_host_identity(path: Path) -> HostIdentity:
     identity_path = path.expanduser()
     identity_path.parent.mkdir(parents=True, exist_ok=True)
@@ -64,8 +104,15 @@ def load_or_create_host_identity(path: Path) -> HostIdentity:
     deadline = time.monotonic() + IDENTITY_CREATE_TIMEOUT_SECONDS
 
     while True:
-        if identity_path.is_file():
-            return _read_host_identity(identity_path)
+        identity, file_present = _read_existing_host_identity(
+            identity_path,
+            lock_path=lock_path,
+            deadline=deadline,
+        )
+        if identity is not None:
+            return identity
+        if file_present:
+            continue
 
         lock_fd: int | None = None
         try:
@@ -82,8 +129,16 @@ def load_or_create_host_identity(path: Path) -> HostIdentity:
             continue
 
         try:
-            if identity_path.is_file():
-                return _read_host_identity(identity_path)
+            identity, file_present = _read_existing_host_identity(
+                identity_path,
+                lock_path=lock_path,
+                deadline=deadline,
+            )
+            if identity is not None:
+                return identity
+            if file_present:
+                continue
+
             identity = HostIdentity(host_id=_new_host_id())
             _write_host_identity_atomic(identity_path, identity)
             return identity
