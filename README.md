@@ -7,6 +7,9 @@ top, not the primary identity layer.
 Design authority: [`docs/code-index-spec.md`](docs/code-index-spec.md).
 Repo-specific implementation choices: [`plans/code-index-repo-plan.md`](plans/code-index-repo-plan.md).
 Project-memory summary: [`CLAUDE.md`](CLAUDE.md).
+OpenClaw fleet docs: [`docs/openclaw/broker-deployment.md`](docs/openclaw/broker-deployment.md),
+[`docs/openclaw/host-identity.md`](docs/openclaw/host-identity.md), and
+[`docs/openclaw/nats-subject-acls.md`](docs/openclaw/nats-subject-acls.md).
 
 ## Status
 
