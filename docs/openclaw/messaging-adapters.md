@@ -51,18 +51,22 @@ command:propose
 command:write
 ```
 
-Command promotion requires both:
+Command promotion requires all of:
 
 1. `openclaw_messaging_adapters.command_promotion_enabled = true`
 2. A verified identity link with `command:write`
+3. A platform-room mapping for the adapter room/thread to the OpenClaw room
+4. A route policy that enables promotion for the command type and target kind
 
-If either condition is missing, the inbound event is stored as chat with
+If any condition is missing, the inbound event is stored as chat with
 `metadata.command_promotion = blocked` and no command ref is created.
 
 ## Telegram
 
 The Telegram adapter handles inbound webhook updates and outbound notification
-payloads. It derives idempotency from:
+payloads. Inbound webhook handling requires the configured Telegram secret
+token to match the `X-Telegram-Bot-Api-Secret-Token` header before identity
+lookup or command promotion runs. It derives idempotency from:
 
 ```text
 telegram:<platform_room_id>:<platform_thread_id>:<platform_event_id>

@@ -18,31 +18,42 @@ class ApiResponse:
 
 
 class MessagingRouter:
-    def __init__(self, store: MessagingStore) -> None:
+    def __init__(
+        self,
+        store: MessagingStore,
+        *,
+        telegram_secret_token: str | None = None,
+    ) -> None:
         self.store = store
+        self.telegram_secret_token = _string_or_none(telegram_secret_token)
 
     def handle(
         self,
         method: str,
         path: str,
         body: Mapping[str, Any] | None = None,
+        headers: Mapping[str, Any] | None = None,
     ) -> ApiResponse:
         method = method.upper()
         parts = [unquote(part) for part in urlsplit(path).path.strip("/").split("/") if part]
         payload = dict(body or {})
+        request_headers = {str(key).lower(): str(value) for key, value in dict(headers or {}).items()}
         try:
             if method == "GET" and parts == ["rooms"]:
                 return ApiResponse(200, {"rooms": self.store.list_rooms()})
             if method == "GET" and len(parts) == 3 and parts[0] == "rooms" and parts[2] == "messages":
                 return ApiResponse(200, {"messages": self.store.list_messages(parts[1])})
             if method == "POST" and parts == ["messages"]:
+                message_type = str(payload.get("message_type") or "chat").strip().lower()
+                if message_type == "command" and not _principal_can_sign_command(payload):
+                    return ApiResponse(403, {"error": "command signing requires command:write principal"})
                 result = self.store.create_message(
                     room_id=str(payload.get("room_id") or ""),
                     sender_kind=str(payload.get("sender_kind") or "human"),
                     sender_id=str(payload.get("sender_id") or ""),
                     body=str(payload.get("body") or ""),
                     target_scope=_object_or_none(payload.get("target_scope")),
-                    message_type=str(payload.get("message_type") or "chat"),
+                    message_type=message_type,
                     context_handles=_list_or_none(payload.get("context_handles")),
                     adapter_id=_string_or_none(payload.get("adapter_id")),
                     platform_ref=_object_or_none(payload.get("platform_ref")),
@@ -71,10 +82,19 @@ class MessagingRouter:
             if method == "GET" and parts == ["messages", "stream"]:
                 return ApiResponse(200, {"events": self.store.list_message_events()})
             if method == "POST" and parts == ["adapters", "telegram", "webhook"]:
-                result = handle_telegram_webhook(self.store, payload)
+                result = handle_telegram_webhook(
+                    self.store,
+                    payload,
+                    secret_token=self.telegram_secret_token,
+                    provided_secret_token=request_headers.get(
+                        "x-telegram-bot-api-secret-token"
+                    ),
+                )
                 return ApiResponse(201 if result["created"] else 200, result)
         except KeyError as exc:
             return ApiResponse(404, {"error": str(exc)})
+        except PermissionError as exc:
+            return ApiResponse(403, {"error": str(exc)})
         except (MessagingError, ValueError) as exc:
             return ApiResponse(400, {"error": str(exc)})
         return ApiResponse(404, {"error": "route not found"})
@@ -103,3 +123,21 @@ def _list_or_none(value: Any) -> list[Any] | None:
 def _string_or_none(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _principal_can_sign_command(payload: Mapping[str, Any]) -> bool:
+    principal = payload.get("principal")
+    if not isinstance(principal, Mapping):
+        return False
+    scopes = principal.get("scopes")
+    if isinstance(scopes, str):
+        scope_set = {scopes}
+    elif isinstance(scopes, list):
+        scope_set = {str(scope) for scope in scopes}
+    else:
+        scope_set = set()
+    if "command:write" not in scope_set:
+        return False
+    principal_id = _string_or_none(principal.get("principal_id"))
+    sender_id = _string_or_none(payload.get("sender_id"))
+    return not principal_id or not sender_id or principal_id == sender_id

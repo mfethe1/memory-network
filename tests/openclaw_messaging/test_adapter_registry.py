@@ -6,10 +6,17 @@ from code_index.openclaw_messaging.adapter_registry import AdapterRegistry
 from code_index.openclaw_messaging.store import MessagingStore
 
 
+SIGNING_SECRET = "test-secret"
+
+
+def _store(tmp_path: Path) -> MessagingStore:
+    return MessagingStore(tmp_path / "messages.db", signing_secret=SIGNING_SECRET)
+
+
 def test_default_external_adapters_register_without_command_promotion(
     tmp_path: Path,
 ) -> None:
-    store = MessagingStore(tmp_path / "messages.db")
+    store = _store(tmp_path)
     try:
         registry = AdapterRegistry(store)
         registry.register_defaults()
@@ -34,7 +41,7 @@ def test_default_external_adapters_register_without_command_promotion(
 def test_slack_or_discord_inbound_cannot_create_command_until_identity_and_policy_allow(
     tmp_path: Path,
 ) -> None:
-    store = MessagingStore(tmp_path / "messages.db", signing_secret="test-secret")
+    store = _store(tmp_path)
     try:
         AdapterRegistry(store).register_defaults()
         room = store.create_room(
@@ -74,7 +81,7 @@ def test_slack_or_discord_inbound_cannot_create_command_until_identity_and_polic
             scopes=("message:write", "command:write"),
             display_name="Operator",
         )
-        promoted = store.ingest_adapter_message(
+        still_blocked = store.ingest_adapter_message(
             adapter_id="slack",
             platform_user_id="U123",
             room_id=room["room_id"],
@@ -84,6 +91,36 @@ def test_slack_or_discord_inbound_cannot_create_command_until_identity_and_polic
             platform_ref={
                 "platform_room_id": "C123",
                 "platform_event_id": "event-2",
+            },
+            target_scope={"kind": "task", "task_id": "task-123"},
+        )
+        assert still_blocked["message"]["message_type"] == "chat"
+        assert store.get_command_ref_for_message(
+            still_blocked["message"]["message_id"]
+        ) is None
+
+        store.map_platform_room(
+            adapter_id="slack",
+            platform_room_id="C123",
+            room_id=room["room_id"],
+            route_policy={
+                "command_promotion": {
+                    "enabled": True,
+                    "allowed_command_types": ["assign_task"],
+                    "allowed_target_kinds": ["task"],
+                }
+            },
+        )
+        promoted = store.ingest_adapter_message(
+            adapter_id="slack",
+            platform_user_id="U123",
+            room_id=room["room_id"],
+            body="/assign task-123 host-a",
+            message_type="command",
+            command_type="assign_task",
+            platform_ref={
+                "platform_room_id": "C123",
+                "platform_event_id": "event-3",
             },
             target_scope={"kind": "task", "task_id": "task-123"},
         )
@@ -102,7 +139,7 @@ def test_slack_or_discord_inbound_cannot_create_command_until_identity_and_polic
 def test_generic_webhook_can_create_inbound_message_but_not_command(
     tmp_path: Path,
 ) -> None:
-    store = MessagingStore(tmp_path / "messages.db")
+    store = _store(tmp_path)
     try:
         AdapterRegistry(store).register_defaults()
         room = store.create_room(room_kind="fleet", display_name="Fleet")

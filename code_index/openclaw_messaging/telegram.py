@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 from typing import Any, Mapping
 
 from code_index.openclaw_messaging.adapters import AdapterCapabilities
@@ -95,7 +96,13 @@ def handle_telegram_webhook(
     update: Mapping[str, Any],
     *,
     adapter_id: str = "telegram",
+    secret_token: str | None,
+    provided_secret_token: str | None,
 ) -> dict[str, Any]:
+    _require_secret_token(
+        expected=secret_token,
+        provided=provided_secret_token,
+    )
     adapter = TelegramAdapter()
     if adapter_id != adapter.adapter_id:
         raise ValueError("only the built-in telegram adapter is supported")
@@ -126,6 +133,17 @@ def handle_telegram_webhook(
         trace_id=draft.trace_id,
         correlation_id=draft.correlation_id,
     )
+
+
+def _require_secret_token(*, expected: str | None, provided: str | None) -> None:
+    expected_text = str(expected or "").strip()
+    provided_text = str(provided or "").strip()
+    if not expected_text:
+        raise PermissionError("Telegram webhook secret token is not configured")
+    if not provided_text:
+        raise PermissionError("Telegram webhook secret token is required")
+    if not hmac.compare_digest(provided_text, expected_text):
+        raise PermissionError("Telegram webhook secret token is invalid")
 
 
 def _telegram_message(update: Mapping[str, Any]) -> Mapping[str, Any]:

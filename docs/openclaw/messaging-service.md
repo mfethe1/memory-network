@@ -41,6 +41,12 @@ adapter ID, platform room/thread ID, and platform event/message ID so replayed
 webhook updates return the existing message and do not create duplicate
 deliveries or command refs.
 
+Delivery rows carry a normalized delivery key in addition to recipient
+kind/ID. Adapter deliveries include platform target identity in that key so
+two Telegram room targets do not collapse into one delivery. ACK updates are
+monotonic; a late `delivered` report cannot downgrade an already `acked`
+delivery.
+
 ## Rooms And Projections
 
 Rooms are the user-facing conversation model. A task room can include swarm
@@ -85,11 +91,22 @@ POST /adapters/telegram/webhook
 The dispatcher is intentionally framework-free. A future HTTP server can wrap
 the same router without changing store behavior.
 
+`POST /messages` signs commands only when the request includes a principal
+with `command:write`. Chat messages may be accepted without that principal in
+this slice, but mutating command refs are never created by an anonymous route
+caller.
+
 ## Command References
 
 Messages with `message_type = command` create an `openclaw_command_refs` row.
+The store requires an explicit signing secret; there is no production default.
 The command payload is signed with deterministic local HMAC for Milestone 1
-tests. Host/run/controller deliveries for command messages include the
-`command_id` in delivery metadata. External adapters cannot create command
-refs unless the adapter policy allows promotion and the platform user is
-linked to a verified OpenClaw identity with `command:write`.
+tests. Verification checks HMAC, expected key ID, pending/active status,
+expiration, DB row identity, command/message IDs, target fields, and message
+body hash. Host/run/controller deliveries for command messages include the
+`command_id` in delivery metadata.
+
+External adapters cannot create command refs unless adapter policy allows
+promotion, the platform user is linked to a verified OpenClaw identity with
+`command:write`, the event maps to the room through an explicit platform-room
+mapping, and that mapping allows the command type and target kind.

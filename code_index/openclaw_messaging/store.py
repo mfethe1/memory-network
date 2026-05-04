@@ -34,9 +34,11 @@ class MessagingStore:
         self,
         db_path: str | Path,
         *,
-        signing_secret: str = "openclaw-local-dev-secret",
+        signing_secret: str,
     ) -> None:
         self.db_path = db_path
+        if not str(signing_secret or "").strip():
+            raise MessagingError("signing_secret is required")
         self.signing_secret = signing_secret.encode("utf-8")
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
@@ -88,13 +90,14 @@ class MessagingStore:
               message_id TEXT NOT NULL REFERENCES openclaw_messages(message_id),
               recipient_kind TEXT NOT NULL,
               recipient_id TEXT NOT NULL,
+              delivery_key TEXT NOT NULL,
               delivery_status TEXT NOT NULL,
               nats_sequence INTEGER,
               delivered_at TEXT,
               acked_at TEXT,
               error TEXT,
               metadata_json TEXT NOT NULL,
-              UNIQUE(message_id, recipient_kind, recipient_id)
+              UNIQUE(message_id, delivery_key)
             );
 
             CREATE TABLE IF NOT EXISTS openclaw_command_refs (
@@ -133,13 +136,14 @@ class MessagingStore:
               adapter_id TEXT NOT NULL,
               platform_room_id TEXT NOT NULL,
               platform_thread_id TEXT,
+              platform_thread_key TEXT NOT NULL DEFAULT '',
               room_id TEXT NOT NULL REFERENCES openclaw_rooms(room_id),
               sync_mode TEXT NOT NULL,
               route_policy_json TEXT NOT NULL,
               created_at TEXT NOT NULL,
               archived_at TEXT,
               metadata_json TEXT NOT NULL,
-              UNIQUE(adapter_id, platform_room_id, platform_thread_id)
+              UNIQUE(adapter_id, platform_room_id, platform_thread_key)
             );
 
             CREATE TABLE IF NOT EXISTS openclaw_external_identities (
@@ -167,7 +171,7 @@ class MessagingStore:
               ON openclaw_platform_room_mappings(
                 adapter_id,
                 platform_room_id,
-                platform_thread_id
+                platform_thread_key
               );
             """
         )
@@ -406,6 +410,12 @@ class MessagingStore:
         if existing is not None:
             return self._message_result(existing, created=False)
 
+        room = self.get_room(room_id)
+        effective_target_scope = (
+            _normalize_target_scope(target_scope)
+            if target_scope is not None
+            else self._target_scope_for_room(room)
+        )
         identity = self.get_external_identity(adapter_id, platform_user_id)
         sender_id = (
             identity["openclaw_identity_id"]
@@ -417,9 +427,13 @@ class MessagingStore:
             choices=MESSAGE_TYPES,
             field_name="message_type",
         )
-        allowed_command = (
-            requested_type == "command"
-            and self.can_promote_adapter_command(adapter_id, platform_user_id)
+        allowed_command = requested_type == "command" and self.can_promote_adapter_command(
+            adapter_id,
+            platform_user_id,
+            room_id=room_id,
+            platform_ref=ref,
+            command_type=command_type,
+            target_scope=effective_target_scope,
         )
         effective_type = "command" if allowed_command else (
             "chat" if requested_type == "command" else requested_type
@@ -441,7 +455,7 @@ class MessagingStore:
             sender_kind="human",
             sender_id=sender_id,
             body=body,
-            target_scope=target_scope,
+            target_scope=effective_target_scope,
             message_type=effective_type,
             adapter_id=adapter_id,
             platform_ref=ref,
@@ -498,7 +512,7 @@ class MessagingStore:
                 """
                 SELECT * FROM openclaw_message_deliveries
                  WHERE message_id = ?
-                 ORDER BY recipient_kind, recipient_id
+                 ORDER BY recipient_kind, recipient_id, delivery_key
                 """,
                 (message_id,),
             )
@@ -526,6 +540,9 @@ class MessagingStore:
         now = _now()
         delivered_at = existing["delivered_at"]
         acked_at = existing["acked_at"]
+        current_status = str(existing["delivery_status"] or "queued")
+        if _delivery_status_rank(status) < _delivery_status_rank(current_status):
+            return existing
         if status in {"delivered", "acked"} and not delivered_at:
             delivered_at = now
         if status == "acked":
@@ -561,13 +578,71 @@ class MessagingStore:
 
     def verify_command_ref(self, command_ref: Mapping[str, Any]) -> bool:
         try:
+            command_id = str(command_ref["command_id"])
+            message_id = str(command_ref["message_id"])
             signed = json.loads(str(command_ref["signed_payload"]))
             payload = signed["payload"]
             signature = str(signed["signature"])
         except (KeyError, TypeError, json.JSONDecodeError):
             return False
+        if not isinstance(payload, Mapping):
+            return False
         expected = _sign_payload(self.signing_secret, payload)
-        return hmac.compare_digest(signature, expected)
+        if not hmac.compare_digest(signature, expected):
+            return False
+        row = self.conn.execute(
+            "SELECT * FROM openclaw_command_refs WHERE command_id = ?",
+            (command_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        stored = _command(row)
+        if stored["message_id"] != message_id:
+            return False
+        for key in (
+            "command_id",
+            "message_id",
+            "command_type",
+            "signed_payload",
+            "signature_key_id",
+            "expires_at",
+            "status",
+        ):
+            if str(command_ref.get(key)) != str(stored.get(key)):
+                return False
+        if stored["signature_key_id"] != DEFAULT_SIGNATURE_KEY_ID:
+            return False
+        if stored["status"] not in {"pending", "active"}:
+            return False
+        if str(payload.get("command_id")) != stored["command_id"]:
+            return False
+        if str(payload.get("message_id")) != stored["message_id"]:
+            return False
+        if str(payload.get("command_type")) != stored["command_type"]:
+            return False
+        if str(payload.get("expires_at")) != stored["expires_at"]:
+            return False
+        expires_at = _parse_datetime(stored["expires_at"])
+        if expires_at is None or expires_at <= datetime.now(timezone.utc):
+            return False
+        message = self.get_message(stored["message_id"])
+        if str(payload.get("sender_id")) != message["sender_id"]:
+            return False
+        expected_body_hash = hashlib.sha256(
+            message["body"].encode("utf-8")
+        ).hexdigest()
+        if str(payload.get("body_sha256")) != expected_body_hash:
+            return False
+        target_scope = payload.get("target_scope")
+        if not isinstance(target_scope, Mapping):
+            return False
+        if _clean(target_scope.get("host_id")) != stored["target_host_id"]:
+            return False
+        if _clean(target_scope.get("task_id")) != stored["task_id"]:
+            return False
+        if _clean(target_scope.get("run_id")) != stored["run_id"]:
+            return False
+        return True
 
     def register_adapter(
         self,
@@ -727,6 +802,11 @@ class MessagingStore:
         self,
         adapter_id: str,
         platform_user_id: str,
+        *,
+        room_id: str | None = None,
+        platform_ref: Mapping[str, Any] | None = None,
+        command_type: str | None = None,
+        target_scope: Mapping[str, Any] | None = None,
     ) -> bool:
         adapter = self.get_adapter(adapter_id)
         if not adapter or not adapter["command_promotion_enabled"]:
@@ -734,7 +814,28 @@ class MessagingStore:
         identity = self.get_external_identity(adapter_id, platform_user_id)
         if not identity:
             return False
-        return "command:write" in set(identity["scopes"])
+        if "command:write" not in set(identity["scopes"]):
+            return False
+        ref = dict(platform_ref or {})
+        platform_room_id = _clean(
+            ref.get("platform_room_id") or ref.get("chat_id") or ref.get("room_id")
+        )
+        if not room_id or not platform_room_id:
+            return False
+        mapping = self.find_platform_room_mapping(
+            adapter_id=adapter_id,
+            platform_room_id=platform_room_id,
+            platform_thread_id=_clean(
+                ref.get("platform_thread_id") or ref.get("thread_id")
+            ),
+        )
+        if mapping is None or mapping["room_id"] != room_id:
+            return False
+        return _route_policy_allows_command(
+            mapping["route_policy"],
+            command_type=command_type,
+            target_scope=target_scope,
+        )
 
     def map_platform_room(
         self,
@@ -749,6 +850,7 @@ class MessagingStore:
     ) -> dict[str, Any]:
         self.get_room(room_id)
         now = _now()
+        thread_key = _thread_key(platform_thread_id)
         existing = self._exact_platform_room_mapping(
             adapter_id=adapter_id,
             platform_room_id=str(platform_room_id),
@@ -779,15 +881,17 @@ class MessagingStore:
                     """
                     INSERT INTO openclaw_platform_room_mappings (
                       mapping_id, adapter_id, platform_room_id,
-                      platform_thread_id, room_id, sync_mode, route_policy_json,
-                      created_at, archived_at, metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                      platform_thread_id, platform_thread_key, room_id,
+                      sync_mode, route_policy_json, created_at, archived_at,
+                      metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
                     """,
                     (
                         _new_id("mapping"),
                         adapter_id,
                         str(platform_room_id),
                         _clean(platform_thread_id),
+                        thread_key,
                         room_id,
                         sync_mode,
                         _dump(dict(route_policy or {})),
@@ -812,6 +916,7 @@ class MessagingStore:
         platform_thread_id: str | None = None,
     ) -> dict[str, Any] | None:
         thread = _clean(platform_thread_id)
+        thread_key = _thread_key(platform_thread_id)
         row = None
         if thread is not None:
             row = self.conn.execute(
@@ -819,10 +924,10 @@ class MessagingStore:
                 SELECT * FROM openclaw_platform_room_mappings
                  WHERE adapter_id = ?
                    AND platform_room_id = ?
-                   AND platform_thread_id = ?
+                   AND platform_thread_key = ?
                    AND archived_at IS NULL
                 """,
-                (adapter_id, platform_room_id, thread),
+                (adapter_id, platform_room_id, thread_key),
             ).fetchone()
         if row is None:
             row = self.conn.execute(
@@ -830,12 +935,24 @@ class MessagingStore:
                 SELECT * FROM openclaw_platform_room_mappings
                  WHERE adapter_id = ?
                    AND platform_room_id = ?
-                   AND platform_thread_id IS NULL
+                   AND platform_thread_key = ''
                    AND archived_at IS NULL
                 """,
                 (adapter_id, platform_room_id),
             ).fetchone()
         return _mapping(row) if row else None
+
+    def list_platform_room_mappings(self) -> list[dict[str, Any]]:
+        return [
+            _mapping(row)
+            for row in self.conn.execute(
+                """
+                SELECT * FROM openclaw_platform_room_mappings
+                 WHERE archived_at IS NULL
+                 ORDER BY adapter_id, platform_room_id, platform_thread_key
+                """
+            )
+        ]
 
     def _exact_platform_room_mapping(
         self,
@@ -845,13 +962,14 @@ class MessagingStore:
         platform_thread_id: str | None = None,
     ) -> dict[str, Any] | None:
         thread = _clean(platform_thread_id)
+        thread_key = _thread_key(platform_thread_id)
         if thread is None:
             row = self.conn.execute(
                 """
                 SELECT * FROM openclaw_platform_room_mappings
                  WHERE adapter_id = ?
                    AND platform_room_id = ?
-                   AND platform_thread_id IS NULL
+                   AND platform_thread_key = ''
                    AND archived_at IS NULL
                 """,
                 (adapter_id, platform_room_id),
@@ -862,10 +980,10 @@ class MessagingStore:
                 SELECT * FROM openclaw_platform_room_mappings
                  WHERE adapter_id = ?
                    AND platform_room_id = ?
-                   AND platform_thread_id = ?
+                   AND platform_thread_key = ?
                    AND archived_at IS NULL
                 """,
-                (adapter_id, platform_room_id, thread),
+                (adapter_id, platform_room_id, thread_key),
             ).fetchone()
         return _mapping(row) if row else None
 
@@ -998,7 +1116,7 @@ class MessagingStore:
               command_id, message_id, command_type, target_host_id, task_id,
               run_id, lease_id, signed_payload, signature_key_id, expires_at,
               status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'signed', ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'pending', ?)
             """,
             (
                 command_id,
@@ -1032,6 +1150,7 @@ class MessagingStore:
                 for key, value in recipient.items()
                 if key not in {"recipient_kind", "recipient_id"}
             }
+            delivery_key = _delivery_key(recipient)
             if command_id and recipient["recipient_kind"] in {
                 "host",
                 "run",
@@ -1043,15 +1162,16 @@ class MessagingStore:
                 """
                 INSERT OR IGNORE INTO openclaw_message_deliveries (
                   delivery_id, message_id, recipient_kind, recipient_id,
-                  delivery_status, nats_sequence, delivered_at, acked_at,
-                  error, metadata_json
-                ) VALUES (?, ?, ?, ?, 'queued', NULL, NULL, NULL, NULL, ?)
+                  delivery_key, delivery_status, nats_sequence, delivered_at,
+                  acked_at, error, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, 'queued', NULL, NULL, NULL, NULL, ?)
                 """,
                 (
                     _new_id("delivery"),
                     message_id,
                     recipient["recipient_kind"],
                     recipient["recipient_id"],
+                    delivery_key,
                     _dump(metadata),
                 ),
             )
@@ -1178,6 +1298,7 @@ def _delivery(row: sqlite3.Row) -> dict[str, Any]:
         "message_id": row["message_id"],
         "recipient_kind": row["recipient_kind"],
         "recipient_id": row["recipient_id"],
+        "delivery_key": row["delivery_key"],
         "delivery_status": row["delivery_status"],
         "nats_sequence": row["nats_sequence"],
         "delivered_at": row["delivered_at"],
@@ -1227,6 +1348,7 @@ def _mapping(row: sqlite3.Row) -> dict[str, Any]:
         "adapter_id": row["adapter_id"],
         "platform_room_id": row["platform_room_id"],
         "platform_thread_id": row["platform_thread_id"],
+        "platform_thread_key": row["platform_thread_key"],
         "room_id": row["room_id"],
         "sync_mode": row["sync_mode"],
         "route_policy": _load(row["route_policy_json"], {}),
@@ -1348,6 +1470,83 @@ def _scope_list(scopes: Iterable[str]) -> list[str]:
         if text and text not in out:
             out.append(text)
     return out
+
+
+def _delivery_status_rank(status: str) -> int:
+    return {
+        "queued": 0,
+        "delivered": 1,
+        "acked": 2,
+        "failed": 3,
+        "expired": 3,
+    }.get(str(status or "").strip().lower(), 0)
+
+
+def _delivery_key(recipient: Mapping[str, Any]) -> str:
+    target = {
+        "recipient_kind": recipient.get("recipient_kind"),
+        "recipient_id": recipient.get("recipient_id"),
+        "platform_room_id": recipient.get("platform_room_id"),
+        "platform_thread_id": recipient.get("platform_thread_id"),
+        "platform_message_id": recipient.get("platform_message_id"),
+        "webhook_url": recipient.get("webhook_url"),
+        "email": recipient.get("email"),
+    }
+    target = {key: value for key, value in target.items() if value is not None}
+    return hashlib.sha256(_dump(target).encode("utf-8")).hexdigest()
+
+
+def _thread_key(platform_thread_id: Any) -> str:
+    return _clean(platform_thread_id) or ""
+
+
+def _route_policy_allows_command(
+    route_policy: Mapping[str, Any],
+    *,
+    command_type: str | None,
+    target_scope: Mapping[str, Any] | None,
+) -> bool:
+    policy = (
+        route_policy.get("command_promotion")
+        if isinstance(route_policy.get("command_promotion"), Mapping)
+        else {}
+    )
+    if not policy.get("enabled"):
+        return False
+    allowed_command_types = _string_set(policy.get("allowed_command_types"))
+    command = str(command_type or "").strip()
+    if allowed_command_types and command not in allowed_command_types:
+        return False
+    target_kind = ""
+    if isinstance(target_scope, Mapping):
+        target_kind = str(target_scope.get("kind") or "").strip().lower()
+    allowed_target_kinds = _string_set(policy.get("allowed_target_kinds"))
+    if allowed_target_kinds and target_kind not in allowed_target_kinds:
+        return False
+    return True
+
+
+def _string_set(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {value.strip()} if value.strip() else set()
+    if not isinstance(value, list):
+        return set()
+    return {str(item).strip() for item in value if str(item).strip()}
+
+
+def _parse_datetime(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _sign_payload(secret: bytes, payload: Mapping[str, Any]) -> str:

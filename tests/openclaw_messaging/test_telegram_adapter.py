@@ -3,9 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 
 from code_index.openclaw_messaging.adapter_registry import AdapterRegistry
+from code_index.openclaw_messaging.routes import MessagingRouter
 from code_index.openclaw_messaging.store import MessagingStore
 from code_index.openclaw_messaging.telegram import TelegramAdapter
 from code_index.openclaw_messaging.telegram import handle_telegram_webhook
+
+SIGNING_SECRET = "test-secret"
+TELEGRAM_SECRET = "telegram-secret"
+
+
+def _store(tmp_path: Path) -> MessagingStore:
+    return MessagingStore(tmp_path / "messages.db", signing_secret=SIGNING_SECRET)
 
 
 def _telegram_update(
@@ -29,7 +37,7 @@ def _telegram_update(
 def test_telegram_reply_creates_same_canonical_envelope_as_web_ui_message(
     tmp_path: Path,
 ) -> None:
-    store = MessagingStore(tmp_path / "messages.db")
+    store = _store(tmp_path)
     try:
         AdapterRegistry(store).register_defaults()
         room = store.create_room(room_kind="task", display_name="Task", task_id="task-1")
@@ -57,6 +65,8 @@ def test_telegram_reply_creates_same_canonical_envelope_as_web_ui_message(
         telegram_message = handle_telegram_webhook(
             store,
             _telegram_update(text="Please check this."),
+            secret_token=TELEGRAM_SECRET,
+            provided_secret_token=TELEGRAM_SECRET,
         )["message"]
 
         comparable_keys = (
@@ -79,7 +89,7 @@ def test_telegram_reply_creates_same_canonical_envelope_as_web_ui_message(
 def test_platform_room_mapping_upsert_is_idempotent_for_default_thread(
     tmp_path: Path,
 ) -> None:
-    store = MessagingStore(tmp_path / "messages.db")
+    store = _store(tmp_path)
     try:
         first_room = store.create_room(room_kind="task", display_name="First")
         second_room = store.create_room(room_kind="task", display_name="Second")
@@ -113,6 +123,106 @@ def test_platform_room_mapping_upsert_is_idempotent_for_default_thread(
             platform_room_id="-100123",
             platform_thread_id="99",
         )["room_id"] == thread_room["room_id"]
+        assert len(store.list_platform_room_mappings()) == 2
+    finally:
+        store.close()
+
+
+def test_telegram_webhook_requires_valid_secret_before_ingest(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    try:
+        AdapterRegistry(store).register_defaults()
+        store.set_adapter_command_promotion("telegram", enabled=True)
+        room = store.create_room(
+            room_kind="task",
+            display_name="Task",
+            task_id="task-1",
+            metadata={
+                "default_delivery_targets": [
+                    {"recipient_kind": "host", "recipient_id": "host-a"}
+                ]
+            },
+        )
+        store.map_platform_room(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            room_id=room["room_id"],
+            route_policy={
+                "command_promotion": {
+                    "enabled": True,
+                    "allowed_command_types": ["assign_task"],
+                    "allowed_target_kinds": ["task"],
+                }
+            },
+        )
+        store.link_external_identity(
+            adapter_id="telegram",
+            platform_user_id="42",
+            openclaw_identity_id="operator-1",
+            scopes=("message:write", "command:write"),
+            display_name="Operator",
+        )
+
+        for provided in (None, "forged"):
+            try:
+                handle_telegram_webhook(
+                    store,
+                    _telegram_update(text="/assign task-1 host-a"),
+                    secret_token=TELEGRAM_SECRET,
+                    provided_secret_token=provided,
+                )
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError("forged Telegram webhook was accepted")
+
+        valid = handle_telegram_webhook(
+            store,
+            _telegram_update(text="/assign task-1 host-a"),
+            secret_token=TELEGRAM_SECRET,
+            provided_secret_token=TELEGRAM_SECRET,
+        )
+
+        assert store.list_messages(room["room_id"]) == [valid["message"]]
+        assert valid["command_ref"] is not None
+    finally:
+        store.close()
+
+
+def test_telegram_route_uses_secret_token_header(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    router = MessagingRouter(store, telegram_secret_token=TELEGRAM_SECRET)
+    try:
+        AdapterRegistry(store).register_defaults()
+        room = store.create_room(room_kind="task", display_name="Task", task_id="task-1")
+        store.map_platform_room(
+            adapter_id="telegram",
+            platform_room_id="-100123",
+            room_id=room["room_id"],
+        )
+        store.link_external_identity(
+            adapter_id="telegram",
+            platform_user_id="42",
+            openclaw_identity_id="operator-1",
+            scopes=("message:write",),
+            display_name="Operator",
+        )
+
+        forged = router.handle(
+            "POST",
+            "/adapters/telegram/webhook",
+            _telegram_update(text="Please check this."),
+        )
+        valid = router.handle(
+            "POST",
+            "/adapters/telegram/webhook",
+            _telegram_update(text="Please check this."),
+            headers={"X-Telegram-Bot-Api-Secret-Token": TELEGRAM_SECRET},
+        )
+
+        assert forged.status_code == 403
+        assert valid.status_code == 201
+        assert len(store.list_messages(room["room_id"])) == 1
     finally:
         store.close()
 
@@ -120,7 +230,7 @@ def test_platform_room_mapping_upsert_is_idempotent_for_default_thread(
 def test_replayed_telegram_update_does_not_duplicate_commands_or_deliveries(
     tmp_path: Path,
 ) -> None:
-    store = MessagingStore(tmp_path / "messages.db", signing_secret="test-secret")
+    store = _store(tmp_path)
     try:
         AdapterRegistry(store).register_defaults()
         store.set_adapter_command_promotion("telegram", enabled=True)
@@ -139,6 +249,13 @@ def test_replayed_telegram_update_does_not_duplicate_commands_or_deliveries(
             adapter_id="telegram",
             platform_room_id="-100123",
             room_id=room["room_id"],
+            route_policy={
+                "command_promotion": {
+                    "enabled": True,
+                    "allowed_command_types": ["assign_task"],
+                    "allowed_target_kinds": ["task"],
+                }
+            },
         )
         store.link_external_identity(
             adapter_id="telegram",
@@ -151,10 +268,14 @@ def test_replayed_telegram_update_does_not_duplicate_commands_or_deliveries(
         first = handle_telegram_webhook(
             store,
             _telegram_update(text="/assign task-1 host-a"),
+            secret_token=TELEGRAM_SECRET,
+            provided_secret_token=TELEGRAM_SECRET,
         )
         second = handle_telegram_webhook(
             store,
             _telegram_update(text="/assign task-1 host-a"),
+            secret_token=TELEGRAM_SECRET,
+            provided_secret_token=TELEGRAM_SECRET,
         )
 
         message_id = first["message"]["message_id"]

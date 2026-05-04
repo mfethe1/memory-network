@@ -5,10 +5,17 @@ from pathlib import Path
 from code_index.openclaw_messaging.store import MessagingStore
 
 
+SIGNING_SECRET = "test-secret"
+
+
+def _store(tmp_path: Path) -> MessagingStore:
+    return MessagingStore(tmp_path / "messages.db", signing_secret=SIGNING_SECRET)
+
+
 def test_room_kinds_and_task_projection_include_swarm_participants(
     tmp_path: Path,
 ) -> None:
-    store = MessagingStore(tmp_path / "messages.db")
+    store = _store(tmp_path)
     try:
         for kind in ("fleet", "repo", "run", "host", "swarm"):
             store.create_room(room_kind=kind, display_name=f"{kind} room")
@@ -81,7 +88,7 @@ def test_room_kinds_and_task_projection_include_swarm_participants(
 
 
 def test_target_preview_expands_supported_target_kinds(tmp_path: Path) -> None:
-    store = MessagingStore(tmp_path / "messages.db")
+    store = _store(tmp_path)
     try:
         store.create_room(
             room_kind="fleet",

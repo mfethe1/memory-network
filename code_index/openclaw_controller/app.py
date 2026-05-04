@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -24,8 +25,9 @@ class OpenClawControllerApp:
         method: str,
         path: str,
         body: Mapping[str, Any] | None = None,
+        headers: Mapping[str, Any] | None = None,
     ) -> ApiResponse:
-        return self.router.handle(method, path, body)
+        return self.router.handle(method, path, body, headers=headers)
 
     def close(self) -> None:
         self.store.close()
@@ -34,7 +36,8 @@ class OpenClawControllerApp:
 def create_app(
     db_path: str | Path,
     *,
-    signing_secret: str = "openclaw-local-dev-secret",
+    signing_secret: str,
+    telegram_secret_token: str | None = None,
     register_default_adapters: bool = True,
 ) -> OpenClawControllerApp:
     store = MessagingStore(db_path, signing_secret=signing_secret)
@@ -42,7 +45,7 @@ def create_app(
         AdapterRegistry(store).register_defaults()
     return OpenClawControllerApp(
         store=store,
-        router=MessagingRouter(store),
+        router=MessagingRouter(store, telegram_secret_token=telegram_secret_token),
     )
 
 
@@ -58,6 +61,16 @@ def main(argv: list[str] | None = None) -> int:
         default="{}",
         help="Request body JSON object for dispatcher smoke checks",
     )
+    parser.add_argument(
+        "--signing-secret",
+        default=os.environ.get("OPENCLAW_CONTROLLER_SIGNING_SECRET"),
+        help="Command reference signing secret. May also use OPENCLAW_CONTROLLER_SIGNING_SECRET.",
+    )
+    parser.add_argument(
+        "--telegram-secret-token",
+        default=os.environ.get("OPENCLAW_TELEGRAM_SECRET_TOKEN"),
+        help="Telegram webhook secret token. May also use OPENCLAW_TELEGRAM_SECRET_TOKEN.",
+    )
     args = parser.parse_args(argv)
     try:
         body = json.loads(args.body_json)
@@ -65,8 +78,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"--body-json must be valid JSON: {exc}")
     if not isinstance(body, dict):
         parser.error("--body-json must be a JSON object")
+    if not args.signing_secret:
+        parser.error("--signing-secret or OPENCLAW_CONTROLLER_SIGNING_SECRET is required")
 
-    app = create_app(args.db)
+    app = create_app(
+        args.db,
+        signing_secret=args.signing_secret,
+        telegram_secret_token=args.telegram_secret_token,
+    )
     try:
         response = app.handle_request(args.method, args.path, body)
         print(
