@@ -36,17 +36,25 @@ class MessagingStore:
         *,
         signing_secret: str,
     ) -> None:
-        self.db_path = db_path
+        self.db_path = str(db_path)
         if not str(signing_secret or "").strip():
             raise MessagingError("signing_secret is required")
         self.signing_secret = signing_secret.encode("utf-8")
-        self.conn = sqlite3.connect(str(db_path))
+        if not self._is_in_memory_path(self.db_path) and not self.db_path.startswith("file:"):
+            Path(self.db_path).expanduser().resolve().parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+        self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.apply_schema()
 
     def close(self) -> None:
         self.conn.close()
+
+    def ping(self) -> None:
+        self.conn.execute("SELECT 1").fetchone()
 
     def apply_schema(self) -> None:
         self.conn.executescript(
@@ -185,6 +193,11 @@ class MessagingStore:
             """
         )
         self.conn.commit()
+
+    @staticmethod
+    def _is_in_memory_path(value: str) -> bool:
+        text = str(value or "").strip().lower()
+        return text == ":memory:" or text.startswith("file::memory:")
 
     def create_room(
         self,

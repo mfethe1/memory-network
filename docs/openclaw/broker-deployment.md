@@ -31,6 +31,11 @@ NKey/account controls, monitoring, and restart evidence. Railway may host
 `fumemory` and control APIs, but it is not the broker for Milestone 1 until the
 restart verification below passes on Railway.
 
+Railway-hosted controller, Messaging API, Fleet MCP, and fumemory-compatible
+services should therefore point at this external or otherwise restart-verified
+persistent broker. Do not treat a Railway NATS deployment as production-ready
+for M1 until the JetStream restart and deploy checks below have been completed.
+
 This satisfies the plan because the first broker has explicit JetStream file
 storage, a disk lifecycle independent from the VM lifecycle, private-only
 network exposure, snapshot/restore expectations, and a restart test gate before

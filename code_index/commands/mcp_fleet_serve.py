@@ -38,6 +38,16 @@ from code_index.openclaw_controller.fleet_mcp import (
     FLEET_TOOL_DESCRIPTIONS,
     describe_fleet_surface,
 )
+from code_index.openclaw_controller.service_config import (
+    OPENCLAW_CONTEXT_STORE_PATH_ENV,
+    OPENCLAW_SIGNING_SECRET_ENV,
+    OpenClawConfigError,
+    resolve_bind_host,
+    resolve_context_store_path,
+    resolve_deployment_mode,
+    resolve_port,
+    resolve_service_paths,
+)
 
 FLEET_TOKEN_FILENAME = "fleet-mcp-token"
 FLEET_TOKEN_ENV_VAR = "OPENCLAW_FLEET_MCP_TOKEN"
@@ -105,12 +115,16 @@ def run(args: argparse.Namespace | list[str] | None = None) -> int:
         print(json.dumps(_UNAVAILABLE))
         return 1
 
-    fleet_controller = _load_fleet_controller(args)
+    try:
+        fleet_controller = _load_fleet_controller(args)
+        context_store = _load_context_store(args)
+    except OpenClawConfigError as exc:
+        print(json.dumps({"error": str(exc)}))
+        return 1
+
     if fleet_controller is None:
         print(json.dumps({"error": "fleet controller is not available"}))
         return 1
-
-    context_store = _load_context_store(args)
 
     from code_index.openclaw_controller.fleet_mcp import build_fleet_fastmcp
 
@@ -121,9 +135,14 @@ def run(args: argparse.Namespace | list[str] | None = None) -> int:
 
     transport = args.transport.lower()
     if transport == "http":
-        host = args.host or "127.0.0.1"
-        port = args.port or 8766
-        if not _is_loopback(host) and not args.allow_remote:
+        mode = resolve_deployment_mode()
+        host = args.host or resolve_bind_host()
+        port = args.port or resolve_port(default=8766)
+        if (
+            not _is_loopback(host)
+            and not args.allow_remote
+            and mode == "development"
+        ):
             print(
                 json.dumps(
                     {
@@ -180,28 +199,48 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _load_fleet_controller(args: argparse.Namespace) -> Any | None:
-    # For the CLI entry point, we return an in-memory FleetController as the
-    # default.  Production deployments wire a persistent store here.
     try:
         from code_index.openclaw_controller.scheduler import FleetController
         from code_index.openclaw_hostd.leases import InMemoryFleetLeaseStore
+        from code_index.openclaw_hostd.leases import SQLiteFleetLeaseStore
         from code_index.openclaw_messaging.store import MessagingStore
 
-        signing_secret = os.environ.get("OPENCLAW_CONTROLLER_SIGNING_SECRET", "")
+        mode = resolve_deployment_mode()
+        signing_secret = os.environ.get(OPENCLAW_SIGNING_SECRET_ENV, "").strip()
         if not signing_secret:
-            signing_secret = _generate_token()
-        store = MessagingStore(":memory:", signing_secret=signing_secret)
+            if mode == "development":
+                signing_secret = _generate_token()
+            else:
+                raise OpenClawConfigError(
+                    f"{OPENCLAW_SIGNING_SECRET_ENV} is required outside development mode"
+                )
+        if mode == "development":
+            store = MessagingStore(":memory:", signing_secret=signing_secret)
+            lease_store = InMemoryFleetLeaseStore()
+        else:
+            paths = resolve_service_paths()
+            store = MessagingStore(paths.messaging_db_path, signing_secret=signing_secret)
+            lease_store = SQLiteFleetLeaseStore(paths.controller_db_path)
         return FleetController(
             messaging_store=store,
-            lease_store=InMemoryFleetLeaseStore(),
+            lease_store=lease_store,
         )
+    except OpenClawConfigError:
+        raise
     except Exception:
         return None
 
 
 def _load_context_store(args: argparse.Namespace) -> Any | None:
-    db_path = getattr(args, "db", None)
-    if not db_path:
+    explicit_path = getattr(args, "db", None)
+    mode = resolve_deployment_mode()
+    required = (
+        mode != "development"
+        or bool(explicit_path)
+        or bool(os.environ.get(OPENCLAW_CONTEXT_STORE_PATH_ENV, "").strip())
+    )
+    db_path = resolve_context_store_path(explicit_path, required=required)
+    if db_path is None:
         return None
     try:
         from code_index.openclaw_context.store import SQLiteContextStore

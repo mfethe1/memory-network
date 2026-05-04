@@ -13,12 +13,14 @@ Coverage:
 
 from __future__ import annotations
 
+from argparse import Namespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from code_index.commands.mcp_fleet_serve import _load_context_store
 from code_index.openclaw_controller.fleet_mcp import (
     FLEET_TOOL_DESCRIPTIONS,
     FleetMcpTools,
@@ -546,6 +548,34 @@ def test_fleet_publish_work_summary_requires_summary(tmp_path: Path) -> None:
     t = _tools(tmp_path, context_store=store)
     with pytest.raises(ValueError):
         t.fleet_publish_work_summary(host_id="host-01", run_id="run-001", summary="")
+
+
+def test_fleet_mcp_cli_loads_context_store_from_persistent_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mount = tmp_path / "railway-volume"
+    mount.mkdir()
+    monkeypatch.setenv("OPENCLAW_DEPLOYMENT_MODE", "railway")
+    monkeypatch.setenv("RAILWAY_VOLUME_MOUNT_PATH", str(mount))
+
+    store = _load_context_store(Namespace(db=None))
+    assert store is not None
+    try:
+        pointer = store.upsert_context_pointer(
+            source_uri="memo://fleet/repo-a",
+            source_kind="decision",
+            content_hash="h-1",
+            locator={"id": "fleet-repo-a"},
+            summary="persisted pointer",
+            repo_id="repo-a",
+        )
+        loaded = store.get_context_pointer(pointer.pointer_id)
+
+        assert loaded is not None
+        assert Path(store.path or "").parent == mount / "openclaw"
+    finally:
+        store.close()
 
 
 # ------------------------------------------------------------------

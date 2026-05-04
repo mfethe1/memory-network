@@ -139,3 +139,40 @@ def test_completed_work_index_dedupes_replay_and_omits_raw_transcript_by_default
         assert "raw_transcript" not in replay.entry.verification_results["pytest"]
     finally:
         store.close()
+
+
+def test_completed_work_index_survives_store_restart(tmp_path: Path) -> None:
+    db_path = tmp_path / "context.db"
+    first_store = SQLiteContextStore(db_path)
+    try:
+        result = record_completed_work_index(
+            first_store,
+            task_id="task-restart",
+            run_id="run-restart",
+            files_changed=["code_index\\openclaw_context\\store.py"],
+            symbols_affected=["code_index.openclaw_context.store.SQLiteContextStore"],
+            approach_taken="Persist locally before any optional remote sync.",
+            verification_results={"status": "passed"},
+            trace_id="trace-restart",
+        )
+        assert result.stored is True
+        assert result.entry is not None
+        work_id = result.entry.work_id
+    finally:
+        first_store.close()
+
+    second_store = SQLiteContextStore(db_path)
+    try:
+        loaded = second_store.get_completed_work(work_id)
+        by_file = second_store.list_completed_work_by_file(
+            "code_index/openclaw_context/store.py"
+        )
+        by_symbol = second_store.list_completed_work_by_symbol(
+            "code_index.openclaw_context.store.SQLiteContextStore"
+        )
+
+        assert loaded is not None
+        assert by_file == [loaded]
+        assert by_symbol == [loaded]
+    finally:
+        second_store.close()

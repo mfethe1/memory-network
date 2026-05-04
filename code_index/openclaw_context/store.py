@@ -29,11 +29,18 @@ class SQLiteContextStore:
     """Local SQLite store shaped like the planned fumemory context tables."""
 
     def __init__(self, path: str | Path | sqlite3.Connection = ":memory:") -> None:
+        self.path: str | None = None
         if isinstance(path, sqlite3.Connection):
             self._conn = path
             self._owns_conn = False
         else:
-            self._conn = sqlite3.connect(str(path))
+            self.path = str(path)
+            if not _is_in_memory_path(self.path) and not self.path.startswith("file:"):
+                Path(self.path).expanduser().resolve().parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+            self._conn = sqlite3.connect(self.path)
             self._owns_conn = True
         self._conn.row_factory = sqlite3.Row
         self._configure_connection()
@@ -42,6 +49,9 @@ class SQLiteContextStore:
     def close(self) -> None:
         if self._owns_conn:
             self._conn.close()
+
+    def ping(self) -> None:
+        self._conn.execute("SELECT 1").fetchone()
 
     def sqlite_pragmas(self) -> dict[str, Any]:
         """Return operational SQLite pragmas used for local durability checks."""
@@ -1201,3 +1211,8 @@ def _required_text(value: object, field_name: str) -> str:
     if not text:
         raise ValueError(f"{field_name} is required")
     return text
+
+
+def _is_in_memory_path(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    return text == ":memory:" or text.startswith("file::memory:")

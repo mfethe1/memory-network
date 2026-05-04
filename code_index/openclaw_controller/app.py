@@ -1,22 +1,298 @@
-"""Minimal OpenClaw controller app wrapper for embedded messaging routes."""
+"""OpenClaw controller dispatcher and long-running HTTP service wrapper."""
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer
 import json
 import os
-from dataclasses import dataclass
 from pathlib import Path
+import socket
 from typing import Any, Mapping
 from urllib.parse import unquote, urlsplit
 
+from code_index.openclaw_controller.scheduler import FleetController
+from code_index.openclaw_controller.service_config import (
+    OPENCLAW_CONTEXT_STORE_PATH_ENV,
+    OPENCLAW_CONTROLLER_DB_PATH_ENV,
+    OPENCLAW_DEPLOYMENT_MODE_ENV,
+    OPENCLAW_MESSAGING_DB_PATH_ENV,
+    OPENCLAW_NATS_URL_ENV,
+    OPENCLAW_REQUIRE_NATS_ENV,
+    OPENCLAW_SIGNING_SECRET_ENV,
+    OPENCLAW_TELEGRAM_BOT_TOKEN_ENV,
+    OPENCLAW_TELEGRAM_SECRET_ENV,
+    OpenClawConfigError,
+    OpenClawDeploymentPaths,
+    redact_nats_url,
+    resolve_bind_host,
+    resolve_nats_url,
+    resolve_port,
+    resolve_require_nats,
+    resolve_service_paths,
+)
+from code_index.openclaw_context.store import SQLiteContextStore
+from code_index.openclaw_hostd.leases import InMemoryFleetLeaseStore
+from code_index.openclaw_hostd.leases import SQLiteFleetLeaseStore
+from code_index.openclaw_hostd.nats_client import NatsClient
+from code_index.openclaw_hostd.nats_client import create_nats_transport
 from code_index.openclaw_messaging.adapter_registry import AdapterRegistry
 from code_index.openclaw_messaging.routes import ApiResponse
 from code_index.openclaw_messaging.routes import MessagingRouter
 from code_index.openclaw_messaging.routes import Principal
 from code_index.openclaw_messaging.store import MessagingStore
-from code_index.openclaw_controller.scheduler import FleetController
-from code_index.openclaw_hostd.leases import InMemoryFleetLeaseStore
+
+
+class _UnavailableNatsPublisher:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.connected = False
+
+    def publish(self, subject: str, payload: Mapping[str, Any]) -> None:
+        raise RuntimeError(str(self.error))
+
+    def close(self) -> None:
+        return
+
+
+class _ConfiguredThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler_cls: type[BaseHTTPRequestHandler],
+        *,
+        use_ipv6: bool,
+    ) -> None:
+        self.address_family = socket.AF_INET6 if use_ipv6 else socket.AF_INET
+        super().__init__(server_address, handler_cls)
+
+
+class _ControllerRequestHandler(BaseHTTPRequestHandler):
+    server_version = "OpenClawController/1.0"
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._handle()
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._handle()
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+        return
+
+    def _handle(self) -> None:
+        service = self.server.service  # type: ignore[attr-defined]
+        headers = {key: value for key, value in self.headers.items()}
+        length = int(self.headers.get("Content-Length") or "0")
+        body: dict[str, Any] | None = None
+        if length:
+            raw = self.rfile.read(length)
+            try:
+                parsed = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                self._write_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": f"request body must be valid JSON: {exc}"},
+                )
+                return
+            if not isinstance(parsed, dict):
+                self._write_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "request body must decode to a JSON object"},
+                )
+                return
+            body = parsed
+        response = service.handle_http_request(
+            self.command,
+            self.path,
+            body=body,
+            headers=headers,
+        )
+        self._write_json(response.status_code, response.body)
+
+    def _write_json(self, status_code: int, payload: dict[str, Any]) -> None:
+        data = json.dumps(payload, sort_keys=True).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class _ControllerHTTPServer(_ConfiguredThreadingHTTPServer):
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        *,
+        service: "OpenClawControllerService",
+        use_ipv6: bool,
+    ) -> None:
+        self.service = service
+        super().__init__(
+            server_address,
+            _ControllerRequestHandler,
+            use_ipv6=use_ipv6,
+        )
+
+
+class OpenClawControllerService:
+    def __init__(self, runtime: "OpenClawControllerServiceRuntime") -> None:
+        self.runtime = runtime
+
+    def handle_http_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Mapping[str, Any] | None = None,
+        headers: Mapping[str, Any] | None = None,
+    ) -> ApiResponse:
+        if _is_health_path(path):
+            return ApiResponse(200, self.runtime.health_payload())
+        if _is_ready_path(path):
+            status_code, payload = self.runtime.readiness_payload()
+            return ApiResponse(status_code, payload)
+        principal = _principal_from_headers(headers)
+        return self.runtime.app.handle_request(
+            method,
+            path,
+            body,
+            headers=headers,
+            principal=principal,
+        )
+
+
+class OpenClawControllerServiceRuntime:
+    def __init__(
+        self,
+        *,
+        app: "OpenClawControllerApp",
+        context_store: SQLiteContextStore,
+        lease_store: SQLiteFleetLeaseStore,
+        deployment_paths: OpenClawDeploymentPaths,
+        bind_host: str,
+        port: int,
+        require_nats: bool,
+        nats_url: str | None,
+        nats_reachable: bool,
+        nats_error: str | None,
+    ) -> None:
+        self.app = app
+        self.context_store = context_store
+        self.lease_store = lease_store
+        self.deployment_paths = deployment_paths
+        self.bind_host = bind_host
+        self.port = port
+        self.require_nats = require_nats
+        self.nats_url = nats_url
+        self.nats_reachable = nats_reachable
+        self.nats_error = nats_error
+
+    def close(self) -> None:
+        self.app.close()
+        self.context_store.close()
+        self.lease_store.close()
+        _close_quietly(getattr(self.app.fleet_controller, "nats_client", None))
+
+    def health_payload(self) -> dict[str, Any]:
+        messaging_ok, messaging_error = _check_sqlite_store(self.app.store)
+        context_ok, context_error = _check_sqlite_store(self.context_store)
+        controller_ok, controller_error = _check_lease_store(self.lease_store)
+        volume_ok = (
+            self.deployment_paths.deployment_mode != "railway"
+            or self.deployment_paths.volume_mount_path is not None
+        )
+        nats = {
+            "configured": bool(self.nats_url),
+            "required": self.require_nats,
+            "reachable": self.nats_reachable,
+            "url": redact_nats_url(self.nats_url),
+        }
+        if self.nats_error:
+            nats["degraded_reason"] = self.nats_error
+        degraded = [
+            name
+            for name, ok in (
+                ("messaging_db", messaging_ok),
+                ("context_store", context_ok),
+                ("controller_db", controller_ok),
+                ("volume", volume_ok),
+            )
+            if not ok
+        ]
+        if self.require_nats and (not self.nats_url or not self.nats_reachable):
+            degraded.append("nats")
+        payload = {
+            "service": "openclaw_controller",
+            "status": "ok" if not degraded else "degraded",
+            "deployment_mode": self.deployment_paths.deployment_mode,
+            "process": {"alive": True},
+            "checks": {
+                "messaging_db": {
+                    "ok": messaging_ok,
+                    "path": str(self.deployment_paths.messaging_db_path),
+                },
+                "context_store": {
+                    "ok": context_ok,
+                    "path": str(self.deployment_paths.context_store_path),
+                },
+                "controller_db": {
+                    "ok": controller_ok,
+                    "path": str(self.deployment_paths.controller_db_path),
+                },
+                "volume": {
+                    "ok": volume_ok,
+                    "configured": self.deployment_paths.volume_mount_path is not None,
+                    "mount_path": (
+                        str(self.deployment_paths.volume_mount_path)
+                        if self.deployment_paths.volume_mount_path is not None
+                        else None
+                    ),
+                },
+                "signing_secret": {"configured": True},
+                "nats": nats,
+            },
+        }
+        if messaging_error:
+            payload["checks"]["messaging_db"]["error"] = messaging_error
+        if context_error:
+            payload["checks"]["context_store"]["error"] = context_error
+        if controller_error:
+            payload["checks"]["controller_db"]["error"] = controller_error
+        if degraded:
+            payload["degraded"] = degraded
+        return payload
+
+    def readiness_payload(self) -> tuple[int, dict[str, Any]]:
+        health = self.health_payload()
+        reasons: list[str] = []
+        checks = health["checks"]
+        for name in ("messaging_db", "context_store", "controller_db", "volume"):
+            if not checks[name]["ok"]:
+                reasons.append(name)
+        if not checks["signing_secret"]["configured"]:
+            reasons.append("signing_secret")
+        if self.require_nats:
+            if not self.nats_url:
+                reasons.append("nats_not_configured")
+            elif not self.nats_reachable:
+                reasons.append("nats_unreachable")
+        ready = not reasons
+        payload = {
+            "service": "openclaw_controller",
+            "ready": ready,
+            "status": "ready" if ready else "not_ready",
+            "deployment_mode": self.deployment_paths.deployment_mode,
+            "reasons": reasons,
+        }
+        if not ready:
+            payload["checks"] = checks
+        return (200 if ready else 503), payload
 
 
 @dataclass
@@ -231,34 +507,90 @@ class FleetRouter:
         return ApiResponse(404, {"error": "route not found"})
 
 
+def build_service_runtime(
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> OpenClawControllerServiceRuntime:
+    env = dict(os.environ if environ is None else environ)
+    signing_secret = str(env.get(OPENCLAW_SIGNING_SECRET_ENV, "")).strip()
+    if not signing_secret:
+        raise OpenClawConfigError(
+            f"{OPENCLAW_SIGNING_SECRET_ENV} is required for the controller service"
+        )
+    deployment_paths = resolve_service_paths(env)
+    lease_store = SQLiteFleetLeaseStore(deployment_paths.controller_db_path)
+    context_store = SQLiteContextStore(deployment_paths.context_store_path)
+    nats_url = resolve_nats_url(env)
+    require_nats = resolve_require_nats(env)
+    nats_client, nats_reachable, nats_error = _build_nats_client(nats_url)
+    app = create_app(
+        deployment_paths.messaging_db_path,
+        signing_secret=signing_secret,
+        telegram_secret_token=str(env.get(OPENCLAW_TELEGRAM_SECRET_ENV, "")).strip()
+        or None,
+        telegram_bot_token=str(env.get(OPENCLAW_TELEGRAM_BOT_TOKEN_ENV, "")).strip()
+        or None,
+        lease_store=lease_store,
+        nats_client=nats_client,
+    )
+    return OpenClawControllerServiceRuntime(
+        app=app,
+        context_store=context_store,
+        lease_store=lease_store,
+        deployment_paths=deployment_paths,
+        bind_host=resolve_bind_host(env),
+        port=resolve_port(env, default=8000),
+        require_nats=require_nats,
+        nats_url=nats_url,
+        nats_reachable=nats_reachable,
+        nats_error=nats_error,
+    )
+
+
+def serve(runtime: OpenClawControllerServiceRuntime) -> int:
+    service = OpenClawControllerService(runtime)
+    bind_host = runtime.bind_host
+    server = _ControllerHTTPServer(
+        (bind_host, runtime.port),
+        service=service,
+        use_ipv6=":" in bind_host,
+    )
+    try:
+        print(
+            json.dumps(
+                {
+                    "service": "openclaw_controller",
+                    "bind_host": bind_host,
+                    "port": runtime.port,
+                    "deployment_mode": runtime.deployment_paths.deployment_mode,
+                    "messaging_db_path": str(runtime.deployment_paths.messaging_db_path),
+                    "controller_db_path": str(runtime.deployment_paths.controller_db_path),
+                    "context_store_path": str(runtime.deployment_paths.context_store_path),
+                    "ready_path": "/ready",
+                    "health_path": "/health",
+                },
+                sort_keys=True,
+            )
+        )
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        server.server_close()
+        runtime.close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="OpenClaw controller embedded messaging route dispatcher."
-    )
-    parser.add_argument("--db", default=":memory:", help="SQLite database path")
-    parser.add_argument("--method", default="GET", help="Request method")
-    parser.add_argument("--path", default="/rooms", help="Request path")
-    parser.add_argument(
-        "--body-json",
-        default="{}",
-        help="Request body JSON object for dispatcher smoke checks",
-    )
-    parser.add_argument(
-        "--signing-secret",
-        default=os.environ.get("OPENCLAW_CONTROLLER_SIGNING_SECRET"),
-        help="Command reference signing secret. May also use OPENCLAW_CONTROLLER_SIGNING_SECRET.",
-    )
-    parser.add_argument(
-        "--telegram-secret-token",
-        default=os.environ.get("OPENCLAW_TELEGRAM_SECRET_TOKEN"),
-        help="Telegram webhook secret token. May also use OPENCLAW_TELEGRAM_SECRET_TOKEN.",
-    )
-    parser.add_argument(
-        "--telegram-bot-token",
-        default=os.environ.get("OPENCLAW_TELEGRAM_BOT_TOKEN"),
-        help="Telegram bot token for long-poll ingestion. May also use OPENCLAW_TELEGRAM_BOT_TOKEN.",
-    )
+    parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.serve:
+        try:
+            runtime = build_service_runtime(environ=_service_environ(args))
+        except OpenClawConfigError as exc:
+            print(json.dumps({"error": str(exc)}))
+            return 1
+        return serve(runtime)
     try:
         body = json.loads(args.body_json)
     except json.JSONDecodeError as exc:
@@ -287,6 +619,162 @@ def main(argv: list[str] | None = None) -> int:
         app.close()
 
 
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="OpenClaw controller dispatcher and long-running HTTP service."
+    )
+    parser.add_argument("--db", default=":memory:", help="SQLite database path")
+    parser.add_argument("--method", default="GET", help="Request method")
+    parser.add_argument("--path", default="/rooms", help="Request path")
+    parser.add_argument(
+        "--body-json",
+        default="{}",
+        help="Request body JSON object for dispatcher smoke checks",
+    )
+    parser.add_argument(
+        "--signing-secret",
+        default=os.environ.get(OPENCLAW_SIGNING_SECRET_ENV),
+        help=(
+            "Command reference signing secret. May also use "
+            "OPENCLAW_CONTROLLER_SIGNING_SECRET."
+        ),
+    )
+    parser.add_argument(
+        "--telegram-secret-token",
+        default=os.environ.get(OPENCLAW_TELEGRAM_SECRET_ENV),
+        help=(
+            "Telegram webhook secret token. May also use "
+            "OPENCLAW_TELEGRAM_SECRET_TOKEN."
+        ),
+    )
+    parser.add_argument(
+        "--telegram-bot-token",
+        default=os.environ.get(OPENCLAW_TELEGRAM_BOT_TOKEN_ENV),
+        help=(
+            "Telegram bot token for long-poll ingestion. May also use "
+            "OPENCLAW_TELEGRAM_BOT_TOKEN."
+        ),
+    )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Run the long-lived HTTP controller service.",
+    )
+    parser.add_argument("--host", default=None, help="Service bind host override.")
+    parser.add_argument("--port", type=int, default=None, help="Service port override.")
+    parser.add_argument(
+        "--controller-db",
+        default=None,
+        help="Controller SQLite state path override.",
+    )
+    parser.add_argument(
+        "--messaging-db",
+        default=None,
+        help="Messaging SQLite path override.",
+    )
+    parser.add_argument(
+        "--context-store-db",
+        default=None,
+        help="Context store SQLite path override.",
+    )
+    parser.add_argument(
+        "--nats-url",
+        default=None,
+        help="OpenClaw NATS URL override.",
+    )
+    parser.add_argument(
+        "--deployment-mode",
+        default=None,
+        help="Deployment mode override: development, production, or railway.",
+    )
+    parser.add_argument(
+        "--require-nats",
+        action="store_true",
+        help="Require NATS readiness for the service.",
+    )
+    parser.add_argument(
+        "--no-require-nats",
+        action="store_true",
+        help="Disable strict NATS readiness for the service.",
+    )
+    return parser
+
+
+def _service_environ(args: argparse.Namespace) -> dict[str, str]:
+    env = dict(os.environ)
+    overrides = {
+        OPENCLAW_CONTROLLER_DB_PATH_ENV: args.controller_db,
+        OPENCLAW_MESSAGING_DB_PATH_ENV: args.messaging_db,
+        OPENCLAW_CONTEXT_STORE_PATH_ENV: args.context_store_db,
+        OPENCLAW_NATS_URL_ENV: args.nats_url,
+        OPENCLAW_DEPLOYMENT_MODE_ENV: args.deployment_mode,
+        OPENCLAW_SIGNING_SECRET_ENV: args.signing_secret,
+        OPENCLAW_TELEGRAM_SECRET_ENV: args.telegram_secret_token,
+        OPENCLAW_TELEGRAM_BOT_TOKEN_ENV: args.telegram_bot_token,
+    }
+    if args.host:
+        env["OPENCLAW_BIND_HOST"] = args.host
+    if args.port is not None:
+        env["PORT"] = str(args.port)
+    if args.require_nats and args.no_require_nats:
+        raise OpenClawConfigError(
+            "--require-nats and --no-require-nats cannot be used together"
+        )
+    if args.require_nats:
+        env[OPENCLAW_REQUIRE_NATS_ENV] = "1"
+    elif args.no_require_nats:
+        env[OPENCLAW_REQUIRE_NATS_ENV] = "0"
+    for key, value in overrides.items():
+        if value is not None:
+            env[key] = str(value)
+    return env
+
+
+def _build_nats_client(
+    nats_url: str | None,
+) -> tuple[Any | None, bool, str | None]:
+    if not nats_url:
+        return None, False, None
+    try:
+        client = NatsClient(transport=create_nats_transport(nats_url))
+        client.connect()
+        return client, True, None
+    except Exception as exc:
+        return _UnavailableNatsPublisher(exc), False, str(exc)
+
+
+def _check_sqlite_store(store: Any) -> tuple[bool, str | None]:
+    try:
+        ping = getattr(store, "ping", None)
+        if ping is not None:
+            ping()
+        else:
+            getattr(store, "conn").execute("SELECT 1").fetchone()
+    except Exception as exc:
+        return False, str(exc)
+    return True, None
+
+
+def _check_lease_store(store: SQLiteFleetLeaseStore) -> tuple[bool, str | None]:
+    try:
+        store.conn.execute("SELECT 1").fetchone()
+    except Exception as exc:
+        return False, str(exc)
+    return True, None
+
+
+def _close_quietly(value: Any) -> None:
+    if value is None:
+        return
+    close = getattr(value, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception:
+        return
+
+
 def _is_fleet_path(path: str) -> bool:
     parts = [part for part in urlsplit(path).path.strip("/").split("/") if part]
     return bool(parts and parts[0] == "fleet")
@@ -298,6 +786,32 @@ def _is_telegram_ingest_path(method: str, path: str) -> bool:
         ("adapters", "telegram", "webhook"),
         ("adapters", "telegram", "poll"),
     }
+
+
+def _is_health_path(path: str) -> bool:
+    return urlsplit(path).path.rstrip("/") == "/health"
+
+
+def _is_ready_path(path: str) -> bool:
+    return urlsplit(path).path.rstrip("/") == "/ready"
+
+
+def _principal_from_headers(headers: Mapping[str, Any] | None) -> Principal | None:
+    header_map = {
+        str(key).lower(): str(value).strip()
+        for key, value in dict(headers or {}).items()
+        if str(value).strip()
+    }
+    principal_id = header_map.get("x-openclaw-principal-id", "")
+    scopes_text = header_map.get("x-openclaw-principal-scopes", "")
+    scopes = {
+        item.strip()
+        for item in scopes_text.replace(",", " ").split()
+        if item.strip()
+    }
+    if not principal_id or not scopes:
+        return None
+    return Principal(principal_id=principal_id, scopes=frozenset(scopes))
 
 
 def _with_auto_assignment(
