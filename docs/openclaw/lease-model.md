@@ -68,9 +68,10 @@ Terminal local run statuses release task leases through
 `done`.
 
 Non-terminal statuses do not release fleet leases. Terminal release is
-run-scoped: the graph row `run_id` must match the inbox row and the central
-task lease owner run. A stale terminal row for the same task but a different
-run leaves the active lease and task state unchanged.
+run-scoped: the graph row must include a non-empty `run_id`, and that id must
+match the inbox row and the central task lease owner run. A stale terminal row
+for the same task with a missing or different run leaves the active lease and
+task state unchanged.
 
 The host daemon creates the configured lease store during NATS runtime setup and
 passes it into `TaskInbox`. A task delivery that conflicts with an active task

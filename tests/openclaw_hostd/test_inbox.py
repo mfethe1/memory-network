@@ -316,6 +316,34 @@ def test_wrong_run_terminal_status_does_not_release_current_task_lease(
     assert task.status == "accepted"
 
 
+def test_missing_run_terminal_status_does_not_release_current_task_lease(
+    tmp_path: Path,
+) -> None:
+    graph = FakeGraphClient()
+    leases = InMemoryFleetLeaseStore()
+    inbox = TaskInbox(
+        tmp_path / "inbox.db",
+        host_id="host-a",
+        graph_client=graph,
+        lease_store=leases,
+    )
+    inbox.handle_task_assignment(_assignment())
+    active = leases.get_active_lease("task", "task-123")
+    assert active is not None
+
+    released = inbox.release_task_lease_on_terminal_status(
+        "task-123",
+        terminal_status="completed",
+        run_id=None,
+    )
+
+    task = leases.get_task_record("task-123")
+    assert released is None
+    assert leases.get_active_lease("task", "task-123") == active
+    assert task is not None
+    assert task.status == "accepted"
+
+
 def test_task_inbox_does_not_reacquire_lease_for_terminal_duplicate(
     tmp_path: Path,
 ) -> None:

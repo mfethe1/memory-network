@@ -939,6 +939,52 @@ def test_daemon_loop_wrong_run_terminal_row_does_not_release_current_lease(
         verified.close()
 
 
+def test_graph_payload_missing_run_id_does_not_release_current_lease(
+    tmp_path: Path,
+) -> None:
+    config = _config_with_nats_and_leases(tmp_path)
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    graph = RespectRunIdGraphClient()
+    runtime = service.setup_nats_runtime(
+        config,
+        HostIdentity(host_id=HOST_ID),
+        nats_client=nats,
+        graph_client=graph,
+    )
+    assert runtime is not None
+    transport.subscriptions[f"openclaw.deliver.{HOST_ID}.tasks"](
+        {
+            "kind": "openclaw.task.assigned",
+            "schema_version": 1,
+            "host_id": HOST_ID,
+            "task_id": "task-missing-run",
+            "message_id": "msg-missing-run",
+            "delivery_id": "delivery-missing-run",
+            "message": "Ignore malformed terminal row.",
+        }
+    )
+    active = runtime.lease_store.get_active_lease("task", "task-missing-run")
+    assert active is not None
+
+    released = service.release_terminal_task_leases_from_graph_payload(
+        runtime.task_inbox,
+        {"runs": [{"task_id": "task-missing-run", "status": "completed"}]},
+    )
+
+    task = runtime.lease_store.get_task_record("task-missing-run")
+    try:
+        assert released == []
+        assert (
+            runtime.lease_store.get_active_lease("task", "task-missing-run")
+            == active
+        )
+        assert task is not None
+        assert task.status == "accepted"
+    finally:
+        runtime.close()
+
+
 def test_nats_message_ack_and_reply_are_sent_after_delivery_processing(
     tmp_path: Path,
 ) -> None:

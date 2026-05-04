@@ -270,9 +270,8 @@ class TaskInbox:
             return None
         row_run_id = _optional_text(row.get("run_id"))
         requested_run_id = _optional_text(run_id)
-        if requested_run_id is not None and requested_run_id != row_run_id:
+        if requested_run_id is None or requested_run_id != row_run_id:
             return None
-        owner_run_id = row_run_id or requested_run_id
         fencing_revision = row.get("lease_fencing_revision")
         if fencing_revision is None:
             return None
@@ -282,14 +281,14 @@ class TaskInbox:
             owner_host_id=self.host_id,
             fencing_revision=int(fencing_revision),
             terminal_status=terminal_status,
-            run_id=owner_run_id,
-            owner_run_id=owner_run_id,
+            run_id=requested_run_id,
+            owner_run_id=requested_run_id,
         )
         if released is not None:
             self._update_task_status(
                 task_id,
                 status=str(terminal_status or "").strip().lower(),
-                run_id=owner_run_id,
+                run_id=requested_run_id,
             )
         return released
 
