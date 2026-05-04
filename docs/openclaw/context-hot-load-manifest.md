@@ -93,11 +93,12 @@ default hot-load prompts.
 ## Idempotency
 
 The builder hashes the manifest request and stores the generated manifest in
-the local context store. Replaying the same request returns the same manifest.
-Signed successful manifests replay idempotently. Error manifests, such as a
-stale doctor result, are replaceable so the same request can recover after the
-index is repaired. Handoff packets use the same pattern with a deterministic
-packet hash.
+the local context store. Replaying the same request returns the same manifest
+while the cached signed manifest is unexpired and verifier-valid. Expired
+signed manifests are regenerated with a fresh expiry for the same request hash.
+Error manifests, such as a stale doctor result, are replaceable so the same
+request can recover after the index is repaired. Handoff packets use the same
+pattern with a deterministic packet hash.
 
 ## Fleet Context Graph
 

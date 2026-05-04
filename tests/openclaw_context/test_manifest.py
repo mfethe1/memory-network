@@ -403,6 +403,70 @@ def test_manifest_default_expiry_is_signed_and_verifiable(
         store.close()
 
 
+def test_manifest_default_expiry_cache_regenerates_after_ttl(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteContextStore(tmp_path / "context.db")
+    try:
+        current = {"now": NOW}
+        probe = FakeProbe()
+        builder = ContextManifestBuilder(
+            store=store,
+            probe=probe,
+            signing_secret="test-secret",
+            signature_key_id="test-key",
+            now=lambda: current["now"],
+        )
+        request = ManifestRequest(
+            host_id="host-a",
+            repo_id="repo-a",
+            task_id="task-default-expiry-replay",
+            run_id="run-default-expiry-replay",
+            provider="codex",
+            target_symbols=("pkg.service.handle",),
+        )
+
+        first = builder.build_manifest(request)
+        replay = builder.build_manifest(request)
+        current["now"] = NOW + timedelta(minutes=31)
+        refreshed = builder.build_manifest(request)
+
+        assert replay.manifest_id == first.manifest_id
+        assert replay.signature == first.signature
+        assert replay.expires_at == first.expires_at
+        assert not verify_context_manifest(
+            first,
+            signing_secret="test-secret",
+            signature_key_id="test-key",
+            now=lambda: current["now"],
+        )
+        assert refreshed.request_hash == first.request_hash
+        assert refreshed.expires_at == (
+            NOW + timedelta(minutes=61)
+        ).isoformat()
+        assert refreshed.signature != first.signature
+        assert verify_context_manifest(
+            refreshed,
+            signing_secret="test-secret",
+            signature_key_id="test-key",
+            now=lambda: current["now"],
+        )
+        assert [name for name, _ in probe.calls] == [
+            "doctor",
+            "impact",
+            "tests",
+            "repo_map",
+            "agent_states",
+            "doctor",
+            "impact",
+            "tests",
+            "repo_map",
+            "agent_states",
+        ]
+    finally:
+        store.close()
+
+
 def test_manifest_builder_prunes_dead_reference_pointers(
     tmp_path: Path,
 ) -> None:

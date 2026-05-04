@@ -198,16 +198,17 @@ class ContextManifestBuilder:
     ) -> None:
         self.store = store
         self.probe = probe or CodeIndexContextProbe()
+        self.signing_secret_text = signing_secret
         self.signing_secret = signing_secret.encode("utf-8")
         self.signature_key_id = signature_key_id
         self.now = now or (lambda: datetime.now(timezone.utc))
 
     def build_manifest(self, request: ManifestRequest) -> ContextManifest:
         request_hash = _sha(canonical_json(request.to_dict()))
-        cached = self.store.get_manifest_by_request_hash(request_hash)
-        if cached is not None and cached.status == "signed" and cached.expires_at:
-            return cached
         build_now = self.now()
+        cached = self.store.get_manifest_by_request_hash(request_hash)
+        if cached is not None and self._cached_manifest_valid(cached, build_now):
+            return cached
         expires_at = _effective_expires_at(request.expires_at, build_now)
 
         doctor = self.probe.doctor()
@@ -326,6 +327,18 @@ class ContextManifestBuilder:
             created_at=_datetime_text(build_now),
         )
         return self.store.store_manifest(manifest)
+
+    def _cached_manifest_valid(
+        self,
+        manifest: ContextManifest,
+        now: datetime,
+    ) -> bool:
+        return verify_context_manifest(
+            manifest,
+            signing_secret=self.signing_secret_text,
+            signature_key_id=self.signature_key_id,
+            now=lambda: now,
+        )
 
     def _candidate_pointers(
         self,
