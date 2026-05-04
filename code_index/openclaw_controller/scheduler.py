@@ -215,7 +215,7 @@ class FleetController:
                 message_id=stored_command["message_id"],
             )
 
-        subject = f"openclaw.deliver.{selected_host.host_id}.tasks"
+        subject = f"openclaw.task.{selected_host.host_id}.assigned"
         payload = self._task_publish_payload(
             details,
             host_id=selected_host.host_id,
@@ -428,6 +428,14 @@ class FleetController:
             message=_required_text(message.get("body"), "message"),
             selected_paths=_string_tuple(assignment.get("selected_paths")),
             selected_nodes=_string_tuple(assignment.get("selected_nodes")),
+            required_provider_capabilities=_first_string_tuple(
+                assignment,
+                (
+                    "required_provider_capabilities",
+                    "provider_capabilities",
+                    "required_capabilities",
+                ),
+            ),
             node=(
                 dict(assignment["node"])
                 if isinstance(assignment.get("node"), Mapping)
@@ -474,6 +482,11 @@ class FleetController:
             return "repo_root_mismatch"
         if not host.supports_provider(details.provider):
             return "provider_unavailable"
+        if not host.supports_provider_capabilities(
+            details.provider,
+            details.required_provider_capabilities,
+        ):
+            return "provider_capability_missing"
         repo_lease = self.lease_store.get_active_lease(
             "repo",
             details.repo_root,
@@ -496,12 +509,17 @@ class FleetController:
         *,
         repo_root: str,
         provider: str,
+        required_provider_capabilities: tuple[str, ...] = (),
         now: datetime,
     ) -> bool:
         return (
             host.health_at(now) == HOST_HEALTHY
             and host.supports_repo_root(repo_root)
             and host.supports_provider(provider)
+            and host.supports_provider_capabilities(
+                provider,
+                required_provider_capabilities,
+            )
         )
 
     def _host_delivery(
@@ -536,6 +554,10 @@ class FleetController:
             "selected_paths": list(details.selected_paths),
             "selected_nodes": list(details.selected_nodes),
         }
+        if details.required_provider_capabilities:
+            payload["required_provider_capabilities"] = list(
+                details.required_provider_capabilities
+            )
         if details.node is not None:
             payload["node"] = dict(details.node)
         if details.agent_name is not None:
@@ -633,12 +655,14 @@ class FleetController:
         task_id = _optional_text(state.get("task_id")) or _optional_text(
             context_health.get("task_id")
         )
-        health = "unknown"
         last_action_at = _parse_datetime(state.get("last_action_at"))
-        if last_action_at is not None:
+        last_event_at = _parse_datetime(state.get("last_event_at"))
+        last_observed_at = _latest_datetime(last_action_at, last_event_at)
+        health = "unknown"
+        if last_observed_at is not None:
             health = (
                 "stale"
-                if now - last_action_at >= self.run_stale_after
+                if now - last_observed_at >= self.run_stale_after
                 else "healthy"
             )
         handoff = self._handoff_for_run(host_id=host_id, task_id=task_id, run_id=run_id)
@@ -650,6 +674,10 @@ class FleetController:
             or _optional_text(state.get("status")),
             "run_health": health,
             "last_action_at": last_action_at.isoformat() if last_action_at else None,
+            "last_event_at": last_event_at.isoformat() if last_event_at else None,
+            "last_observed_at": (
+                last_observed_at.isoformat() if last_observed_at else None
+            ),
             "context_health": dict(context_health),
             "handoff_state": dict(handoff or {}),
         }
@@ -713,6 +741,17 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _first_string_tuple(
+    payload: Mapping[str, Any],
+    names: tuple[str, ...],
+) -> tuple[str, ...]:
+    for name in names:
+        value = _string_tuple(payload.get(name))
+        if value:
+            return value
+    return ()
+
+
 def _required_text(value: object, field_name: str) -> str:
     text = str(value or "").strip()
     if not text:
@@ -735,6 +774,13 @@ def _parse_datetime(value: object) -> datetime | None:
         return _utc(datetime.fromisoformat(text))
     except ValueError:
         return None
+
+
+def _latest_datetime(*values: datetime | None) -> datetime | None:
+    parsed = [value for value in values if value is not None]
+    if not parsed:
+        return None
+    return max(parsed)
 
 
 def _utc(value: datetime | None) -> datetime:

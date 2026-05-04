@@ -106,7 +106,7 @@ def test_fleet_task_route_assigns_eligible_host_and_preserves_messaging_routes(
         assert assigned.body["status"] == "assigned"
         assert assigned.body["assignment"]["host_id"] == "host-a"
         assert assigned.body["room_message_update"]["status"] == "assigned"
-        assert nats.published[0][0] == "openclaw.deliver.host-a.tasks"
+        assert nats.published[0][0] == "openclaw.task.host-a.assigned"
         assert nats.published[0][1]["provider"] == "codex"
         assert rooms.status_code == 200
         assert len(rooms.body["rooms"]) == 1

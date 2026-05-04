@@ -54,6 +54,10 @@ class ProviderCapability:
             "capabilities": list(self.capabilities),
         }
 
+    def has_capabilities(self, required: tuple[str, ...]) -> bool:
+        available = {capability.lower() for capability in self.capabilities}
+        return all(capability.lower() in available for capability in required)
+
 
 @dataclass(frozen=True)
 class HostInventoryRecord:
@@ -117,10 +121,23 @@ class HostInventoryRecord:
         )
 
     def supports_provider(self, provider: str) -> bool:
+        return self.provider_capability(provider) is not None
+
+    def provider_capability(self, provider: str) -> ProviderCapability | None:
         requested = str(provider or "").strip().lower()
-        return any(
-            capability.provider_id.lower() == requested
-            for capability in self.providers
+        for capability in self.providers:
+            if capability.provider_id.lower() == requested:
+                return capability
+        return None
+
+    def supports_provider_capabilities(
+        self,
+        provider: str,
+        required_capabilities: tuple[str, ...],
+    ) -> bool:
+        capability = self.provider_capability(provider)
+        return capability is not None and capability.has_capabilities(
+            required_capabilities
         )
 
     def to_projection(
@@ -154,6 +171,7 @@ class AssignmentDetails:
     message: str
     selected_paths: tuple[str, ...] = ()
     selected_nodes: tuple[str, ...] = ()
+    required_provider_capabilities: tuple[str, ...] = ()
     node: Mapping[str, Any] | None = None
     agent_name: str | None = None
 

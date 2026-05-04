@@ -77,6 +77,36 @@ def _host(
     )
 
 
+def _host_with_capabilities(
+    controller: FleetController,
+    host_id: str,
+    *,
+    provider_id: str = "codex",
+    capabilities: list[str],
+    now: datetime = NOW,
+) -> None:
+    controller.record_host_heartbeat(
+        {
+            "kind": "openclaw.host_heartbeat",
+            "schema_version": 1,
+            "host_id": host_id,
+            "heartbeat_interval_seconds": 10,
+            "generated_at": now.isoformat(),
+            "capabilities": {
+                "repo_roots": [{"path": r"E:\Projects\repo-a", "exists": True}],
+                "providers": [
+                    {
+                        "id": provider_id,
+                        "display_name": provider_id,
+                        "capabilities": capabilities,
+                    }
+                ],
+            },
+        },
+        now=now,
+    )
+
+
 def _command(
     store: MessagingStore,
     *,
@@ -85,8 +115,17 @@ def _command(
     body: str = "Implement the task.",
     repo_root: str = r"E:\Projects\repo-a",
     provider: str = "codex",
+    required_provider_capabilities: list[str] | None = None,
     expires_at: str | None = None,
 ) -> dict[str, Any]:
+    assignment = {
+        "repo_root": repo_root,
+        "provider": provider,
+        "selected_paths": ["code_index/openclaw_controller/app.py"],
+        "selected_nodes": ["openclaw_controller.app"],
+    }
+    if required_provider_capabilities is not None:
+        assignment["required_provider_capabilities"] = required_provider_capabilities
     room = store.create_room(
         room_kind="task",
         display_name=f"Task {task_id}",
@@ -95,12 +134,7 @@ def _command(
             "default_delivery_targets": [
                 {"recipient_kind": "host", "recipient_id": host_id}
             ],
-            "assignment": {
-                "repo_root": repo_root,
-                "provider": provider,
-                "selected_paths": ["code_index/openclaw_controller/app.py"],
-                "selected_nodes": ["openclaw_controller.app"],
-            },
+            "assignment": assignment,
         },
     )
     result = store.create_message(
@@ -137,7 +171,7 @@ def test_controller_assigns_task_only_to_eligible_host_and_publishes_nats_shape(
         assert leases.get_active_lease("task", "task-123", now=NOW)
         assert nats.published == [
             (
-                "openclaw.deliver.host-a.tasks",
+                "openclaw.task.host-a.assigned",
                 {
                     "kind": "openclaw.task.assigned",
                     "schema_version": 1,
@@ -182,6 +216,69 @@ def test_controller_refuses_assignment_when_repo_lease_is_held_elsewhere(
         assert result.room_message_update["status"] == "rejected"
         assert nats.published == []
         assert leases.get_active_lease("task", "task-123", now=NOW) is None
+    finally:
+        store.close()
+
+
+def test_required_provider_capabilities_skip_same_provider_host_without_capability(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        controller, nats, _leases = _controller(store)
+        _host_with_capabilities(
+            controller,
+            "host-a",
+            capabilities=["chat"],
+        )
+        _host_with_capabilities(
+            controller,
+            "host-b",
+            capabilities=["task_run", "fresh_session"],
+        )
+        command_ref = _command(
+            store,
+            host_id="host-b",
+            required_provider_capabilities=["task_run", "fresh_session"],
+        )
+
+        result = controller.assign_task_from_command_ref(command_ref, now=NOW)
+
+        assert result.status == "assigned"
+        assert result.assignment is not None
+        assert result.assignment.host_id == "host-b"
+        assert nats.published[0][0] == "openclaw.task.host-b.assigned"
+    finally:
+        store.close()
+
+
+def test_assignment_rejects_when_provider_id_matches_but_capability_is_missing(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        controller, nats, _leases = _controller(store)
+        _host_with_capabilities(
+            controller,
+            "host-a",
+            capabilities=["chat"],
+        )
+        command_ref = _command(
+            store,
+            required_provider_capabilities=["task_run"],
+        )
+
+        result = controller.assign_task_from_command_ref(command_ref, now=NOW)
+
+        assert result.status == "rejected"
+        assert result.rejection is not None
+        assert result.rejection.reason == "no_eligible_hosts"
+        assert result.rejection.details == {
+            "candidates": [
+                {"host_id": "host-a", "reason": "provider_capability_missing"}
+            ]
+        }
+        assert nats.published == []
     finally:
         store.close()
 
@@ -269,6 +366,48 @@ def test_health_projection_marks_run_stale_without_mutating_agent_run_status(
         assert run["agent_run_status"] == "working"
         assert task is not None
         assert task.status == "working"
+    finally:
+        store.close()
+
+
+def test_run_health_uses_recent_and_stale_run_events_without_heartbeat(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        controller, _nats, _leases = _controller(store)
+        controller.record_run_event(
+            {
+                "host_id": "host-a",
+                "task_id": "task-recent",
+                "run_id": "run-recent",
+                "status": "working",
+                "event_type": "tool_call",
+                "generated_at": (NOW - timedelta(minutes=2)).isoformat(),
+            },
+            now=NOW - timedelta(minutes=2),
+        )
+        controller.record_run_event(
+            {
+                "host_id": "host-a",
+                "task_id": "task-stale",
+                "run_id": "run-stale",
+                "status": "working",
+                "event_type": "tool_call",
+                "generated_at": (NOW - timedelta(minutes=15)).isoformat(),
+            },
+            now=NOW - timedelta(minutes=15),
+        )
+
+        projection = controller.project_fleet(now=NOW)
+
+        health_by_run = {
+            run["run_id"]: run["run_health"] for run in projection["runs"]
+        }
+        assert health_by_run == {
+            "run-recent": "healthy",
+            "run-stale": "stale",
+        }
     finally:
         store.close()
 
