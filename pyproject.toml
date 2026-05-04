@@ -38,6 +38,7 @@ dev = [
 index = "code_index.index_launcher:main"
 code_index = "code_index.cli:main"
 code-index = "code_index.cli:main"
+code-index-openclaw-hostd = "code_index.openclaw_hostd.service:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
