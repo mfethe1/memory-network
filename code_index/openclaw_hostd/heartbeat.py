@@ -63,10 +63,13 @@ def detect_capabilities(
     config: HostDaemonConfig,
     *,
     graph_server_probe: GraphServerProbe | None = None,
+    probe_graph_server: bool = False,
 ) -> dict[str, Any]:
-    graph_server_available = False
-    if config.graph_server_url:
+    graph_server_checked = False
+    graph_server_available: bool | None = None
+    if config.graph_server_url and (probe_graph_server or graph_server_probe):
         probe = graph_server_probe or check_graph_server_available
+        graph_server_checked = True
         graph_server_available = bool(probe(config.graph_server_url))
 
     return {
@@ -79,6 +82,7 @@ def detect_capabilities(
         "providers": _provider_payload(),
         "graph_server": {
             "url": redact_url(config.graph_server_url),
+            "checked": graph_server_checked,
             "available": graph_server_available,
         },
     }
@@ -90,6 +94,7 @@ def build_heartbeat_payload(
     *,
     now: datetime | None = None,
     graph_server_probe: GraphServerProbe | None = None,
+    probe_graph_server: bool = False,
 ) -> dict[str, Any]:
     generated_at = now or datetime.now(timezone.utc)
     if generated_at.tzinfo is None:
@@ -105,5 +110,6 @@ def build_heartbeat_payload(
         "capabilities": detect_capabilities(
             config,
             graph_server_probe=graph_server_probe,
+            probe_graph_server=probe_graph_server,
         ),
     }

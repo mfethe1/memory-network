@@ -4,6 +4,9 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
+from code_index.openclaw_hostd import heartbeat
 from code_index.openclaw_hostd.config import (
     GRAPH_SERVER_URL_ENV,
     HOST_IDENTITY_PATH_ENV,
@@ -13,6 +16,29 @@ from code_index.openclaw_hostd.config import (
 )
 from code_index.openclaw_hostd.heartbeat import build_heartbeat_payload
 from code_index.openclaw_hostd.identity import HostIdentity
+
+
+def test_default_heartbeat_does_not_probe_graph_server_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_urlopen(*args: object, **kwargs: object) -> None:
+        raise AssertionError("default heartbeat generation must not use network")
+
+    monkeypatch.setattr(heartbeat, "urlopen", fail_urlopen)
+    identity = HostIdentity(host_id="host_0123456789abcdef0123456789abcdef")
+    config = HostDaemonConfig(
+        state_dir=tmp_path / "state",
+        host_identity_path=tmp_path / "state" / "host-id.json",
+        repo_roots=(tmp_path,),
+        graph_server_url="http://127.0.0.1:8767/health",
+    )
+
+    payload = build_heartbeat_payload(config, identity)
+
+    graph_server = payload["capabilities"]["graph_server"]
+    assert graph_server["available"] is None
+    assert graph_server["checked"] is False
 
 
 def test_heartbeat_reports_host_capabilities_without_secrets(tmp_path: Path) -> None:
@@ -42,6 +68,7 @@ def test_heartbeat_reports_host_capabilities_without_secrets(tmp_path: Path) -> 
     assert payload["host_id"] == identity.host_id
     assert payload["ssh_hostname"] == "openclaw-test-host"
     assert payload["capabilities"]["graph_server"]["available"] is False
+    assert payload["capabilities"]["graph_server"]["checked"] is True
     assert payload["capabilities"]["repo_roots"] == [
         {
             "path": str(root.resolve()),

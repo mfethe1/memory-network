@@ -33,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print heartbeat payloads as JSON.",
     )
+    parser.add_argument(
+        "--probe-graph-server",
+        action="store_true",
+        help="Check local graph-server availability during heartbeat generation.",
+    )
     return parser
 
 
@@ -50,9 +55,18 @@ def _emit_payload(payload: dict[str, object], *, as_json: bool) -> None:
     )
 
 
-def run_once(config: HostDaemonConfig, *, as_json: bool) -> dict[str, object]:
+def run_once(
+    config: HostDaemonConfig,
+    *,
+    as_json: bool,
+    probe_graph_server: bool = False,
+) -> dict[str, object]:
     identity = load_or_create_host_identity(config.host_identity_path)
-    payload = build_heartbeat_payload(config, identity)
+    payload = build_heartbeat_payload(
+        config,
+        identity,
+        probe_graph_server=probe_graph_server,
+    )
     _emit_payload(payload, as_json=as_json)
     return payload
 
@@ -64,11 +78,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         if args.once:
-            run_once(config, as_json=bool(args.json))
+            run_once(
+                config,
+                as_json=bool(args.json),
+                probe_graph_server=bool(args.probe_graph_server),
+            )
             return 0
 
         while True:
-            run_once(config, as_json=bool(args.json))
+            run_once(
+                config,
+                as_json=bool(args.json),
+                probe_graph_server=bool(args.probe_graph_server),
+            )
             time.sleep(config.heartbeat_interval_seconds)
     except KeyboardInterrupt:
         logger.info("OpenClaw host daemon interrupted")
