@@ -13,6 +13,7 @@ from typing import Sequence
 
 from code_index.openclaw_hostd.config import HostDaemonConfig, load_config
 from code_index.openclaw_hostd.graph_client import GraphServerClient
+from code_index.openclaw_hostd.graph_client import GraphServerResponse
 from code_index.openclaw_hostd.heartbeat import build_heartbeat_payload
 from code_index.openclaw_hostd.identity import load_or_create_host_identity
 from code_index.openclaw_hostd.identity import HostIdentity
@@ -47,6 +48,22 @@ class HostDaemonNatsRuntime:
     outbox: Any
     task_inbox: TaskInbox
     host_inbox: HostInbox
+
+
+class DisabledGraphServerClient:
+    def agent_board(self) -> GraphServerResponse:
+        return GraphServerResponse(
+            ok=True,
+            status_code=None,
+            payload={"active_runs": []},
+        )
+
+    def submit_task(self, **payload: Any) -> GraphServerResponse:
+        return GraphServerResponse(
+            ok=False,
+            status_code=None,
+            error="graph-server URL is not configured",
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -413,9 +430,9 @@ def run_daemon_loop(
         sleep(config.heartbeat_interval_seconds)
 
 
-def _graph_client_for_config(config: HostDaemonConfig) -> GraphServerClient:
+def _graph_client_for_config(config: HostDaemonConfig) -> Any:
     if not config.graph_server_url:
-        raise ValueError("graph_server_url is required for NATS task inbox setup")
+        return DisabledGraphServerClient()
     return GraphServerClient(
         config.graph_server_url,
         bearer_token=config.graph_server_token,

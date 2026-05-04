@@ -160,6 +160,21 @@ def _config_with_nats(tmp_path: Path) -> HostDaemonConfig:
     )
 
 
+def _config_with_nats_without_graph(tmp_path: Path) -> HostDaemonConfig:
+    config = _config_with_nats(tmp_path)
+    return HostDaemonConfig(
+        state_dir=config.state_dir,
+        host_identity_path=config.host_identity_path,
+        repo_roots=config.repo_roots,
+        graph_server_url=None,
+        graph_server_token=config.graph_server_token,
+        ssh_hostname=config.ssh_hostname,
+        heartbeat_interval_seconds=config.heartbeat_interval_seconds,
+        nats_url=config.nats_url,
+        config_path=config.config_path,
+    )
+
+
 def test_daemon_loop_uses_connected_nats_for_subscriptions_outbox_and_agent_states(
     tmp_path: Path,
 ) -> None:
@@ -252,6 +267,35 @@ def test_configured_nats_transport_factory_subscribes_drains_and_publishes_agent
     }
     assert outbox.drain_calls >= 1
     assert [entry[1] for entry in transport.kv_entries] == [f"{HOST_ID}.run-factory"]
+
+
+def test_configured_nats_runs_with_empty_graph_server_url(
+    tmp_path: Path,
+) -> None:
+    transport = FakeNatsTransport()
+    outbox = RecordingOutbox()
+    factory_urls: list[str] = []
+
+    def transport_factory(url: str) -> FakeNatsTransport:
+        factory_urls.append(url)
+        return transport
+
+    service.run_daemon_loop(
+        _config_with_nats_without_graph(tmp_path),
+        as_json=True,
+        nats_transport_factory=transport_factory,
+        outbox=outbox,
+        sleep=lambda seconds: None,
+        max_iterations=1,
+    )
+
+    assert factory_urls == ["nats://127.0.0.1:4222"]
+    assert set(transport.subscriptions) == {
+        f"openclaw.task.{HOST_ID}.assigned",
+        f"openclaw.host.{HOST_ID}.inbox",
+    }
+    assert outbox.drain_calls >= 1
+    assert transport.kv_entries == []
 
 
 def test_configured_nats_without_transport_logs_disabled_clearly(
