@@ -107,26 +107,17 @@ class FleetRouter:
                     {"hosts": self.controller.project_fleet()["hosts"]},
                 )
             if method == "POST" and parts == ["fleet", "hosts", "heartbeat"]:
-                if not _principal_has_scope(
-                    principal,
-                    {"fleet:ingest", "host:ingest"},
-                ):
+                if not _principal_can_ingest_host(principal, payload):
                     return _forbidden()
                 host = self.controller.record_host_heartbeat(_object(payload))
                 return ApiResponse(200, {"host": host})
             if method == "POST" and parts == ["fleet", "agent-states"]:
-                if not _principal_has_scope(
-                    principal,
-                    {"fleet:ingest", "host:ingest"},
-                ):
+                if not _principal_can_ingest_host(principal, payload):
                     return _forbidden()
                 state = self.controller.record_agent_state(_object(payload))
                 return ApiResponse(200, {"agent_state": state})
             if method == "POST" and parts == ["fleet", "run-events"]:
-                if not _principal_has_scope(
-                    principal,
-                    {"fleet:ingest", "host:ingest"},
-                ):
+                if not _principal_can_ingest_host(principal, payload):
                     return _forbidden()
                 event = self.controller.record_run_event(_object(payload))
                 return ApiResponse(200, {"run_event": event})
@@ -237,8 +228,28 @@ def _principal_has_scope(
     return bool(set(principal.scopes) & allowed_scopes)
 
 
+def _principal_can_ingest_host(
+    principal: Principal | None,
+    payload: Mapping[str, Any],
+) -> bool:
+    if principal is None:
+        return False
+    scopes = set(principal.scopes)
+    if "fleet:ingest" in scopes:
+        return True
+    if "host:ingest" not in scopes:
+        return False
+    host_id = _optional_text(payload.get("host_id"))
+    return host_id is not None and principal.principal_id == host_id
+
+
 def _forbidden() -> ApiResponse:
     return ApiResponse(403, {"error": "fleet write requires trusted principal scope"})
+
+
+def _optional_text(value: object) -> str | None:
+    text = str(value or "").strip()
+    return text or None
 
 
 def _assignment_status_code(result: Any) -> int:

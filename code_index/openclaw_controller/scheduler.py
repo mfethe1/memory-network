@@ -127,13 +127,13 @@ class FleetController:
     ) -> AssignmentResult:
         timestamp = _utc(now)
         message_id = _optional_text(command_ref.get("message_id"))
-        consumed = self._consumed_command_ref(command_ref)
-        if consumed is not None:
+        status_rejection = self._command_ref_status_rejection(command_ref)
+        if status_rejection is not None:
             return self._assignment_rejected(
-                reason="command_ref_consumed",
-                message="command reference has already been consumed",
+                reason=status_rejection.reason,
+                message=status_rejection.message,
                 message_id=message_id,
-                details=consumed,
+                details=status_rejection.details,
             )
         if not self.messaging_store.verify_command_ref(command_ref):
             return self._assignment_rejected(
@@ -156,12 +156,21 @@ class FleetController:
                 message="controller task creation requires an assign_task command",
                 message_id=message_id,
             )
+        claimed_command = self.messaging_store.claim_command_ref(
+            stored_command["command_id"],
+        )
+        if claimed_command is None:
+            return self._command_ref_claim_rejected(
+                stored_command["message_id"],
+            )
+        stored_command = claimed_command
         message = self.messaging_store.get_message(stored_command["message_id"])
         room = self.messaging_store.get_room(message["room_id"])
         try:
             details = self._assignment_details(stored_command, message, room)
         except ValueError as exc:
-            return self._assignment_rejected(
+            return self._reject_claimed_assignment(
+                stored_command["command_id"],
                 reason="missing_assignment_context",
                 message=str(exc),
                 message_id=stored_command["message_id"],
@@ -173,7 +182,8 @@ class FleetController:
             now=timestamp,
         )
         if selected_host is None:
-            return self._assignment_rejected(
+            return self._reject_claimed_assignment(
+                stored_command["command_id"],
                 reason=rejection.reason,
                 message=rejection.message,
                 message_id=stored_command["message_id"],
@@ -184,7 +194,8 @@ class FleetController:
             host_id=selected_host.host_id,
         )
         if delivery is None:
-            return self._assignment_rejected(
+            return self._reject_claimed_assignment(
+                stored_command["command_id"],
                 reason="delivery_missing",
                 message="originating message has no delivery record for selected host",
                 message_id=stored_command["message_id"],
@@ -226,7 +237,8 @@ class FleetController:
                     fencing_revision=repo_lease.fencing_revision,
                     now=timestamp,
                 )
-            return self._assignment_rejected(
+            return self._reject_claimed_assignment(
+                stored_command["command_id"],
                 reason=(
                     "repo_lease_conflict"
                     if "repo lease" in str(exc)
@@ -254,7 +266,8 @@ class FleetController:
                 host_id=selected_host.host_id,
                 now=timestamp,
             )
-            return self._assignment_rejected(
+            return self._reject_claimed_assignment(
+                stored_command["command_id"],
                 reason="nats_publish_failed",
                 message=str(exc),
                 message_id=stored_command["message_id"],
@@ -666,10 +679,10 @@ class FleetController:
         except Exception:
             return
 
-    def _consumed_command_ref(
+    def _command_ref_status_rejection(
         self,
         command_ref: Mapping[str, Any],
-    ) -> dict[str, Any] | None:
+    ) -> Rejection | None:
         message_id = _optional_text(command_ref.get("message_id"))
         command_id = _optional_text(command_ref.get("command_id"))
         if message_id is None or command_id is None:
@@ -677,9 +690,68 @@ class FleetController:
         stored = self.messaging_store.get_command_ref_for_message(message_id)
         if stored is None or stored["command_id"] != command_id:
             return None
+        details = {"command_id": command_id, "status": stored["status"]}
+        if stored["status"] == "active":
+            return Rejection(
+                reason="command_ref_claimed",
+                message="command reference is already being assigned",
+                details=details,
+            )
         if stored["status"] in {"assigned", "rejected", "cancelled"}:
-            return {"command_id": command_id, "status": stored["status"]}
+            return Rejection(
+                reason="command_ref_consumed",
+                message="command reference has already been consumed",
+                details=details,
+            )
         return None
+
+    def _command_ref_claim_rejected(
+        self,
+        message_id: str,
+    ) -> AssignmentResult:
+        stored = self.messaging_store.get_command_ref_for_message(message_id)
+        status = _optional_text(stored.get("status")) if stored is not None else None
+        command_id = _optional_text(stored.get("command_id")) if stored is not None else None
+        details = {"status": status or "unknown"}
+        if command_id is not None:
+            details["command_id"] = command_id
+        if status == "active":
+            return self._assignment_rejected(
+                reason="command_ref_claimed",
+                message="command reference is already being assigned",
+                message_id=message_id,
+                details=details,
+            )
+        if status in {"assigned", "rejected", "cancelled"}:
+            return self._assignment_rejected(
+                reason="command_ref_consumed",
+                message="command reference has already been consumed",
+                message_id=message_id,
+                details=details,
+            )
+        return self._assignment_rejected(
+            reason="command_ref_claim_failed",
+            message="command reference could not be claimed for assignment",
+            message_id=message_id,
+            details=details,
+        )
+
+    def _reject_claimed_assignment(
+        self,
+        command_id: str,
+        *,
+        reason: str,
+        message: str,
+        message_id: str | None,
+        details: Mapping[str, Any] | None = None,
+    ) -> AssignmentResult:
+        self.messaging_store.mark_command_ref_status(command_id, status="rejected")
+        return self._assignment_rejected(
+            reason=reason,
+            message=message,
+            message_id=message_id,
+            details=details,
+        )
 
     def _assignment_rejected(
         self,

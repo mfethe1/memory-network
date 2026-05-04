@@ -21,6 +21,14 @@ INGEST_PRINCIPAL = Principal(
     principal_id="host-a",
     scopes=frozenset({"fleet:ingest"}),
 )
+HOST_A_INGEST_PRINCIPAL = Principal(
+    principal_id="host-a",
+    scopes=frozenset({"host:ingest"}),
+)
+FLEET_INGEST_PRINCIPAL = Principal(
+    principal_id="fleet-service",
+    scopes=frozenset({"fleet:ingest"}),
+)
 ASSIGN_PRINCIPAL = Principal(
     principal_id="controller",
     scopes=frozenset({"command:write"}),
@@ -285,6 +293,84 @@ def test_fleet_write_routes_reject_untrusted_or_missing_principal(
 
         assert unauthenticated_heartbeat.status_code == 403
         assert wrong_scope_heartbeat.status_code == 403
+    finally:
+        app.close()
+
+
+def test_host_scoped_ingest_principal_cannot_spoof_another_host(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        tmp_path / "messages.db",
+        signing_secret=SIGNING_SECRET,
+        lease_store=InMemoryFleetLeaseStore(),
+        nats_client=FakeNats(),
+    )
+    try:
+        spoofed_heartbeat = app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            _heartbeat("host-b"),
+            principal=HOST_A_INGEST_PRINCIPAL,
+        )
+        spoofed_agent_state = app.handle_request(
+            "POST",
+            "/fleet/agent-states",
+            {
+                "host_id": "host-b",
+                "run_id": "run-b",
+                "task_id": "task-b",
+                "run_status": "working",
+            },
+            principal=HOST_A_INGEST_PRINCIPAL,
+        )
+        spoofed_run_event = app.handle_request(
+            "POST",
+            "/fleet/run-events",
+            {
+                "host_id": "host-b",
+                "run_id": "run-b",
+                "task_id": "task-b",
+                "event_type": "tool_call",
+            },
+            principal=HOST_A_INGEST_PRINCIPAL,
+        )
+
+        fleet_heartbeat = app.handle_request(
+            "POST",
+            "/fleet/hosts/heartbeat",
+            _heartbeat("host-b"),
+            principal=FLEET_INGEST_PRINCIPAL,
+        )
+        fleet_agent_state = app.handle_request(
+            "POST",
+            "/fleet/agent-states",
+            {
+                "host_id": "host-b",
+                "run_id": "run-b",
+                "task_id": "task-b",
+                "run_status": "working",
+            },
+            principal=FLEET_INGEST_PRINCIPAL,
+        )
+        fleet_run_event = app.handle_request(
+            "POST",
+            "/fleet/run-events",
+            {
+                "host_id": "host-b",
+                "run_id": "run-b",
+                "task_id": "task-b",
+                "event_type": "tool_call",
+            },
+            principal=FLEET_INGEST_PRINCIPAL,
+        )
+
+        assert spoofed_heartbeat.status_code == 403
+        assert spoofed_agent_state.status_code == 403
+        assert spoofed_run_event.status_code == 403
+        assert fleet_heartbeat.status_code == 200
+        assert fleet_agent_state.status_code == 200
+        assert fleet_run_event.status_code == 200
     finally:
         app.close()
 

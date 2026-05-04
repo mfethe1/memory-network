@@ -23,6 +23,19 @@ class FakeNats:
         self.published.append((subject, dict(payload)))
 
 
+class ReentrantNats(FakeNats):
+    def __init__(self) -> None:
+        super().__init__()
+        self.on_first_publish: Any | None = None
+
+    def publish(self, subject: str, payload: dict[str, Any]) -> None:
+        super().publish(subject, payload)
+        if self.on_first_publish is not None:
+            callback = self.on_first_publish
+            self.on_first_publish = None
+            callback()
+
+
 class RaceLeaseStore(InMemoryFleetLeaseStore):
     def __init__(self) -> None:
         super().__init__()
@@ -361,6 +374,43 @@ def test_successful_assignment_consumes_command_ref_and_replay_is_rejected(
         assert replay.status == "rejected"
         assert replay.rejection is not None
         assert replay.rejection.reason == "command_ref_consumed"
+        assert [subject for subject, _payload in nats.published] == [
+            "openclaw.task.host-a.assigned"
+        ]
+    finally:
+        store.close()
+
+
+def test_command_ref_claim_prevents_reentrant_double_assignment_publish(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        nats = ReentrantNats()
+        controller, _publisher, _leases = _controller(store, nats=nats)
+        _host(controller, "host-a")
+        command_ref = _command(store)
+        replay_result = None
+
+        def replay_assignment() -> None:
+            nonlocal replay_result
+            replay_result = controller.assign_task_from_command_ref(
+                command_ref,
+                now=NOW,
+            )
+
+        nats.on_first_publish = replay_assignment
+
+        assigned = controller.assign_task_from_command_ref(command_ref, now=NOW)
+
+        stored = store.get_command_ref_for_message(command_ref["message_id"])
+        assert assigned.status == "assigned"
+        assert replay_result is not None
+        assert replay_result.status == "rejected"
+        assert replay_result.rejection is not None
+        assert replay_result.rejection.reason == "command_ref_claimed"
+        assert stored is not None
+        assert stored["status"] == "assigned"
         assert [subject for subject, _payload in nats.published] == [
             "openclaw.task.host-a.assigned"
         ]

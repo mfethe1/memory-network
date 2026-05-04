@@ -609,6 +609,41 @@ class MessagingStore:
         ).fetchone()
         return _command(row)
 
+    def claim_command_ref(
+        self,
+        command_id: str,
+        *,
+        from_status: str = "pending",
+        to_status: str = "active",
+    ) -> dict[str, Any] | None:
+        command_id = str(command_id or "").strip()
+        from_status = str(from_status or "").strip().lower()
+        to_status = str(to_status or "").strip().lower()
+        allowed = {"pending", "active", "assigned", "rejected", "cancelled"}
+        if not command_id:
+            raise MessagingError("command_id is required")
+        if from_status not in allowed or to_status not in allowed:
+            raise MessagingError(
+                "command status must be pending, active, assigned, rejected, or cancelled"
+            )
+        with self._transaction():
+            cursor = self.conn.execute(
+                """
+                UPDATE openclaw_command_refs
+                   SET status = ?
+                 WHERE command_id = ?
+                   AND status = ?
+                """,
+                (to_status, command_id, from_status),
+            )
+        if cursor.rowcount != 1:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM openclaw_command_refs WHERE command_id = ?",
+            (command_id,),
+        ).fetchone()
+        return _command(row)
+
     def verify_command_ref(self, command_ref: Mapping[str, Any]) -> bool:
         try:
             command_id = str(command_ref["command_id"])
