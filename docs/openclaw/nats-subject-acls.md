@@ -385,14 +385,20 @@ nats --server $env:NATS_URL --creds .\creds\controller.creds `
   pub openclaw.task.oclh_a.assigned '{"task_id":"canary-a"}'
 # Expected: PASS, controller can assign an Agent Task.
 
+nats --server $env:NATS_URL --creds .\creds\controller.creds `
+  pub openclaw.task.oclh_a.assigned '{"task_id":"canary-a-cross-host"}'
+# Expected: PASS, a second canary remains available for the cross-host
+# negative delivery check below.
+
 nats --server $env:NATS_URL --creds .\creds\host-a.creds `
   sub openclaw.deliver.oclh_a.tasks --count 1 --timeout 5s
 # Expected: PASS, host_a can receive its own pushed task delivery.
 
 nats --server $env:NATS_URL --creds .\creds\host-b.creds `
   sub openclaw.deliver.oclh_a.tasks --count 1 --timeout 2s
-# Expected: FAIL with authorization violation, or no delivery if the server
-# rejects before delivery.
+# Expected: FAIL with an explicit authorization violation. Timeout, "no
+# messages", or any other non-authorization result fails this check because the
+# second canary would be available if the cross-host subscription were allowed.
 
 nats --server $env:NATS_URL --creds .\creds\host-b.creds `
   sub openclaw.task.oclh_a.assigned --count 1 --timeout 2s
