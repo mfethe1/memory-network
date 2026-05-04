@@ -6,6 +6,7 @@ from typing import Any
 
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
+from code_index import scopes
 from code_index import retrieval
 
 
@@ -81,9 +82,11 @@ def _build_search_payload(
     query: str,
     scope: str,
     limit: int,
+    path_scope: scopes.ScopeSelection | None = None,
 ) -> dict[str, Any]:
     normalized_scope = scope if scope in {"all", "files", "transcripts"} else "all"
     safe_limit = max(1, min(50, int(limit or 12)))
+    scoped = path_scope is not None and path_scope.path != "."
     conn = db_mod.connect(config.db_path)
     try:
         db_mod.ensure_schema(conn, config)
@@ -94,7 +97,7 @@ def _build_search_payload(
                 limit=safe_limit,
                 budget_bytes=20_000,
                 sources=_search_sources_for_scope(normalized_scope),
-                per_source_limit=safe_limit,
+                per_source_limit=max(safe_limit * 8, 50) if scoped else safe_limit,
             ),
         ).to_dict()
         file_results: list[dict[str, Any]] = []
@@ -107,16 +110,24 @@ def _build_search_payload(
             if source_kind == retrieval.SourceKind.FILE_PATH.value:
                 result = _broker_file_result(item)
                 path = str(result.get("file_path") or "")
+                if scoped and not scopes.path_in_scope(path, path_scope):
+                    continue
                 if path:
                     seen_paths.add(path)
                 file_results.append(result)
             elif source_kind == retrieval.SourceKind.CODE_CHUNK.value:
                 path = str((item.get("payload") or {}).get("file_path") or "")
+                if scoped and not scopes.path_in_scope(path, path_scope):
+                    continue
                 file_results.append(
                     _broker_file_result(item, path_match_also=path in seen_paths)
                 )
             elif source_kind == retrieval.SourceKind.TRANSCRIPT_EVENT.value:
-                transcript_results.append(_broker_transcript_result(item))
+                result = _broker_transcript_result(item)
+                path = str(result.get("file_path") or "")
+                if scoped and not scopes.path_in_scope(path, path_scope):
+                    continue
+                transcript_results.append(result)
     finally:
         db_mod.close(conn)
     return {
@@ -124,6 +135,7 @@ def _build_search_payload(
         "kind": "code_index_graph_search",
         "query": query,
         "scope": normalized_scope,
+        "path_scope": path_scope.to_dict() if path_scope is not None else None,
         "limit": safe_limit,
         "files": file_results,
         "transcripts": transcript_results,

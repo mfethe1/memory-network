@@ -1,0 +1,225 @@
+"""Configuration loading for the OpenClaw host daemon."""
+
+from __future__ import annotations
+
+import json
+import os
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+CONFIG_PATH_ENV = "OPENCLAW_HOSTD_CONFIG"
+STATE_DIR_ENV = "OPENCLAW_HOSTD_STATE_DIR"
+HOST_IDENTITY_PATH_ENV = "OPENCLAW_HOSTD_HOST_ID_PATH"
+REPO_ROOTS_ENV = "OPENCLAW_HOSTD_REPO_ROOTS"
+GRAPH_SERVER_URL_ENV = "OPENCLAW_HOSTD_GRAPH_SERVER_URL"
+GRAPH_SERVER_TOKEN_ENV = "OPENCLAW_HOSTD_GRAPH_SERVER_TOKEN"
+SSH_HOSTNAME_ENV = "OPENCLAW_HOSTD_SSH_HOSTNAME"
+HEARTBEAT_INTERVAL_ENV = "OPENCLAW_HOSTD_HEARTBEAT_INTERVAL_SECONDS"
+NATS_URL_ENV = "OPENCLAW_HOSTD_NATS_URL"
+HOST_ALIASES_ENV = "OPENCLAW_HOSTD_HOST_ALIASES"
+FLEET_LEASE_STORE_PATH_ENV = "OPENCLAW_HOSTD_FLEET_LEASE_STORE_PATH"
+CONTEXT_STORE_PATH_ENV = "OPENCLAW_HOSTD_CONTEXT_STORE_PATH"
+
+DEFAULT_GRAPH_SERVER_URL = "http://127.0.0.1:8767/health"
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30
+
+
+@dataclass(frozen=True)
+class HostDaemonConfig:
+    state_dir: Path
+    host_identity_path: Path
+    repo_roots: tuple[Path, ...]
+    host_aliases: tuple[str, ...] = ()
+    graph_server_url: str | None = DEFAULT_GRAPH_SERVER_URL
+    graph_server_token: str | None = field(default=None, repr=False)
+    ssh_hostname: str | None = None
+    heartbeat_interval_seconds: int = DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+    nats_url: str | None = field(default=None, repr=False)
+    fleet_lease_store_path: Path | None = None
+    context_store_path: Path | None = None
+    config_path: Path | None = None
+
+
+def _default_state_dir() -> Path:
+    return Path.home() / ".code_index" / "openclaw_hostd"
+
+
+def _read_json_config(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"OpenClaw host daemon config not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path}: OpenClaw host daemon config must be a JSON object")
+    return payload
+
+
+def _optional_path(value: Any) -> Path | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return Path(value).expanduser()
+
+
+def _path_tuple(value: Any, *, default: tuple[Path, ...]) -> tuple[Path, ...]:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        values = [part for part in value.split(os.pathsep) if part.strip()]
+    elif isinstance(value, list):
+        values = value
+    else:
+        raise ValueError("repo_roots must be a list of paths or pathsep string")
+    paths: list[Path] = []
+    for item in values:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("repo_roots entries must be non-empty strings")
+        paths.append(Path(item).expanduser())
+    return tuple(paths)
+
+
+def _positive_int(value: Any, *, default: int) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _text_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("expected a string value")
+    return value.strip() or None
+
+
+def normalize_host_aliases(
+    value: Any,
+    *,
+    field_name: str = "host_aliases",
+) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"{field_name} must be a string, JSON list, or comma-separated list"
+                ) from exc
+            return normalize_host_aliases(parsed, field_name=field_name)
+        values: list[Any] = text.split(",")
+    elif isinstance(value, list | tuple):
+        values = list(value)
+    else:
+        raise ValueError(f"{field_name} must be a string or list of strings")
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if not isinstance(item, str):
+            raise ValueError(f"{field_name} entries must be strings")
+        alias = item.strip().lower()
+        if not alias:
+            continue
+        if any(character.isspace() for character in alias):
+            raise ValueError(f"{field_name} entries may not contain whitespace")
+        if any(character in alias for character in ("@", "/", "\\", "*", ">")):
+            raise ValueError(
+                f"{field_name} entries may not contain @, path separators, or NATS wildcards"
+            )
+        if alias in seen:
+            continue
+        seen.add(alias)
+        aliases.append(alias)
+    return tuple(aliases)
+
+
+def load_config(
+    config_path: str | os.PathLike[str] | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+) -> HostDaemonConfig:
+    environ = os.environ if env is None else env
+    selected_config_path = _optional_path(
+        str(config_path) if config_path is not None else environ.get(CONFIG_PATH_ENV)
+    )
+    data: dict[str, Any] = {}
+    if selected_config_path is not None:
+        data = _read_json_config(selected_config_path)
+
+    state_dir = _optional_path(environ.get(STATE_DIR_ENV)) or _optional_path(
+        data.get("state_dir")
+    )
+    state_dir = state_dir or _default_state_dir()
+
+    host_identity_path = _optional_path(environ.get(HOST_IDENTITY_PATH_ENV))
+    if host_identity_path is None:
+        host_identity_path = _optional_path(data.get("host_identity_path"))
+    host_identity_path = host_identity_path or state_dir / "host-identity.json"
+
+    root_default = (cwd or Path.cwd(),)
+    repo_roots = _path_tuple(data.get("repo_roots"), default=root_default)
+    if environ.get(REPO_ROOTS_ENV):
+        repo_roots = _path_tuple(environ.get(REPO_ROOTS_ENV), default=repo_roots)
+    host_aliases = normalize_host_aliases(data.get("host_aliases"))
+    if HOST_ALIASES_ENV in environ:
+        host_aliases = normalize_host_aliases(
+            environ.get(HOST_ALIASES_ENV),
+            field_name=HOST_ALIASES_ENV,
+        )
+
+    graph_server_url = _text_or_none(
+        environ.get(
+            GRAPH_SERVER_URL_ENV,
+            data.get("graph_server_url", DEFAULT_GRAPH_SERVER_URL),
+        )
+    )
+    graph_server_token = _text_or_none(
+        environ.get(GRAPH_SERVER_TOKEN_ENV, data.get("graph_server_token"))
+    )
+    ssh_hostname = _text_or_none(
+        environ.get(SSH_HOSTNAME_ENV, data.get("ssh_hostname"))
+    )
+    heartbeat_interval_seconds = _positive_int(
+        environ.get(
+            HEARTBEAT_INTERVAL_ENV,
+            data.get("heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS),
+        ),
+        default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    )
+    nats_url = _text_or_none(environ.get(NATS_URL_ENV, data.get("nats_url")))
+    fleet_lease_store_path = _optional_path(
+        environ.get(FLEET_LEASE_STORE_PATH_ENV)
+    )
+    if fleet_lease_store_path is None:
+        fleet_lease_store_path = _optional_path(data.get("fleet_lease_store_path"))
+    fleet_lease_store_path = fleet_lease_store_path or state_dir / "fleet-leases.db"
+    context_store_path = _optional_path(environ.get(CONTEXT_STORE_PATH_ENV))
+    if context_store_path is None:
+        context_store_path = _optional_path(data.get("context_store_path"))
+
+    return HostDaemonConfig(
+        state_dir=state_dir,
+        host_identity_path=host_identity_path,
+        repo_roots=tuple(repo_roots),
+        host_aliases=host_aliases,
+        graph_server_url=graph_server_url,
+        graph_server_token=graph_server_token,
+        ssh_hostname=ssh_hostname,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+        nats_url=nats_url,
+        fleet_lease_store_path=fleet_lease_store_path,
+        context_store_path=context_store_path,
+        config_path=selected_config_path,
+    )

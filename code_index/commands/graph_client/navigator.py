@@ -74,16 +74,22 @@ GRAPH_SCRIPT_NAVIGATOR = r"""function renderNavigator() {
       if (!button.disabled) archiveAgentRun(button.dataset.archiveRun, button);
     });
   });
+  document.querySelectorAll("[data-accept-review-run]").forEach(button => {
+    button.addEventListener("click", event => {
+      event.stopPropagation();
+      if (!button.disabled) acceptAgentRunReview(button.dataset.acceptReviewRun, button);
+    });
+  });
   document.querySelectorAll("[data-run-details]").forEach(button => {
     button.addEventListener("click", event => {
       event.stopPropagation();
-      if (!button.disabled) showRunTranscript(button.dataset.runDetails, button);
+      if (!button.disabled) showRunTranscript(button.dataset.runDetails, button, { focusComposer: true });
     });
   });
   document.querySelectorAll("[data-search-run]").forEach(button => {
     button.addEventListener("click", event => {
       event.stopPropagation();
-      if (!button.disabled) showRunTranscript(button.dataset.searchRun, button);
+      if (!button.disabled) showRunTranscript(button.dataset.searchRun, button, { focusComposer: true });
     });
   });
 }
@@ -200,14 +206,22 @@ function taskBoardRunHtml(run, column) {
   const blockers = (run.blocked_by || []).filter(item => String(item.status || "").toLowerCase() === "active");
   const health = run.run_health || {};
   const label = run.prompt || run.run_id;
+  const reviewable = isReviewStatus(run.status);
   const badge = blockers.length
     ? `${blockers.length} blocker${blockers.length === 1 ? "" : "s"}`
-    : `${run.agent_name || "Agent"} · ${health.health || run.status || column}`;
-  return `
+    : `${run.agent_name || "Agent"} · ${runHealthSummary(run, health.health || run.status || column)}`;
+  const card = `
     <button class="task-card ${escapeHtml(health.health || "")}" data-run-details="${escapeHtml(run.run_id)}" type="button" title="${escapeHtml(label)}">
       <span>${escapeHtml(label)}</span>
       <em>${escapeHtml(badge)}</em>
     </button>
+  `;
+  if (!reviewable) return card;
+  return `
+    <div class="task-card-row">
+      ${card}
+      <button class="task-card-action" data-accept-review-run="${escapeHtml(run.run_id)}" type="button" title="Approve reviewed work">Approve</button>
+    </div>
   `;
 }
 function renderSearchResults() {
@@ -263,6 +277,10 @@ function uniqueRuns(runs) {
 function isTerminalStatus(status) {
   return terminalRunStatuses.has(String(status || "").toLowerCase());
 }
+function isReviewStatus(status) {
+  const value = String(status || "").toLowerCase();
+  return value === "review" || value === "needs_review" || value === "needs-review";
+}
 function activeRunIds() {
   return new Set(((data.agent && data.agent.active_runs) || [])
     .map(run => run && run.run_id)
@@ -273,20 +291,36 @@ function runDisplayStatus(run) {
   if (isTerminalStatus(status) || !run || !run.run_id) return status;
   return activeRunIds().has(run.run_id) ? status : `stale ${status}`;
 }
+function runHealthSummary(run, fallback = "") {
+  const health = (run && run.run_health) || {};
+  const parts = [];
+  const primary = String(health.health || fallback || (run && run.status) || "working").replaceAll("_", " ");
+  if (primary) parts.push(primary);
+  const liveness = String(health.process_liveness || "").replaceAll("_", " ");
+  if (liveness && liveness !== "unknown") parts.push(liveness);
+  const verification = String(health.verification_state || "").replaceAll("_", " ");
+  if (verification && verification !== "not run") parts.push(verification);
+  const claimCount = Number(health.active_claim_count || 0);
+  if (claimCount > 0) parts.push(`${claimCount} claim${claimCount === 1 ? "" : "s"}`);
+  return parts.join(" · ");
+}
 function runRowHtml(run) {
   const status = run.status || "working";
   const displayStatus = runDisplayStatus(run);
+  const healthSummary = runHealthSummary(run, displayStatus);
   const label = run.prompt || run.run_id;
   const cancelable = !isTerminalStatus(status);
+  const reviewable = isReviewStatus(status);
   const active = selectedRunTranscript && selectedRunTranscript.run && selectedRunTranscript.run.run_id === run.run_id ? " active" : "";
   return `
-    <div class="run-row${active}" title="${escapeHtml(`${run.agent_name || "Agent"} ${displayStatus}: ${label}`)}">
+    <div class="run-row${active}" title="${escapeHtml(`${run.agent_name || "Agent"} ${healthSummary}: ${label}`)}">
       <button class="run-select" data-run-details="${escapeHtml(run.run_id)}" type="button" title="Open agent terminal stream">
         <span class="nav-icon">${escapeHtml(displayStatus.slice(0, 1).toUpperCase())}</span>
         <span class="nav-name">${escapeHtml(label)}</span>
-        <span class="nav-badge">${escapeHtml(run.agent_name || "Agent")} · ${escapeHtml(displayStatus)}</span>
+        <span class="nav-badge">${escapeHtml(run.agent_name || "Agent")} · ${escapeHtml(healthSummary)}</span>
       </button>
-      <button class="run-detail" data-run-details="${escapeHtml(run.run_id)}" type="button" title="View run stream">Stream</button>
+      <button class="run-detail" data-run-details="${escapeHtml(run.run_id)}" type="button" title="View run stream">${reviewable ? "Review" : "Stream"}</button>
+      ${reviewable ? `<button class="run-accept" data-accept-review-run="${escapeHtml(run.run_id)}" type="button" title="Approve reviewed work">Approve</button>` : ""}
       <button class="run-cancel" data-cancel-run="${escapeHtml(run.run_id)}" type="button"${cancelable ? "" : " disabled aria-disabled=\"true\""} title="Cancel run">Cancel</button>
       <button class="run-archive" data-archive-run="${escapeHtml(run.run_id)}" type="button" title="Archive run from the sidebar">Archive</button>
     </div>

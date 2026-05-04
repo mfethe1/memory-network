@@ -131,7 +131,72 @@ def test_graph_server_subparser_exists():
     from code_index.cli import build_parser
 
     parser = build_parser()
-    ns = parser.parse_args(["graph-server", "--port", "8767", "--quiet"])
+    ns = parser.parse_args(
+        ["graph-server", "--port", "8767", "--scope", "pkg", "--quiet"]
+    )
     assert ns.command == "graph-server"
     assert ns.port == 8767
+    assert ns.scope == "pkg"
     assert ns.quiet is True
+
+
+def test_context_subparser_accepts_scope():
+    from code_index.cli import build_parser
+
+    parser = build_parser()
+    ns = parser.parse_args(["context", "--scope", "pkg", "fix scoped package"])
+    assert ns.command == "context"
+    assert ns.scope == "pkg"
+    assert ns.task == "fix scoped package"
+
+
+def test_agent_plugin_start_subparser_accepts_root_scope_provider():
+    from code_index.cli import build_parser
+
+    parser = build_parser()
+    ns = parser.parse_args(
+        [
+            "agent-plugin",
+            "start",
+            "--root",
+            ".",
+            "--scope",
+            "pkg",
+            "--provider",
+            "codex",
+            "--check-only",
+            "--json",
+        ]
+    )
+    assert ns.command == "agent-plugin"
+    assert ns.agent_plugin_action == "start"
+    assert ns.root == "."
+    assert ns.scope == "pkg"
+    assert ns.provider == "codex"
+    assert ns.check_only is True
+
+
+def test_agent_plugin_start_check_only_reports_scope(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    (tmp_path / "pkg").mkdir()
+
+    rc = main(
+        [
+            "agent-plugin",
+            "start",
+            "--root",
+            str(tmp_path),
+            "--scope",
+            "pkg",
+            "--skip-provider-check",
+            "--check-only",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["kind"] == "code_index_agent_plugin_check"
+    assert payload["root"] == str(tmp_path.resolve())
+    assert payload["scope"] == "pkg"

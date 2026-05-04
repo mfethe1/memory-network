@@ -56,3 +56,17 @@ Architecture notes:
 - The graph HTTP server uses a lightweight `Router`/`Route` abstraction
   (`commands/graph_server_router.py`) instead of long if/else chains. Routes match
   method + path with `{param}` extraction and are resolved in registration order.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked in GitHub Issues for `mfethe1/memory-network`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The canonical triage label strings are used unchanged. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repo with `CONTEXT.md` at the root. See `docs/agents/domain.md`.

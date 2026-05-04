@@ -14,7 +14,8 @@ is strongest in these workflows:
 - auditing run transcripts and decisions during long tasks
 - getting parser diagnostics and affected-test commands when a run completes
 - cancelling a runaway local agent process from the UI
-- exposing the same context layer to Claude, Codex, and MCP-capable tools
+- exposing the same context layer to Codex, Claude, Kimi, OpenCode, and
+  MCP-capable tools
 
 It is less useful for tiny repos, one-file tasks, or teams that only need a
 static search index. The graph control plane matters once there is enough task
@@ -34,7 +35,8 @@ state to supervise.
   files, affected pytest node ids, or a broader-test warning when no edges are
   known.
 - `code_index agent-adapter --mode command` can launch a configured local
-  Claude/Codex/other command and stream stdout/stderr back to the graph.
+  Codex/Claude/Kimi/OpenCode/custom command and stream stdout/stderr back to
+  the graph.
   Structured JSON or prefixed output lines become read/edit/test/status events.
 - `plugins/code-index-agent/scripts/install_plugin.py` writes repo-local MCP,
   Claude settings, launcher config, starter scripts, and a demo task.
@@ -43,9 +45,11 @@ state to supervise.
 - `plugins/code-index-agent/scripts/start_graph_server.py --root <dir>` can
   target any local directory, initialize a missing `.code_index/index.db`, and
   launch the live graph using this source tree through `PYTHONPATH`.
-- `CODE_INDEX_AGENT_PROVIDER=claude` and `CODE_INDEX_AGENT_PROVIDER=codex`
-  provide built-in local command presets; `CODE_INDEX_AGENT_COMMAND` remains
-  the escape hatch for other systems.
+- `CODE_INDEX_AGENT_PROVIDER=codex`, `claude`, `kimi`, and `opencode` provide
+  built-in local command presets; `CODE_INDEX_AGENT_COMMAND` remains the
+  escape hatch for other systems.
+- `code_index agent-adapter --list-providers --json` exposes the active
+  provider registry for Codex plugins, launcher UIs, and external wrappers.
 - `plugins/code-index-agent` packages the MCP config, skill instructions, and
   graph-server launcher for repo-local plugin use.
 

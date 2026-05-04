@@ -242,7 +242,7 @@ GRAPH_CSS = r"""
     }
     .run-row {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto auto;
+      grid-template-columns: minmax(0, 1fr) auto auto auto auto;
       align-items: center;
       gap: 4px;
       border-radius: 5px;
@@ -296,6 +296,7 @@ GRAPH_CSS = r"""
       grid-column: 2;
     }
     .run-detail,
+    .run-accept,
     .run-cancel,
     .run-archive {
       height: 24px;
@@ -309,12 +310,14 @@ GRAPH_CSS = r"""
       cursor: pointer;
     }
     .run-detail:hover:not(:disabled),
+    .run-accept:hover:not(:disabled),
     .run-cancel:hover:not(:disabled),
     .run-archive:hover:not(:disabled) {
       color: var(--ink);
       border-color: var(--line-strong);
     }
     .run-detail:disabled,
+    .run-accept:disabled,
     .run-cancel:disabled,
     .run-archive:disabled,
     .run-select:disabled {
@@ -393,6 +396,32 @@ GRAPH_CSS = r"""
     }
     .task-card + .task-card {
       margin-top: 4px;
+    }
+    .task-card-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 4px;
+      align-items: stretch;
+    }
+    .task-card-row + .task-card-row,
+    .task-card + .task-card-row,
+    .task-card-row + .task-card {
+      margin-top: 4px;
+    }
+    .task-card-action {
+      min-height: 32px;
+      border: 1px solid rgba(255, 209, 102, 0.55);
+      border-radius: 5px;
+      background: rgba(255, 209, 102, 0.08);
+      color: var(--ink);
+      font: inherit;
+      font-size: 10px;
+      padding: 0 7px;
+      cursor: pointer;
+    }
+    .task-card-action:hover:not(:disabled) {
+      border-color: rgba(255, 209, 102, 0.85);
+      background: rgba(255, 209, 102, 0.14);
     }
     .task-card span,
     .task-card em {
@@ -495,6 +524,10 @@ GRAPH_CSS = r"""
       stroke-opacity: 0.75;
       stroke-dasharray: 5 5;
     }
+    .edge.agent_derived {
+      stroke-opacity: 0.62;
+      stroke-linecap: round;
+    }
     .community-label {
       pointer-events: none;
     }
@@ -550,18 +583,27 @@ GRAPH_CSS = r"""
     .node .agent-work-bubble {
       cursor: pointer;
     }
-    .node .agent-work-bubble rect,
-    .node.active .agent-work-bubble rect {
+    .node .agent-work-bubble .agent-work-bg {
       fill: rgba(13, 17, 23, 0.94);
       stroke: var(--focus);
-      stroke-width: 1px;
-      filter: drop-shadow(0 3px 10px rgba(0,0,0,0.36));
+      stroke-width: 1.5px;
+      filter: drop-shadow(0 2px 4px rgba(0,0,0,0.4));
+    }
+    .node .agent-work-bubble.is-edit .agent-work-bg {
+      stroke: #ffd166;
+    }
+    .node .agent-work-bubble.is-test .agent-work-bg {
+      stroke: #9fd07f;
+    }
+    .node .agent-work-bubble.is-tool .agent-work-bg,
+    .node .agent-work-bubble.is-navigate .agent-work-bg {
+      stroke: #5dd4c6;
     }
     .node .agent-work-bubble text {
       pointer-events: none;
       paint-order: normal;
       stroke: none;
-      dominant-baseline: auto;
+      dominant-baseline: central;
     }
     .node .agent-work-pulse {
       fill: var(--focus);
@@ -580,28 +622,14 @@ GRAPH_CSS = r"""
     .node .agent-work-bubble.is-navigate .agent-work-pulse {
       fill: #5dd4c6;
     }
-    .node .agent-work-name {
-      fill: var(--ink);
-      font-size: 11px;
-      font-weight: 700;
-      animation: agent-work-word 1.35s ease-in-out infinite;
-    }
-    .node .agent-work-message {
-      fill: var(--muted);
-      font-size: 10px;
-    }
-    .node .agent-work-bubble:hover rect,
-    .node .agent-work-bubble:focus rect {
+    .node .agent-work-bubble:hover .agent-work-bg,
+    .node .agent-work-bubble:focus .agent-work-bg {
       stroke: #f0f6fc;
       fill: #111827;
     }
     @keyframes agent-work-pulse {
       0%, 100% { opacity: 0.45; transform: scale(0.85); }
       45% { opacity: 1; transform: scale(1.25); }
-    }
-    @keyframes agent-work-word {
-      0%, 100% { fill: var(--ink); }
-      50% { fill: #58a6ff; }
     }
     .node.dim,
     .edge.dim {
@@ -1034,6 +1062,68 @@ GRAPH_CSS = r"""
       display: grid;
       gap: 10px;
     }
+    .context-basket {
+      min-height: 28px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+    .context-chip {
+      min-width: 0;
+      max-width: 100%;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid rgba(93,212,198,0.45);
+      border-radius: 999px;
+      background: rgba(93,212,198,0.12);
+      color: #b8fff7;
+      padding: 4px 8px;
+      font-size: 12px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
+    .context-chip-remove {
+      border: 0;
+      border-radius: 999px;
+      background: transparent;
+      color: inherit;
+      padding: 0 3px;
+      cursor: pointer;
+      font-size: 14px;
+      line-height: 1;
+    }
+    .find-results {
+      display: grid;
+      gap: 6px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+      padding: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .find-results[hidden] {
+      display: none;
+    }
+    .find-result-row {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 6px;
+      align-items: center;
+    }
+    .find-result-row code {
+      color: var(--ink);
+      overflow-wrap: anywhere;
+    }
+    .find-kind,
+    .find-file {
+      color: var(--muted);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
     .agent-focus {
       border-bottom: 1px solid var(--line);
       padding-bottom: 14px;
@@ -1451,6 +1541,58 @@ GRAPH_CSS = r"""
       text-transform: uppercase;
       letter-spacing: 0.08em;
     }
+    .run-file-list,
+    .run-command-list {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+    .run-file-button,
+    .run-command-row {
+      min-width: 0;
+      display: grid;
+      gap: 3px;
+      width: 100%;
+      border: 1px solid #202934;
+      border-radius: 6px;
+      padding: 6px 7px;
+      background: #0a0f16;
+      color: var(--ink);
+      text-align: left;
+      font: inherit;
+    }
+    .run-file-button {
+      cursor: pointer;
+    }
+    .run-file-button:hover {
+      border-color: var(--focus);
+      background: rgba(88, 166, 255, 0.09);
+    }
+    .run-file-button.missing {
+      cursor: not-allowed;
+      color: var(--muted);
+      opacity: 0.75;
+    }
+    .run-file-button span,
+    .run-command-row span {
+      color: var(--muted);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+    .run-file-button strong,
+    .run-command-row code {
+      min-width: 0;
+      color: var(--ink);
+      font-size: 12px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+    .run-command-row code {
+      background: transparent;
+      padding: 0;
+      border: 0;
+    }
     .terminal-body {
       max-height: min(52vh, 560px);
       overflow-y: auto;
@@ -1473,9 +1615,44 @@ GRAPH_CSS = r"""
       border-top: 1px solid #202934;
       background: #0a0f16;
     }
+    .thread-history {
+      display: grid;
+      gap: 5px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 7px 8px;
+      background: rgba(88, 166, 255, 0.06);
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .thread-history strong {
+      color: var(--ink);
+      font-size: 11px;
+    }
+    .thread-history-item {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 7px;
+      min-width: 0;
+    }
+    .thread-history-time {
+      color: var(--focus);
+      white-space: nowrap;
+    }
+    .thread-history-text {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .terminal-composer .actions {
       margin-top: 0;
       align-items: center;
+    }
+    .keyboard-hint {
+      color: var(--muted);
+      font-size: 11px;
     }
     .terminal-target {
       grid-template-columns: minmax(0, 1fr);

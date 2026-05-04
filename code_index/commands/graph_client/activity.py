@@ -186,11 +186,55 @@ function notePayload() {
 function taskPayload(node) {
   return agentTaskPayload(node, noteText(node));
 }
+function contextBasketLabel(path) {
+  const parts = String(path || "").split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : String(path || "");
+}
+function addToContextBasket(path) {
+  const clean = String(path || "").trim();
+  if (!clean || selectedContextPaths.includes(clean)) return;
+  selectedContextPaths.push(clean);
+  renderContextBasket();
+}
+function removeFromContextBasket(path) {
+  selectedContextPaths = selectedContextPaths.filter(item => item !== path);
+  renderContextBasket();
+}
+function renderContextBasket() {
+  const container = document.getElementById("context-basket");
+  if (!container) return;
+  container.innerHTML = "";
+  if (!selectedContextPaths.length) {
+    const empty = document.createElement("span");
+    empty.className = "inline-status";
+    empty.textContent = "No files selected.";
+    container.appendChild(empty);
+    return;
+  }
+  selectedContextPaths.forEach(path => {
+    const chip = document.createElement("span");
+    chip.className = "context-chip";
+    chip.title = path;
+    const label = document.createElement("span");
+    label.textContent = contextBasketLabel(path);
+    const remove = document.createElement("button");
+    remove.className = "context-chip-remove";
+    remove.type = "button";
+    remove.textContent = "x";
+    remove.setAttribute("aria-label", `Remove ${path}`);
+    remove.addEventListener("click", () => removeFromContextBasket(path));
+    chip.append(label, remove);
+    container.appendChild(chip);
+  });
+}
 function agentTaskPayload(node, message, options = {}) {
-  const selectedPaths = node.kind === "file"
+  const nodePaths = node.kind === "file"
     ? [node.path]
     : uniquePaths((node.metrics && ((node.metrics.active_files || []).concat(node.metrics.recent_files || []))) || []);
-  const provider = String(options.provider ?? "codex").trim().toLowerCase();
+  const selectedPaths = selectedContextPaths.length
+    ? uniquePaths(selectedContextPaths)
+    : nodePaths;
+  const provider = String(options.provider ?? defaultChatProvider()).trim().toLowerCase();
   const executionStrategy = String(options.executionStrategy || options.execution_strategy || "").trim().toLowerCase();
   const payload = {
     kind: "code_index_graph_agent_task",
@@ -199,6 +243,7 @@ function agentTaskPayload(node, message, options = {}) {
     agent_name: options.agentName || agentNameForProvider(provider),
     selected_nodes: [node.id],
     selected_paths: selectedPaths,
+    edit_policy: String(options.editPolicy || options.edit_policy || "review_before_edit"),
     message: message || noteText(node),
     node: {
       id: node.id,
@@ -223,6 +268,61 @@ function agentTaskPayload(node, message, options = {}) {
     }
   }
   return payload;
+}
+function parseChatCommand(message) {
+  const match = String(message || "").trim().match(/^\/find\s+(?:(function|type|method|class)\s+)?(.+)$/i);
+  if (!match) return null;
+  return {
+    command: "find",
+    kind: match[1] ? match[1].toLowerCase() : null,
+    query: match[2].trim()
+  };
+}
+async function handleFindCommand(cmd, status) {
+  const params = new URLSearchParams({ q: cmd.query, limit: "10" });
+  if (cmd.kind) params.set("kind", cmd.kind);
+  if (status) status.textContent = `Finding symbols for ${cmd.query}`;
+  const path = (data.live && data.live.symbols_path) || "/api/symbols";
+  const response = await fetchGraphGet(`${path}?${params.toString()}`);
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  renderFindResults(data.results || []);
+  if (status) {
+    status.textContent = data.results && data.results.length
+      ? `${data.results.length} symbol result${data.results.length === 1 ? "" : "s"}`
+      : "No symbols found.";
+  }
+}
+function renderFindResults(results) {
+  const panel = document.getElementById("find-results");
+  if (!panel) return;
+  panel.innerHTML = "";
+  panel.hidden = false;
+  const items = Array.isArray(results) ? results : [];
+  if (!items.length) {
+    panel.textContent = "No symbols found.";
+    return;
+  }
+  items.forEach(result => {
+    const row = document.createElement("div");
+    row.className = "find-result-row";
+    const symbol = document.createElement("code");
+    symbol.textContent = result.canonical_name || result.display_name || "symbol";
+    const kind = document.createElement("span");
+    kind.className = "find-kind";
+    kind.textContent = result.symbol_kind || result.kind || "";
+    const file = document.createElement("span");
+    file.className = "find-file";
+    file.textContent = `${result.def_file || ""}:${result.def_line || ""}`;
+    const addButton = document.createElement("button");
+    addButton.className = "small-button";
+    addButton.type = "button";
+    addButton.textContent = "+ context";
+    addButton.disabled = !result.def_file;
+    addButton.addEventListener("click", () => addToContextBasket(result.def_file));
+    row.append(symbol, kind, file, addButton);
+    panel.appendChild(row);
+  });
 }
 async function postAgentTaskToServer(payload) {
   if (!canPostToGraphServer()) {
@@ -356,6 +456,48 @@ async function archiveAgentRun(runId, button) {
       button.disabled = false;
       button.textContent = err.message || original || "Archive";
       setTimeout(() => { button.textContent = original || "Archive"; }, 1200);
+    }
+  }
+}
+async function acceptAgentRunReview(runId, button) {
+  if (!runId || !canPostToGraphServer()) return;
+  const original = button ? button.textContent : "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Approving";
+  }
+  try {
+    const response = await fetchGraphPost(`/api/agent-runs/${encodeURIComponent(runId)}/accept-review`, {
+      decision: "Reviewed the changed files and accepted the work."
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error || `HTTP ${response.status}`);
+    }
+    if (selectedRunTranscript && selectedRunTranscript.run && selectedRunTranscript.run.run_id === runId) {
+      selectedRunTranscript.run = {
+        ...selectedRunTranscript.run,
+        ...result.run
+      };
+      if (result.event) {
+        const byIdentity = new Map((selectedRunTranscript.events || []).map(event => [eventIdentity(event), event]));
+        byIdentity.set(eventIdentity(result.event), result.event);
+        selectedRunTranscript.events = sortTranscriptEvents([...byIdentity.values()]);
+        selectedRunTranscript.decisions = selectedRunTranscript.events.filter(event => event.event_type === "decision");
+        selectedRunTranscript.summary = recomputeTranscriptSummary(selectedRunTranscript);
+        selectedRunTranscript.summaries = selectedRunTranscript.summary;
+      }
+      if (result.suggestions) selectedRunTranscript.suggestions = result.suggestions;
+    }
+    applyAgentRunResponse(result);
+    if (selectedRunTranscript && selectedRunTranscript.run && selectedRunTranscript.run.run_id === runId) {
+      renderInspector();
+    }
+  } catch (err) {
+    if (button) {
+      button.disabled = false;
+      button.textContent = err.message || original || "Approve";
+      setTimeout(() => { button.textContent = original || "Approve"; }, 1600);
     }
   }
 }
@@ -578,10 +720,79 @@ function transcriptFiles(run, events, existing = []) {
       .concat((events || []).map(event => event.file_path).filter(Boolean))
   );
 }
+function commandFromEvent(event) {
+  const payload = (event && event.payload) || {};
+  const raw = payload.command || payload.cmd || payload.invocation || "";
+  if (Array.isArray(raw)) {
+    return raw.filter(Boolean).map(part => String(part)).join(" ").trim();
+  }
+  const command = String(raw || "").trim();
+  if (command) return command;
+  const type = String((event && event.event_type) || "").toLowerCase();
+  if (type === "tool" || type === "test") return String(event.message || "").trim();
+  return "";
+}
+function transcriptCommands(events) {
+  const rows = [];
+  const seen = new Set();
+  (events || []).forEach(event => {
+    const type = String((event && event.event_type) || "").toLowerCase();
+    if (!["tool", "test", "status"].includes(type)) return;
+    const command = commandFromEvent(event);
+    if (!command) return;
+    const payload = event.payload || {};
+    const key = `${type}|${event.timestamp || ""}|${command}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    rows.push({
+      event_pk: event.event_pk,
+      event_type: type,
+      timestamp: event.timestamp || "",
+      file_path: event.file_path || null,
+      command,
+      message: event.message || "",
+      status: payload.status || event.run_status || "",
+      exit_code: payload.exit_code
+    });
+  });
+  return rows;
+}
+function transcriptEdits(events) {
+  return (events || [])
+    .filter(event => event && event.event_type === "edit" && event.file_path)
+    .map(event => ({
+      event_pk: event.event_pk,
+      timestamp: event.timestamp || "",
+      file_path: event.file_path,
+      symbol_path: event.symbol_path || null,
+      message: event.message || "",
+      payload: event.payload || {}
+    }));
+}
+function transcriptChangedFiles(events, existing = []) {
+  const changed = [];
+  function add(path) {
+    if (path && !changed.includes(path)) changed.push(path);
+  }
+  (existing || []).forEach(add);
+  (events || []).forEach(event => {
+    if (!event) return;
+    if (event.event_type === "edit") add(event.file_path);
+    const payload = event.payload || {};
+    const payloadFiles = []
+      .concat(payload.changed_files || [])
+      .concat(payload.changed_file ? [payload.changed_file] : []);
+    payloadFiles.forEach(add);
+  });
+  return uniquePaths(changed);
+}
 function recomputeTranscriptSummary(transcript) {
   const previous = transcript.summary || {};
   const events = transcript.events || [];
   const decisions = events.filter(event => event.event_type === "decision");
+  const edits = transcriptEdits(events);
+  const commands = transcriptCommands(events);
+  const changedFiles = transcriptChangedFiles(events, previous.changed_files || transcript.changed_files || []);
   const eventTypes = {};
   const filesTouched = [];
   events.forEach(event => {
@@ -600,7 +811,10 @@ function recomputeTranscriptSummary(transcript) {
     first_event_at: events.length ? events[0].timestamp : (previous.first_event_at || null),
     last_event_at: events.length ? events[events.length - 1].timestamp : (previous.last_event_at || null),
     event_types: eventTypes,
-    files_touched: filesTouched
+    files_touched: filesTouched,
+    changed_files: changedFiles,
+    edit_count: edits.length,
+    command_count: commands.length
   };
 }
 function openRunTranscriptFromResponse(result) {
@@ -618,6 +832,9 @@ function openRunTranscriptFromResponse(result) {
     events,
     decisions: events.filter(event => event.event_type === "decision"),
     active_files: transcriptFiles(result.run, events),
+    changed_files: transcriptChangedFiles(events),
+    commands: transcriptCommands(events),
+    edits: transcriptEdits(events),
     suggestions: result.suggestions || null,
     summary: {}
   };
@@ -652,6 +869,12 @@ function updateSelectedTranscriptFromSnapshot(snapshot) {
       selectedRunTranscript.events,
       selectedRunTranscript.active_files || []
     );
+    selectedRunTranscript.changed_files = transcriptChangedFiles(
+      selectedRunTranscript.events,
+      selectedRunTranscript.changed_files || []
+    );
+    selectedRunTranscript.commands = transcriptCommands(selectedRunTranscript.events);
+    selectedRunTranscript.edits = transcriptEdits(selectedRunTranscript.events);
     selectedRunTranscript.summary = recomputeTranscriptSummary(selectedRunTranscript);
     selectedRunTranscript.summaries = selectedRunTranscript.summary;
     changed = true;
@@ -697,6 +920,70 @@ function applyAgentRunResponse(result) {
     }
   });
 }
+function dynamicEdgeFromRelationship(relationship, index) {
+  const sourcePath = String((relationship && relationship.source) || "");
+  const targetPath = String((relationship && relationship.target) || "");
+  if (!sourcePath || !targetPath || sourcePath === targetPath) return null;
+  const source = fileNodeId(sourcePath);
+  const target = fileNodeId(targetPath);
+  const sourceNode = nodeById.get(source);
+  const targetNode = nodeById.get(target);
+  if (!sourceNode || !targetNode) return null;
+  return {
+    id: `edge:agent-live:${index}:${source}:${target}`,
+    source,
+    target,
+    kind: "agent_derived",
+    weight: Math.max(1, Number(relationship.observations || 1)),
+    label: "agent_derived",
+    detail: {
+      confidence: relationship.confidence,
+      observations: relationship.observations,
+      rationale: relationship.rationale || "Agents navigated between these files."
+    },
+    sourceNode,
+    targetNode
+  };
+}
+function mergeDynamicEdges(relationships) {
+  if (!Array.isArray(relationships)) return false;
+  const nextDynamicEdges = relationships
+    .map(dynamicEdgeFromRelationship)
+    .filter(Boolean);
+  const nextSignature = nextDynamicEdges
+    .map(edge => `${edge.source}:${edge.target}:${edge.weight}`)
+    .sort()
+    .join("|");
+  const currentSignature = edges
+    .filter(edge => edge.kind === "agent_derived")
+    .map(edge => `${edge.source}:${edge.target}:${edge.weight}`)
+    .sort()
+    .join("|");
+  if (nextSignature === currentSignature) return false;
+  const serialDynamicEdges = nextDynamicEdges.map(edge => ({
+    id: edge.id,
+    source: edge.source,
+    target: edge.target,
+    kind: edge.kind,
+    weight: edge.weight,
+    label: edge.label,
+    detail: edge.detail
+  }));
+  edges = edges.filter(edge => edge.kind !== "agent_derived").concat(nextDynamicEdges);
+  data.edges = ((data.edges || []).filter(edge => edge.kind !== "agent_derived")).concat(serialDynamicEdges);
+  data.summary = data.summary || {};
+  data.summary.edge_count = data.edges.length;
+  data.summary.relation_edge_count = data.edges.filter(edge => edge.kind !== "contains").length;
+  graphAdjacencyCache = null;
+  neighborhoodCache = null;
+  return true;
+}
+function handleConnectionSnapshot(payload) {
+  if (!payload || typeof payload !== "object") return;
+  if (mergeDynamicEdges(payload.derived_relationships || [])) {
+    scheduleAgentGraphRefresh();
+  }
+}
 function handleAgentSnapshot(snapshot) {
   if (!snapshot || !snapshot.agent) return;
   data.agent = {
@@ -720,8 +1007,7 @@ function handleAgentSnapshot(snapshot) {
   const transcriptChanged = updateSelectedTranscriptFromSnapshot(snapshot);
   updateActivityTrail();
   updateNodeActivityFromData();
-  renderActivityTrailEdges();
-  updateVisibility();
+  scheduleAgentGraphRefresh();
   renderNavigator();
   const terminalOpen = !!document.getElementById("terminal-stream-body");
   if (selectedRunTranscript && terminalOpen) {

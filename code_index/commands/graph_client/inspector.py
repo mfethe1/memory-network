@@ -157,6 +157,44 @@ function terminalCursorHtml(transcript) {
 function terminalEmptyHtml(transcript) {
   return `<p class="empty">No terminal output recorded for this run yet.</p>${terminalCursorHtml(transcript)}`;
 }
+function runMessageHistoryKey(runId) {
+  return `code_index_graph_run_history:${data.root}:${runId || "unknown"}`;
+}
+function loadRunMessageHistory(runId) {
+  try {
+    const raw = localStorage.getItem(runMessageHistoryKey(runId));
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.slice(-3) : [];
+  } catch (_err) {
+    return [];
+  }
+}
+function saveRunMessageHistory(runId, message) {
+  try {
+    const history = loadRunMessageHistory(runId);
+    history.push({ text: message, timestamp: new Date().toISOString() });
+    const trimmed = history.slice(-3);
+    localStorage.setItem(runMessageHistoryKey(runId), JSON.stringify(trimmed));
+  } catch (_err) {
+    // Storage may be full or private browsing.
+  }
+}
+function renderRunMessageHistory(runId) {
+  const history = loadRunMessageHistory(runId);
+  if (!history.length) return "";
+  const items = history.map(item => `
+    <div class="thread-history-item">
+      <span class="thread-history-time">${escapeHtml(new Date(item.timestamp).toLocaleTimeString())}</span>
+      <span class="thread-history-text">${escapeHtml(item.text)}</span>
+    </div>
+  `).join("");
+  return `
+    <div class="thread-history" id="run-thread-history">
+      <strong>Recent messages</strong>
+      ${items}
+    </div>
+  `;
+}
 function appendTerminalRows(body, transcript) {
   const run = (transcript && transcript.run) || {};
   const events = transcriptStreamEvents(transcript);
@@ -246,21 +284,75 @@ function bindSubmitOnEnter(messageBox, sendButton) {
     if (!sendButton.disabled) sendButton.click();
   });
 }
+function runFileButtons(paths, emptyText) {
+  const unique = uniquePaths(paths || []);
+  if (!unique.length) return `<p class="empty">${escapeHtml(emptyText)}</p>`;
+  return `
+    <div class="run-file-list">
+      ${unique.slice(0, 12).map(path => {
+        const id = fileNodeId(path);
+        const indexed = nodeById.has(id);
+        const disabled = indexed ? "" : " disabled aria-disabled=\"true\"";
+        return `
+          <button class="run-file-button${indexed ? "" : " missing"}" data-run-file-node="${escapeHtml(id)}" type="button"${disabled} title="${escapeHtml(path)}">
+            <span>${indexed ? "open" : "missing"}</span>
+            <strong>${escapeHtml(path)}</strong>
+          </button>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+function renderRunCommandRows(commands) {
+  const items = commands || [];
+  if (!items.length) return `<p class="empty">No commands recorded.</p>`;
+  return `
+    <div class="run-command-list">
+      ${items.slice(0, 8).map(item => `
+        <div class="run-command-row">
+          <code>${escapeHtml(item.command || item.message || "command")}</code>
+          <span>${escapeHtml([item.event_type || "tool", item.status || "", item.exit_code == null ? "" : `exit ${item.exit_code}`, item.timestamp || ""].filter(Boolean).join(" · "))}</span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+function renderRunEditRows(edits) {
+  const items = edits || [];
+  if (!items.length) return `<p class="empty">No edit events recorded.</p>`;
+  return `
+    <div class="run-command-list">
+      ${items.slice(0, 8).map(item => `
+        <div class="run-command-row">
+          <code>${escapeHtml(item.file_path || "edit")}</code>
+          <span>${escapeHtml([item.symbol_path || "", item.message || "", item.timestamp || ""].filter(Boolean).join(" · "))}</span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
 function renderRunTranscript(transcript) {
   const run = transcript.run || {};
   const events = transcript.events || [];
   const decisions = transcript.decisions || [];
   const files = transcript.active_files || [];
-  const suggestionItems = ((transcript.suggestions && transcript.suggestions.suggestions) || []);
   const summary = transcript.summary || {};
+  const changedFiles = uniquePaths((transcript.changed_files || []).concat(summary.changed_files || []));
+  const commands = transcript.commands || transcriptCommands(events);
+  const edits = transcript.edits || transcriptEdits(events);
+  const suggestionItems = ((transcript.suggestions && transcript.suggestions.suggestions) || []);
   const decisionRows = decisions.length
     ? decisions.slice(0, 8).map(event => `
         <li>${escapeHtml((event.payload && event.payload.decision) || event.message || "decision")}</li>
       `).join("")
     : `<li>No decisions recorded.</li>`;
-  const fileRows = files.length
-    ? files.slice(0, 12).map(path => `<li>${escapeHtml(path)}</li>`).join("")
-    : `<li>No active files reported.</li>`;
+  const fileRows = runFileButtons(files, "No active files reported.");
+  const changedFileRows = runFileButtons(changedFiles, "No edited files recorded.");
+  const commandRows = renderRunCommandRows(commands);
+  const editRows = renderRunEditRows(edits);
+  const reviewAction = isReviewStatus(run.status)
+    ? `<button class="small-button primary-action" id="accept-run-review" type="button">Approve reviewed work</button>`
+    : "";
   const suggestionRows = suggestionItems.length
     ? suggestionItems.slice(0, 8).map(item => {
         const command = item.command ? ` <code>${escapeHtml(item.command)}</code>` : "";
@@ -271,6 +363,8 @@ function renderRunTranscript(transcript) {
     `status ${run.status || "working"}`,
     `${summary.included_event_count || 0}/${summary.event_count || 0} events`,
     files.length ? `${files.length} file(s)` : "no files",
+    changedFiles.length ? `${changedFiles.length} edited` : null,
+    commands.length ? `${commands.length} command(s)` : null,
     decisions.length ? `${decisions.length} decision(s)` : null
   ].filter(Boolean).join(" · ");
   const activity = runActivitySummary(transcript);
@@ -300,13 +394,17 @@ function renderRunTranscript(transcript) {
       <details class="terminal-context" open>
         <summary>${escapeHtml(run.run_id || "run")} · ${escapeHtml(run.started_at || "")}</summary>
         <div class="terminal-context-grid">
-          <div><strong>Active Files</strong><ul class="compact">${fileRows}</ul></div>
+          <div><strong>Active Files</strong>${fileRows}</div>
+          <div><strong>Edited Files</strong>${changedFileRows}</div>
+          <div><strong>Commands</strong>${commandRows}</div>
+          <div><strong>Edits</strong>${editRows}</div>
           <div><strong>Suggestions</strong><ul class="compact">${suggestionRows}</ul></div>
           <div><strong>Decisions</strong><ul class="compact">${decisionRows}</ul></div>
         </div>
       </details>
       <div class="stream-list terminal-body" id="terminal-stream-body" data-run-id="${escapeHtml(run.run_id || "")}">${renderTerminalRows(transcript)}</div>
       <div class="terminal-composer">
+        ${renderRunMessageHistory(run.run_id)}
         <div class="chat-controls terminal-target">
           <label>
             <span>Target</span>
@@ -325,9 +423,11 @@ function renderRunTranscript(transcript) {
         <textarea class="note-box chat-box terminal-input" id="run-followup-message" placeholder="$ Send another message to this run."></textarea>
         <div class="actions">
           <button class="small-button primary-action" id="send-run-followup" type="button"${canPostToGraphServer() ? "" : " disabled aria-disabled=\"true\""}>Send message</button>
+          ${reviewAction}
           <span class="inline-status" id="run-followup-status">${canPostToGraphServer() ? "Ready" : "Graph server required"}</span>
           <span class="inline-status runtime-status" id="run-runtime-status">${escapeHtml(renderAgentRuntimeStatus())}</span>
         </div>
+        <span class="keyboard-hint">Press Enter to send · Shift+Enter for newline</span>
       </div>
     </div>
   `;
@@ -1112,7 +1212,7 @@ function renderChat(node) {
           <label>
             <span>Target</span>
             <select id="agent-provider">
-              ${providerOptionHtml("codex")}
+              ${providerOptionHtml(defaultChatProvider({ run: currentRun }))}
             </select>
           </label>
           <label>
@@ -1123,6 +1223,8 @@ function renderChat(node) {
             </select>
           </label>
         </div>
+        <div id="context-basket" class="context-basket" aria-label="Selected files"></div>
+        <div id="find-results" class="find-results" hidden></div>
         <textarea class="note-box chat-box" id="agent-chat-message" placeholder="Send a focused task or follow-up about the selected node."></textarea>
         <div class="actions">
           <button class="small-button primary-action" id="send-agent-message" type="button"${disabled}>Send to agent</button>
@@ -1179,8 +1281,61 @@ function agentProviderRegistry() {
     { id: "configured", display_name: "Configured adapter" }
   ];
 }
+function providerExists(providerId) {
+  const target = String(providerId || "").toLowerCase();
+  if (!target) return false;
+  return agentProviderRegistry().some(provider =>
+    String(provider.id || "").toLowerCase() === target
+  );
+}
+function providerHintForRun(run) {
+  const metadata = (run && run.metadata) || {};
+  const provider = String(metadata.provider || "").toLowerCase();
+  if (provider) return provider;
+  const agent = String((run && run.agent_name) || "").toLowerCase();
+  if (agent.includes("kimi")) return "kimi";
+  if (agent.includes("claude")) return "claude";
+  if (agent.includes("codex")) return "codex";
+  if (agent.includes("opencode")) return "opencode";
+  return "";
+}
+function configuredProviderHint() {
+  const dispatch = (agentRuntimeConfig().dispatch) || {};
+  const provider = String(dispatch.provider || "").toLowerCase();
+  if (provider) return provider;
+  if (dispatch.custom_command_configured || dispatch.local_command_configured || dispatch.webhook_configured) {
+    return "configured";
+  }
+  return "";
+}
+function activeProviderHint() {
+  const agent = (data && data.agent) || {};
+  const runs = ((agent.active_runs || []).concat(agent.recent_runs || []))
+    .filter(run => run && !isTerminalStatus(run.status));
+  for (const run of runs) {
+    const provider = providerHintForRun(run);
+    if (provider) return provider;
+  }
+  return "";
+}
+function defaultChatProvider(options = {}) {
+  const runHint = options.run ? providerHintForRun(options.run) : "";
+  if (runHint) return runHint;
+  if (options.includeFocus !== false && selected) {
+    const focus = agentFocusForNode(selected);
+    const focusHint = providerHintForRun(focus.currentRun);
+    if (focusHint) return focusHint;
+  }
+  const activeHint = activeProviderHint();
+  if (activeHint) return activeHint;
+  const configuredHint = configuredProviderHint();
+  if (configuredHint) return configuredHint;
+  if (providerExists("codex")) return "codex";
+  const preset = agentProviderRegistry().find(provider => provider && provider.command_preset && provider.id);
+  return preset ? String(preset.id || "configured").toLowerCase() : "configured";
+}
 function providerOptionHtml(selected) {
-  const selectedValue = String(selected || "codex");
+  const selectedValue = String(selected || defaultChatProvider());
   const providers = agentProviderRegistry().slice();
   if (selectedValue && !providers.some(provider => String(provider.id || "") === selectedValue)) {
     const label = selectedValue === "opencode"
@@ -1289,7 +1444,7 @@ function agentNameForProvider(provider) {
   return (data.agent && data.agent.name) || "Agent";
 }
 function providerFromChatControl(selectEl) {
-  const value = selectEl ? String(selectEl.value || "codex") : "codex";
+  const value = selectEl ? String(selectEl.value || defaultChatProvider()) : defaultChatProvider();
   return value === "configured" ? "" : value;
 }
 function executionStrategyFromControl(selectEl) {
@@ -1303,12 +1458,7 @@ function syncProviderForExecutionStrategy(providerSelect, strategySelect) {
   }
 }
 function defaultProviderForRun(run) {
-  const metadata = (run && run.metadata) || {};
-  const provider = String(metadata.provider || "").toLowerCase();
-  if (provider) return provider;
-  if (provider === "kimi" || String((run && run.agent_name) || "").toLowerCase().includes("kimi")) return "kimi";
-  if (provider === "claude" || String((run && run.agent_name) || "").toLowerCase().includes("claude")) return "claude";
-  return "codex";
+  return providerHintForRun(run) || defaultChatProvider({ includeFocus: false });
 }
 function agentTaskPayloadFromRun(transcript, message, options = {}) {
   const run = transcript.run || {};
@@ -1341,12 +1491,25 @@ function bindRunTranscriptPanel(transcript) {
   const strategySelect = document.getElementById("run-followup-execution-strategy");
   const messageBox = document.getElementById("run-followup-message");
   const sendButton = document.getElementById("send-run-followup");
+  const acceptButton = document.getElementById("accept-run-review");
   const status = document.getElementById("run-followup-status");
+  document.querySelectorAll("[data-run-file-node]").forEach(button => {
+    button.addEventListener("click", () => {
+      const target = nodeById.get(button.dataset.runFileNode);
+      if (target) selectNode(target, { center: true });
+    });
+  });
   if (providerSelect) providerSelect.value = defaultProviderForRun((transcript && transcript.run) || {});
   refreshAgentProviders();
   if (strategySelect) {
     strategySelect.addEventListener("change", () => {
       syncProviderForExecutionStrategy(providerSelect, strategySelect);
+    });
+  }
+  if (acceptButton) {
+    acceptButton.addEventListener("click", () => {
+      const runId = ((transcript && transcript.run) || {}).run_id || "";
+      acceptAgentRunReview(runId, acceptButton);
     });
   }
   terminalLastSignature = "";
@@ -1378,6 +1541,7 @@ function bindRunTranscriptPanel(transcript) {
       const result = await postAgentMessageToRun(runId, payload);
       if (handlePreflightResult(result, sendButton, status, "Send anyway")) return;
       if (result.ok) {
+        saveRunMessageHistory(runId, message);
         status.textContent = result.same_run
           ? `Sent ${result.run.run_id.slice(0, 8)}`
           : (result.dispatch && result.dispatch.configured
@@ -1403,6 +1567,7 @@ function bindChatPanel(node) {
   const copyButton = document.getElementById("copy-agent-message-json");
   const status = document.getElementById("agent-chat-status");
   refreshAgentProviders();
+  renderContextBasket();
   document.querySelectorAll("[data-chat-node]").forEach(button => {
     button.addEventListener("click", () => {
       const target = nodeById.get(button.dataset.chatNode);
@@ -1433,6 +1598,18 @@ function bindChatPanel(node) {
       const message = messageBox.value.trim();
       if (!message) {
         status.textContent = "Message required";
+        return;
+      }
+      const command = parseChatCommand(message);
+      if (command && command.command === "find") {
+        sendButton.disabled = true;
+        try {
+          await handleFindCommand(command, status);
+        } catch (err) {
+          status.textContent = err.message || "Find failed";
+        } finally {
+          sendButton.disabled = !canPostToGraphServer();
+        }
         return;
       }
       const provider = providerFromChatControl(providerSelect);

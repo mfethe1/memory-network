@@ -126,7 +126,10 @@ def test_graph_json_exposes_files_relations_care_and_code(
         "high",
         "critical",
     }
-    assert nodes["file:pkg/mid.py"]["summary"]
+    mid_summary = nodes["file:pkg/mid.py"]["summary"]
+    assert mid_summary
+    assert "In Graph Agent Companion" in mid_summary
+    assert "depends on 1 other indexed file" in mid_summary
     assert nodes["file:pkg/mid.py"]["code"]["included"] is True
     assert "def wrapper" in nodes["file:pkg/mid.py"]["code"]["content"]
     assert isinstance(payload["summary"]["recent_edits"], list)
@@ -150,6 +153,42 @@ def test_graph_json_exposes_files_relations_care_and_code(
     assert any(
         kind in relation_edges[0]["detail"] for kind in ("imports", "calls")
     )
+
+
+def test_graph_scope_marks_indexed_files_under_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    _write_graph_fixture(tmp_path)
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "graph",
+            "--root",
+            str(tmp_path),
+            "--scope",
+            "pkg",
+            "--format",
+            "json",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    payload = json.loads(out)
+
+    assert payload["root"] == str(tmp_path.resolve())
+    assert payload["scope"] == {"path": "pkg", "explicit": True}
+    assert payload["focus_paths"] == ["pkg/__init__.py", "pkg/low.py", "pkg/mid.py"]
+    assert payload["agent"]["active_files"] == [
+        "pkg/__init__.py",
+        "pkg/low.py",
+        "pkg/mid.py",
+    ]
+    nodes = {node["id"]: node for node in payload["nodes"]}
+    assert nodes["file:pkg/low.py"]["active_work"] is True
+    assert nodes["file:pkg/mid.py"]["active_work"] is True
+    assert nodes["file:tests/test_mid.py"]["active_work"] is False
 
 
 def test_graph_html_writes_standalone_view(
@@ -223,13 +262,23 @@ def test_graph_html_writes_standalone_view(
     assert "submit-agent-task" in html
     assert "agent-chat-message" in html
     assert "send-agent-message" in html
+    assert "selectedContextPaths" in html
+    assert "context-basket" in html
+    assert "find-results" in html
+    assert "parseChatCommand" in html
+    assert "handleFindCommand" in html
+    assert "/api/symbols" in html
+    assert "edit_policy" in html
     assert "agent-provider" in html
     assert "agent_providers" in html
     assert "agent_runtime" in html
     assert "agentProviderRegistry()" in html
     assert "refreshAgentProviders" in html
     assert "renderAgentRuntimeStatus" in html
-    assert 'providerOptionHtml("codex")' in html
+    assert "defaultChatProvider" in html
+    assert 'addEventListener("connection"' in html
+    assert "mergeDynamicEdges" in html
+    assert "agent_derived" in html
     registry_fallback = html[
         html.index("function agentProviderRegistry()"):
         html.index("function providerOptionHtml")
@@ -247,7 +296,17 @@ def test_graph_html_writes_standalone_view(
     assert "execution_strategy" in html
     assert "agent_runs_path" in html
     assert "agent_preflight_path" in html
+    assert "acceptAgentRunReview" in html
+    assert "/accept-review" in html
+    assert "data-accept-review-run" in html
+    assert "Approve reviewed work" in html
     assert "search_path" in html
+    assert "project-switcher" in html
+    assert "project-switcher-template" in html
+    assert "switch_project_path" in html
+    assert "/api/dirs" in html
+    assert "/api/switch-project" in html
+    assert "/api/init-status" in html
     assert "graphTokenKey" in html
     assert "fetchGraphGet" in html
     assert "/api/search" in html

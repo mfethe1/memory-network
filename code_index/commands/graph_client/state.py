@@ -69,7 +69,8 @@ const edgeColors = {
   calls: "#536f85",
   inherits: "#a56b45",
   implements: "#5d7c68",
-  overrides: "#8c5d68"
+  overrides: "#8c5d68",
+  agent_derived: "#b49ad8"
 };
 const communityColors = [
   "#5dd4c6",
@@ -81,7 +82,7 @@ const communityColors = [
   "#79a7a8",
   "#b49ad8"
 ];
-const terminalRunStatuses = new Set(["completed", "failed", "cancelled", "canceled"]);
+const terminalRunStatuses = new Set(["completed", "failed", "cancelled", "canceled", "review", "needs_review", "needs-review"]);
 const streamEventTypes = new Set(["task", "status", "tool", "read", "edit", "test", "navigate", "decision"]);
 let nodes = [];
 let nodeById = new Map();
@@ -97,6 +98,7 @@ const viewStateKey = `code_index_graph_view:${data.root}`;
 const graphTokenKey = `code_index_graph_token:${data.root}`;
 const DIRECTORY_EXPANSION_DEFAULT_VERSION = 2;
 let notes = loadNotes();
+let selectedContextPaths = [];
 let eventSource = null;
 let liveConnected = false;
 let refreshing = false;
@@ -125,6 +127,7 @@ let debugFetchError = "";
 let agentProvidersRefreshPromise = null;
 let agentProvidersLastFetchMs = 0;
 let agentProviderConfigSignature = "";
+let agentGraphRenderFrame = null;
 let clientMetrics = {
   hydrate_count: 0,
   render_count: 0,
@@ -230,6 +233,11 @@ function graphDataSignature(payload) {
   const activeClaims = (((payload.agent || {}).active_claims || []).map(claim =>
     `${claim.claim_id || ""}:${claim.run_id || ""}:${claim.file_path || ""}:${claim.status || ""}:${claim.updated_at || ""}`
   )).join("|");
+  const dynamicEdges = ((payload.edges || [])
+    .filter(edge => edge && edge.kind === "agent_derived")
+    .map(edge => `${edge.source || ""}:${edge.target || ""}:${edge.weight || ""}`)
+    .sort()
+  ).join("|");
   const notes = Object.values((payload.notes && payload.notes.by_node) || {})
     .map(note => `${note.node_id || note.path}:${note.updated_at || ""}`)
     .sort()
@@ -242,6 +250,7 @@ function graphDataSignature(payload) {
     recentEdit: `${recentEdit.file_path || ""}:${recentEdit.timestamp || ""}:${recentEdit.change_type || ""}`,
     activeRuns,
     activeClaims,
+    dynamicEdges,
     agentProviders: agentProvidersSignatureFromLive(live),
     notes
   });

@@ -10,6 +10,7 @@ import threading
 import textwrap
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -18,8 +19,10 @@ from code_index import config as cfg_mod
 from code_index import db_router as db_mod
 from code_index import agent_activity
 from code_index import lease_manager
+from code_index import run_lifecycle
 from code_index.cli import main
 from code_index.commands import agent_adapter_cmd
+from code_index.commands import graph_server_cmd
 from code_index.commands import mcp_tool_impl
 from code_index.commands.graph_notes import graph_notes_block
 from code_index.commands.graph_server_cmd import _agent_stream_payload, _make_handler
@@ -37,6 +40,147 @@ def _request_json(
     request = urllib.request.Request(url, data=data, headers=request_headers)
     with urllib.request.urlopen(request, timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+class _GraphServerHarness:
+    def __init__(
+        self,
+        *,
+        root: Path,
+        server: ThreadingHTTPServer,
+        thread: threading.Thread,
+        capsys,
+    ) -> None:
+        self.root = root
+        self.server = server
+        self.thread = thread
+        self.capsys = capsys
+        self.base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def __enter__(self) -> "_GraphServerHarness":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def post_json(
+        self,
+        path: str,
+        payload: dict,
+        *,
+        headers: dict | None = None,
+        expect_status: int = 200,
+    ) -> dict:
+        return self._request(
+            path,
+            payload=payload,
+            headers=headers,
+            expect_status=expect_status,
+        )
+
+    def get_json(
+        self,
+        path: str,
+        *,
+        headers: dict | None = None,
+        expect_status: int = 200,
+    ) -> dict:
+        return self._request(path, headers=headers, expect_status=expect_status)
+
+    def reindex(self) -> None:
+        assert main(["update", "--root", str(self.root), "--json"]) == 0
+        self.capsys.readouterr()
+
+    def _request(
+        self,
+        path: str,
+        *,
+        payload: dict | None = None,
+        headers: dict | None = None,
+        expect_status: int = 200,
+    ) -> dict:
+        data = None
+        request_headers = dict(headers or {})
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            request_headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=data,
+            headers=request_headers,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                status = int(response.status)
+                body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            status = int(exc.code)
+            body = exc.read().decode("utf-8")
+        assert status == expect_status
+        return json.loads(body)
+
+
+def _make_server(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    *,
+    scope: str | None = None,
+) -> _GraphServerHarness:
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    monkeypatch.delenv("CODE_INDEX_GRAPH_TOKEN", raising=False)
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+        scope=scope,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return _GraphServerHarness(
+        root=tmp_path,
+        server=server,
+        thread=thread,
+        capsys=capsys,
+    )
+
+
+def _start_graph_server_for_root(
+    root: Path,
+    *,
+    scope: str | None = None,
+) -> tuple[ThreadingHTTPServer, threading.Thread, str]:
+    config = cfg_mod.load(root)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+        scope=scope,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, f"http://127.0.0.1:{server.server_address[1]}"
 
 
 def _request_json_with_headers(
@@ -239,10 +383,135 @@ def _wait_for_process_row(config: cfg_mod.Config, run_id: str) -> dict:
     raise AssertionError(f"process row for {run_id} did not finish: {last_status}")
 
 
+def test_graph_server_browses_dirs_and_switches_to_indexed_project(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    repo_one = tmp_path / "repo-one"
+    repo_two = tmp_path / "repo-two"
+    repo_one.mkdir()
+    repo_two.mkdir()
+    (repo_one / "a.py").write_text("def one():\n    return 1\n", encoding="utf-8")
+    (repo_two / "b.py").write_text("def two():\n    return 2\n", encoding="utf-8")
+    assert main(["init", "--root", str(repo_one), "--json"]) == 0
+    capsys.readouterr()
+    assert main(["init", "--root", str(repo_two), "--json"]) == 0
+    capsys.readouterr()
+
+    server, thread, base_url = _start_graph_server_for_root(repo_one)
+    try:
+        dirs = _request_json(f"{base_url}/api/dirs")
+        assert dirs["path"] == tmp_path.resolve().as_posix()
+        entries = {entry["name"]: entry for entry in dirs["entries"]}
+        assert entries["repo-one"]["indexed"] is True
+        assert entries["repo-two"]["indexed"] is True
+
+        switched = _request_json(
+            f"{base_url}/api/switch-project",
+            {"path": str(repo_two)},
+        )
+        assert switched["ok"] is True
+        assert switched["path"] == repo_two.resolve().as_posix()
+
+        graph = _request_json(f"{base_url}/repo-graph.json")
+        assert graph["root"] == str(repo_two.resolve())
+        assert graph["live"]["active_project"]["path"] == repo_two.resolve().as_posix()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_graph_server_initializes_unindexed_project_before_switch(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    indexed_repo = tmp_path / "indexed"
+    new_repo = tmp_path / "new-project"
+    indexed_repo.mkdir()
+    new_repo.mkdir()
+    (indexed_repo / "a.py").write_text("def indexed():\n    return 1\n", encoding="utf-8")
+    (new_repo / "c.py").write_text("def created():\n    return 3\n", encoding="utf-8")
+    assert main(["init", "--root", str(indexed_repo), "--json"]) == 0
+    capsys.readouterr()
+
+    server, thread, base_url = _start_graph_server_for_root(indexed_repo)
+    try:
+        first = _request_json(
+            f"{base_url}/api/switch-project",
+            {"path": str(new_repo)},
+        )
+        assert first == {
+            "needs_init": True,
+            "path": new_repo.resolve().as_posix(),
+        }
+
+        started = _request_json(
+            f"{base_url}/api/switch-project",
+            {"path": str(new_repo), "initialize": True},
+        )
+        assert started["needs_init"] is True
+        assert started["path"] == new_repo.resolve().as_posix()
+        assert started["status"] in {"running", "done"}
+
+        status: dict | None = None
+        query = urllib.parse.urlencode({"path": str(new_repo)})
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            status = _request_json(f"{base_url}/api/init-status?{query}")
+            if status["status"] == "done":
+                break
+            assert status["status"] == "running"
+            time.sleep(0.05)
+        assert status is not None
+        assert status["status"] == "done"
+        assert status["path"] == new_repo.resolve().as_posix()
+
+        switched = _request_json(
+            f"{base_url}/api/switch-project",
+            {"path": str(new_repo)},
+        )
+        assert switched["ok"] is True
+        assert switched["path"] == new_repo.resolve().as_posix()
+        graph = _request_json(f"{base_url}/repo-graph.json")
+        assert graph["root"] == str(new_repo.resolve())
+
+        workspace_path = home / ".code_index" / "workspaces.json"
+        workspace = json.loads(workspace_path.read_text(encoding="utf-8"))
+        assert any(
+            member["path"] == new_repo.resolve().as_posix()
+            for member in workspace["members"]
+        )
+        listing = _request_json(
+            f"{base_url}/api/dirs?{urllib.parse.urlencode({'path': str(tmp_path)})}"
+        )
+        assert any(
+            project["path"] == new_repo.resolve().as_posix()
+            for project in listing["known_projects"]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_graph_server_agent_providers_endpoint_returns_registry(
     tmp_path: Path, capsys, monkeypatch
 ):
     monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / "pkg" / "a.py").write_text("def value() -> int:\n    return 1\n", encoding="utf-8")
@@ -280,10 +549,269 @@ def test_graph_server_agent_providers_endpoint_returns_registry(
         thread.join(timeout=5)
 
 
+def test_graph_server_scope_focuses_start_search_and_task_selection(
+    tmp_path: Path, capsys, monkeypatch
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text(
+        "def scoped_needle() -> str:\n    return 'needle from scoped package'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "b.py").write_text(
+        "def outside_needle() -> str:\n    return 'needle from outside package'\n",
+        encoding="utf-8",
+    )
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+        scope="pkg",
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        graph = _request_json(f"{base_url}/repo-graph.json")
+        assert graph["root"] == str(tmp_path.resolve())
+        assert graph["scope"]["path"] == "pkg"
+        assert graph["scope"]["explicit"] is True
+        assert graph["focus_paths"] == ["pkg/a.py"]
+        assert "file:other/b.py" in {node["id"] for node in graph["nodes"]}
+        assert graph["agent"]["active_files"] == ["pkg/a.py"]
+
+        search = _request_json(f"{base_url}/api/search?q=needle&scope=all&limit=10")
+        assert search["files"]
+        assert {item["file_path"] for item in search["files"]} == {"pkg/a.py"}
+
+        preflight = _request_json(
+            f"{base_url}/api/agent-task-preflight",
+            {
+                "agent_name": "Codex",
+                "message": "Start from the scoped package.",
+            },
+        )
+        assert preflight["ok"] is True
+        assert preflight["draft"]["root"] == str(tmp_path.resolve())
+        assert preflight["draft"]["scope"]["path"] == "pkg"
+        assert preflight["draft"]["selected_paths"] == ["pkg/a.py"]
+        assert preflight["draft"]["context_policy"]["retrieval_handles"][
+            "selected_paths"
+        ] == ["pkg/a.py"]
+        assert preflight["draft"]["graph_context"]["selected_nodes"][0]["path"] == (
+            "pkg/a.py"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_graph_server_scope_must_stay_inside_root(tmp_path: Path, capsys):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    args = argparse.Namespace(
+        root=str(tmp_path),
+        scope=str(outside),
+        host="127.0.0.1",
+        port=0,
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+    )
+
+    assert graph_server_cmd.run(args) == 2
+    assert "error: scope must be inside root" in capsys.readouterr().out
+
+
+def test_graph_server_scope_rejects_task_selection_outside_scope(
+    tmp_path: Path, capsys, monkeypatch
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text("def scoped():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "b.py").write_text("def outside():\n    return 2\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+        scope="pkg",
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        status, body = _request_raw_status(
+            f"{base_url}/api/agent-task-preflight",
+            json.dumps(
+                {
+                    "agent_name": "Codex",
+                    "message": "Try to start outside the scoped package.",
+                    "selected_paths": ["other/b.py"],
+                }
+            ).encode("utf-8"),
+            {"Content-Type": "application/json"},
+        )
+        assert status == 400
+        assert json.loads(body)["error"] == (
+            "selected path is outside scope: other/b.py"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_preflight_returns_edit_policy_in_draft(
+    tmp_path: Path, capsys, monkeypatch
+):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text(
+        "def value():\n    return 1\n",
+        encoding="utf-8",
+    )
+
+    with _make_server(tmp_path, capsys, monkeypatch) as server:
+        resp = server.post_json(
+            "/api/agent-task-preflight",
+            {
+                "message": "do it",
+                "selected_paths": [],
+                "edit_policy": "direct_edit",
+                "provider": "codex",
+            },
+        )
+
+    assert resp["draft"]["edit_policy"] == "direct_edit"
+
+
+def test_preflight_selected_symbols_threaded_to_draft(
+    tmp_path: Path, capsys, monkeypatch
+):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text(
+        "def value():\n    return 1\n",
+        encoding="utf-8",
+    )
+    sym = {
+        "symbol_uid": "uid1",
+        "canonical_name": "pkg.a.value",
+        "kind": "function",
+        "def_file": "pkg/a.py",
+        "def_line": 1,
+    }
+
+    with _make_server(tmp_path, capsys, monkeypatch) as server:
+        resp = server.post_json(
+            "/api/agent-task-preflight",
+            {
+                "message": "review",
+                "selected_symbols": [sym],
+                "selected_paths": ["pkg/a.py"],
+            },
+        )
+
+    symbols = resp["draft"].get("selected_symbols", [])
+    assert any(symbol["canonical_name"] == "pkg.a.value" for symbol in symbols)
+
+
+def test_preflight_returns_context_preview_for_selected_path(
+    tmp_path: Path, capsys, monkeypatch
+):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "demo.py").write_text(
+        "def hello():\n    return 'hi'\n",
+        encoding="utf-8",
+    )
+
+    with _make_server(tmp_path, capsys, monkeypatch) as server:
+        server.reindex()
+        resp = server.post_json(
+            "/api/agent-task-preflight",
+            {
+                "message": "review",
+                "selected_paths": ["pkg/demo.py"],
+                "edit_policy": "review_before_edit",
+            },
+        )
+
+    preview = resp["draft"].get("context_preview", {})
+    assert preview.get("selected_file") == "pkg/demo.py"
+
+
+def test_symbols_endpoint_returns_function_hit(
+    tmp_path: Path, capsys, monkeypatch
+):
+    (tmp_path / "mymod.py").write_text(
+        "def build_context_packet(x):\n    return x\n",
+        encoding="utf-8",
+    )
+
+    with _make_server(tmp_path, capsys, monkeypatch) as server:
+        server.reindex()
+        resp = server.get_json(
+            "/api/symbols?q=build_context_packet&kind=function&limit=5"
+        )
+
+    assert resp["kind"] == "symbol_results"
+    hits = resp["results"]
+    assert any(
+        hit["canonical_name"].endswith("build_context_packet")
+        for hit in hits
+    )
+    first = hits[0]
+    assert "symbol_uid" in first
+    assert "def_file" in first
+    assert "def_line" in first
+
+
+def test_symbols_endpoint_requires_q_param(
+    tmp_path: Path, capsys, monkeypatch
+):
+    (tmp_path / "mymod.py").write_text(
+        "def value():\n    return 1\n",
+        encoding="utf-8",
+    )
+
+    with _make_server(tmp_path, capsys, monkeypatch) as server:
+        resp = server.get_json("/api/symbols", expect_status=400)
+
+    assert resp["error"]
+
+
 def test_graph_server_serves_graph_and_records_notes_and_events(
     tmp_path: Path, capsys, monkeypatch
 ):
     monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / "pkg" / "a.py").write_text(
@@ -606,6 +1134,150 @@ def test_graph_server_exposes_review_queue_in_all_agent_board_payloads(
         thread.join(timeout=5)
 
 
+def test_graph_server_accepts_review_run_and_clears_review_queue(
+    tmp_path: Path, capsys, monkeypatch
+):
+    monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
+    monkeypatch.delenv("CODE_INDEX_AGENT_PROVIDER", raising=False)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    conn = db_mod.connect(config.db_path)
+    try:
+        review_run = agent_activity.start_run(
+            conn,
+            agent_name="Kimi",
+            prompt="Implementation ready for user review.",
+            status="working",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=review_run["run_id"],
+            event_type="edit",
+            file_path="pkg/a.py",
+            message="Updated value implementation.",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=review_run["run_id"],
+            event_type="status",
+            file_path="pkg/a.py",
+            message="Ready for review.",
+            payload={"status": "review", "changed_files": ["pkg/a.py"]},
+        )
+    finally:
+        db_mod.close(conn)
+
+    args = argparse.Namespace(
+        no_code=False,
+        max_code_bytes=200_000,
+        focus=[],
+        agent_name="Codex",
+        event_interval=1.0,
+        quiet=True,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(config, args))
+    server.quiet = True  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        board = _request_json(f"{base_url}/api/agent-board")
+        assert [run["run_id"] for run in board["orchestrator"]["review_runs"]] == [
+            review_run["run_id"]
+        ]
+
+        accepted = _request_json(
+            f"{base_url}/api/agent-runs/{review_run['run_id']}/accept-review",
+            {"decision": "Reviewed the changed files and accepted the work."},
+        )
+
+        assert accepted["ok"] is True
+        assert accepted["run"]["status"] == "completed"
+        assert accepted["event"]["event_type"] == "decision"
+        assert accepted["event"]["payload"]["status"] == "accepted"
+        assert accepted["event"]["payload"]["review_action"] == "accepted"
+        assert [
+            run["run_id"]
+            for run in accepted["board"]["orchestrator"]["review_runs"]
+        ] == []
+
+        transcript = _request_json(
+            f"{base_url}/api/agent-runs/{review_run['run_id']}"
+        )
+        assert transcript["run"]["status"] == "completed"
+        assert transcript["changed_files"] == ["pkg/a.py"]
+        assert transcript["decisions"][-1]["payload"]["status"] == "accepted"
+
+        board_after = _request_json(f"{base_url}/api/agent-board")
+        assert [
+            run["run_id"]
+            for run in board_after["orchestrator"]["review_runs"]
+        ] == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_agent_stream_reconciles_dead_local_process_before_payload(
+    tmp_path: Path, capsys
+):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    assert main(["init", "--root", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    config = cfg_mod.load(tmp_path)
+    conn = db_mod.connect(config.db_path)
+    try:
+        run = agent_activity.start_run(
+            conn,
+            agent_name="Kimi",
+            prompt="Local command already exited.",
+            status="working",
+        )
+        process = run_lifecycle.register_process(
+            conn,
+            run_id=run["run_id"],
+            transport="local-command",
+            provider="kimi",
+            pid=123456,
+            command_label="kimi --quiet",
+        )
+        run_lifecycle.finish_process(
+            conn,
+            process_id=process["process_id"],
+            status="completed",
+            exit_code=0,
+        )
+    finally:
+        db_mod.close(conn)
+
+    stream = _agent_stream_payload(config)
+
+    assert all(
+        item["run_id"] != run["run_id"]
+        for item in stream["agent"]["active_runs"]
+    )
+    assert [item["run_id"] for item in stream["agent"]["orchestrator"]["review_runs"]] == [
+        run["run_id"]
+    ]
+    conn = db_mod.connect(config.db_path)
+    try:
+        updated = agent_activity.get_run(conn, run["run_id"])
+    finally:
+        db_mod.close(conn)
+    assert updated is not None
+    assert updated["status"] == "review"
+
+
 def test_graph_server_starts_agent_swarm_as_child_runs(tmp_path: Path, capsys, monkeypatch):
     monkeypatch.delenv("CODE_INDEX_AGENT_WEBHOOK_URL", raising=False)
     monkeypatch.delenv("CODE_INDEX_AGENT_COMMAND", raising=False)
@@ -708,6 +1380,43 @@ def test_graph_server_starts_agent_swarm_as_child_runs(tmp_path: Path, capsys, m
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_graph_server_agent_runs_dedupes_same_supplied_run_id(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+):
+    with _make_server(tmp_path, capsys, monkeypatch) as server:
+        supplied_run_id = "run-openclaw-dedupe-test"
+        payload = {
+            "run_id": supplied_run_id,
+            "task_id": "task-1",
+            "message": "Inspect selected files.",
+        }
+
+        first = server.post_json("/api/agent-runs", payload)
+        replay = server.post_json(
+            "/api/agent-runs",
+            {**payload, "message": "Replay should not create a new run."},
+        )
+
+        assert first["ok"] is True
+        assert first["run"]["run_id"] == supplied_run_id
+        assert replay["ok"] is True
+        assert replay["duplicate"] is True
+        assert replay["run"]["run_id"] == supplied_run_id
+        assert replay["run"]["prompt"] == "Inspect selected files."
+        config = cfg_mod.load(tmp_path)
+        conn = db_mod.connect(config.db_path)
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM agent_runs WHERE run_id = ?",
+                (supplied_run_id,),
+            ).fetchone()[0]
+        finally:
+            db_mod.close(conn)
+        assert count == 1
 
 
 def test_graph_server_reconciles_swarm_parent_when_children_stop(
@@ -1141,6 +1850,26 @@ def test_graph_server_posts_followup_message_to_existing_agent_run(
     assert main(["init", "--root", str(tmp_path), "--json"]) == 0
     capsys.readouterr()
 
+    script_path = tmp_path / "followup_adapter.py"
+    script_path.write_text(
+        textwrap.dedent(
+            """
+            import json
+            import sys
+
+            with open(sys.argv[1], encoding="utf-8") as handle:
+                task = json.load(handle)
+            print(f"followup dispatch: {task['provider']} {task['message']}")
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(
+        agent_adapter_cmd.PROVIDER_COMMANDS,
+        "opencode",
+        f'"{sys.executable}" "{script_path}" {{task_json}}',
+    )
+
     config = cfg_mod.load(tmp_path)
     conn = db_mod.connect(config.db_path)
     try:
@@ -1198,18 +1927,26 @@ def test_graph_server_posts_followup_message_to_existing_agent_run(
 
         transcript = _request_json(f"{base_url}/api/agent-runs/{run['run_id']}")
         assert transcript["run"]["run_id"] == run["run_id"]
-        assert transcript["run"]["status"] == "working"
-        assert [event["message"] for event in transcript["events"]] == [
-            "Continue in this same session."
+        assert transcript["run"]["status"] in {"working", "completed"}
+        assert "Continue in this same session." in [
+            event["message"] for event in transcript["events"]
         ]
         assert transcript["active_files"] == ["pkg/a.py"]
+        completed = _wait_for_run_status(config, run["run_id"], "completed")
+        assert completed["run_id"] == run["run_id"]
 
         conn = db_mod.connect(config.db_path)
         try:
             count = conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0]
+            recent = agent_activity.recent_events(conn, limit=12)
         finally:
             db_mod.close(conn)
         assert count == 1
+        assert any(
+            "followup dispatch: opencode Continue in this same session."
+            in event["message"]
+            for event in recent
+        )
     finally:
         server.shutdown()
         server.server_close()

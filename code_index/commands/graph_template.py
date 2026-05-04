@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import re
 
+from code_index.commands.graph_project_switcher import (
+    PROJECT_SWITCHER_CSS,
+    PROJECT_SWITCHER_HTML,
+    PROJECT_SWITCHER_SCRIPT,
+)
 from code_index.commands.graph_script import GRAPH_SCRIPT
 from code_index.commands.graph_styles import GRAPH_CSS
 
@@ -24,6 +29,7 @@ HTML_BETWEEN_CSS_AND_SCRIPT = r"""  </style>
     <div class="brand">
       <h1>code_index graph</h1>
       <p id="repo-subtitle"></p>
+      __PROJECT_SWITCHER_HTML__
     </div>
     <div class="agent-status">
       <strong id="agent-name">Agent</strong>
@@ -186,8 +192,9 @@ def _compact_script(script: str) -> str:
 
 HTML_TEMPLATE = (
     _compact_html_fragment(HTML_BEFORE_CSS)
-    + _compact_css(GRAPH_CSS)
+    + _compact_css(GRAPH_CSS + PROJECT_SWITCHER_CSS)
     + _compact_html_fragment(HTML_BETWEEN_CSS_AND_SCRIPT)
-    + _compact_script(GRAPH_SCRIPT)
+    .replace("__PROJECT_SWITCHER_HTML__", _compact_html_fragment(PROJECT_SWITCHER_HTML))
+    + _compact_script(GRAPH_SCRIPT + PROJECT_SWITCHER_SCRIPT)
     + _compact_html_fragment(HTML_AFTER_SCRIPT)
 )

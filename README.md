@@ -7,6 +7,10 @@ top, not the primary identity layer.
 Design authority: [`docs/code-index-spec.md`](docs/code-index-spec.md).
 Repo-specific implementation choices: [`plans/code-index-repo-plan.md`](plans/code-index-repo-plan.md).
 Project-memory summary: [`CLAUDE.md`](CLAUDE.md).
+OpenClaw fleet docs: [`docs/openclaw/broker-deployment.md`](docs/openclaw/broker-deployment.md),
+[`docs/openclaw/host-identity.md`](docs/openclaw/host-identity.md),
+[`docs/openclaw/linux-macos-host-enrollment.md`](docs/openclaw/linux-macos-host-enrollment.md), and
+[`docs/openclaw/nats-subject-acls.md`](docs/openclaw/nats-subject-acls.md).
 
 ## Status
 
@@ -23,6 +27,14 @@ Requires Python **3.10+**. No external Python deps are required for the core
 CLI; optional deps unlock additional features (see below).
 
 ```bash
+# Install the command wrappers once. This adds `index`, `code_index`, and
+# `code-index` to the active Python environment's Scripts/bin directory.
+python -m pip install -e .
+
+# From any repo or subdirectory, launch Graph Agent Companion in the background.
+# The shell returns immediately; logs and the PID file live under .code_index/.
+index
+
 # Index the current repo (creates .code_index/ with index.db)
 python -m code_index init
 
@@ -72,15 +84,15 @@ python -m code_index agent-adapter --mode command \
   --task-json .code_index/sample-task.json \
   --command 'claude -p {provider_prompt}' --json
 
-# Start the repo-local plugin launcher for Claude/Codex/other command adapters
+# Start the repo-local plugin launcher for Codex/Claude/Kimi/OpenCode adapters
 python plugins/code-index-agent/scripts/install_plugin.py --root . --provider codex --json
-python plugins/code-index-agent/scripts/start_graph_server.py --root . --port 8767 \
+python -m code_index agent-plugin start --root . --port 8767 \
   --provider codex
 
-# Point the same launcher at any local codebase. If the target has no
-# .code_index/index.db yet, the launcher initializes it before serving the graph.
-python E:/Projects/hackathon/memory-claude/plugins/code-index-agent/scripts/start_graph_server.py \
-  --root E:/Projects/other-repo --port 8767 --provider codex
+# Point the same launcher at any local codebase and start in a scoped subtree.
+# --root owns the repo/index; --scope is the starting directory inside it.
+python -m code_index agent-plugin start \
+  --root E:/Projects/other-repo --scope src/auth --port 8767 --provider codex
 
 # Import a SCIP semantic index exported as JSON
 python -m code_index import-scip --json-index index.scip.json
@@ -113,6 +125,9 @@ python -m code_index workspace graph --limit 50
 
 Every subcommand accepts `--json` for machine-readable output. The JSON shape
 is the stable interface for agents; human output is unstable across versions.
+If `index` is not found after installation, add the active Python
+`Scripts`/`bin` directory to your `PATH` or run it as
+`python -m code_index.index_launcher`.
 
 ## Live code graph
 
@@ -122,14 +137,26 @@ embedded source where allowed, a Chat tab for graph-scoped agent tasks, and a
 notes tab that exports agent-task JSON.
 
 `code_index graph-server` is the interactive local mode. It serves
-`/repo-graph.html`, `/repo-graph.json`, `/notes.json`, `/api/search`, and
-`/events`. The browser receives Server-Sent Events when agent activity or notes change. Agent
-events update the active/recent files, run list, and inspector in place; full
-graph JSON refreshes are reserved for graph or note data changes. Saved node
-notes are durable in
+`/repo-graph.html`, `/mobile.html`, `/repo-graph.json`, `/notes.json`,
+`/api/search`, and `/events`. The browser receives Server-Sent Events when
+agent activity or notes change. Agent events update the active/recent files,
+run list, and inspector in place; full graph JSON refreshes are reserved for
+graph or note data changes. Saved node notes are durable in
 `.code_index/graph-notes.json`, and note saves are also recorded as
 `agent_events` so the recent activity panel can show user guidance next to
 agent work.
+
+`/mobile.html` is the phone-first control surface. It keeps the full graph off
+the first screen and focuses on the Agent Task board, search, preflighted task
+submission, Agent Run transcripts, run actions, and debug/live-event status.
+For Tailscale or another private overlay network, bind the graph server to the
+private interface and keep token auth enabled:
+
+```powershell
+$env:CODE_INDEX_GRAPH_TOKEN="<strong-token>"
+$env:CODE_INDEX_AGENT_PROVIDER="codex"
+python -m code_index graph-server --host <tailscale-ip> --port 8768 --quiet
+```
 
 Agents can write activity through the CLI, MCP mutating tools when explicitly
 enabled, or `POST /api/agent-events` on the graph server. The current graph
@@ -137,9 +164,9 @@ uses this to highlight active files and the last edited files before the index
 has been refreshed.
 
 When served through `graph-server`, the Chat tab can submit a task for the
-selected node and choose the configured adapter, Codex CLI, Claude CLI, or Kimi
-Code CLI per message. The Notes tab keeps the same submit/export path for saved
-guidance.
+selected node and choose the configured adapter, Codex CLI, Claude CLI, Kimi
+Code CLI, or OpenCode CLI per message. The Notes tab keeps the same
+submit/export path for saved guidance.
 Browser task submission now runs as draft -> preflight -> dispatch:
 `POST /api/agent-task-preflight` builds the normalized task draft, graph
 context, runtime retrieval policy, care warnings, and active file-claim
@@ -150,15 +177,28 @@ callback URL, and dispatches the task when an adapter is configured. Set
 `CODE_INDEX_AGENT_WEBHOOK_URL` to send task JSON to an HTTP webhook, or set
 `CODE_INDEX_AGENT_COMMAND` to launch a local command adapter directly from the
 graph server. You can also set
-`CODE_INDEX_AGENT_PROVIDER=claude`, `CODE_INDEX_AGENT_PROVIDER=codex`, or
-`CODE_INDEX_AGENT_PROVIDER=kimi` for built-in local presets. The Kimi preset
-uses non-interactive stream JSON mode, thinking mode, one Ralph iteration, and a
-per-run MCP config that exposes `code_index mcp-serve` to the agent. Each
-submitted task includes a bounded
+`CODE_INDEX_AGENT_PROVIDER=claude`, `CODE_INDEX_AGENT_PROVIDER=codex`,
+`CODE_INDEX_AGENT_PROVIDER=kimi`, or `CODE_INDEX_AGENT_PROVIDER=opencode` for
+built-in local presets. The Codex, Claude, Kimi, and OpenCode presets normalize
+provider JSON output into the same graph event stream. The Kimi preset uses
+non-interactive stream JSON mode, thinking mode, one Ralph iteration, and a
+per-run MCP config that exposes `code_index mcp-serve` to the agent. Kimi runs
+also use an isolated temporary `KIMI_SHARE_DIR`, seeded from the user's current
+Kimi config and credentials, so concurrent runs do not contend for
+`~/.kimi/logs/kimi.log` rotation on Windows. Set
+`CODE_INDEX_KIMI_ISOLATE_SHARE_DIR=0` to disable that isolation. Additional
+provider presets can be loaded without code changes by setting
+`CODE_INDEX_AGENT_PROVIDER_SPECS` to one or more path-separated JSON files with
+`providers` entries containing `id`, `display_name`, `command_preset`, and
+`capabilities`. Inspect the active registry with
+`python -m code_index agent-adapter --list-providers --json`. Each submitted
+task includes a bounded
 `context_packet` with repo-map, selected files/nodes, matching chunks, graph
 notes, and recent agent activity. The command adapter streams stdout/stderr
 back as graph events and marks the run completed or failed from the process
-exit code.
+exit code. Known provider logging-noise blocks, such as Loguru handler
+tracebacks from failed log rotation, are compacted into one graph event instead
+of preserving every traceback line.
 Useful command placeholders are `{message}`, `{provider_prompt}`, `{run_id}`,
 `{root}`, `{task_json}`, `{selected_paths}`, and `{selected_nodes}`.
 
@@ -242,14 +282,23 @@ The repo-local plugin package lives in `plugins/code-index-agent`. It includes
 a Codex plugin manifest, MCP server config, a skill playbook, demo assets, an
 installer, and a cross-platform graph-server launcher. The installer writes
 repo-local `.mcp.json`, `.claude/settings.local.json`, `.code_index` launcher
-config, starter scripts, and a demo task:
+config, starter scripts, and a demo task. Codex is the default publishing
+target; the same provider registry supports Claude, Kimi, OpenCode, and custom
+commands:
 
 ```bash
 python plugins/code-index-agent/scripts/install_plugin.py --root . --provider codex --json
 ```
 
-The launcher accepts any local directory via `--root`. It injects this
-`code_index` source tree into `PYTHONPATH`, initializes a missing
+Provider adapter details and extension examples live in
+[`docs/agent-provider-adapters.md`](docs/agent-provider-adapters.md).
+
+The promoted launcher is available as
+`python -m code_index agent-plugin start --root <repo> --scope <dir>`.
+`--root` owns the repo/index and `--scope` is the starting directory inside
+that repo for graph focus, search, and default task selection. The legacy
+plugin script accepts the same root/scope startup model. Both paths inject this
+`code_index` source tree into `PYTHONPATH`, initialize a missing
 `.code_index/index.db`, and then starts `graph-server`; pass `--refresh-index`
 when you explicitly want an existing target index rescanned before launch. The
 launcher validates configured provider executables before starting unless
@@ -354,8 +403,8 @@ Tracked as TODOs rather than silent gaps:
 - **Graph-server is local-first.** It supports SSE, durable notes, and local
   POST adapters, but it is not yet a hosted multi-user collaboration service.
 - **Provider routing is adapter-level.** The graph can export node task JSON
-  and record activity, but choosing Codex vs Claude still belongs in a thin
-  orchestration/webhook layer above `code_index`.
+  and record activity, while Codex, Claude, Kimi, OpenCode, and custom command
+  selection stays in the thin adapter registry above `code_index`.
 - **Call graph / override / implements relations not yet extracted.**
 - **Inner-block chunks are de-scoped in v1** per the spec; oversized
   functions are not split.

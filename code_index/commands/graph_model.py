@@ -183,7 +183,11 @@ def _role_for_file(path: str, language: str | None) -> str:
 def _read_code(
     root: Path, rel_path: str, *, include_code: bool, max_code_bytes: int
 ) -> tuple[int | None, dict[str, Any]]:
-    path = root / rel_path
+    path = (root / rel_path).resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError:
+        return None, {"included": False, "content": "", "reason": "path outside root"}
     if not path.is_file():
         return None, {
             "included": False,
@@ -274,7 +278,17 @@ def _collect_symbols_by_file(conn: sqlite3.Connection) -> dict[str, list[dict[st
                s.canonical_name,
                s.display_name,
                s.kind,
-               o.start_line
+               o.start_line,
+               (
+                   SELECT c.context_json
+                     FROM chunks c
+                    WHERE c.file_path = f.file_path
+                      AND c.symbol_path = s.canonical_name
+                      AND c.chunk_type = s.kind
+                      AND c.deleted_at IS NULL
+                    ORDER BY c.chunk_uid
+                    LIMIT 1
+               ) AS context_json
           FROM occurrences o
           JOIN files f ON f.file_pk = o.file_pk
           JOIN symbols s ON s.symbol_pk = o.symbol_pk
@@ -289,12 +303,20 @@ def _collect_symbols_by_file(conn: sqlite3.Connection) -> dict[str, list[dict[st
         items = out[row["file_path"]]
         if len(items) >= 16:
             continue
+        docstring = None
+        if row["context_json"]:
+            try:
+                ctx = json.loads(row["context_json"])
+                docstring = ctx.get("docstring_summary")
+            except json.JSONDecodeError:
+                pass
         items.append(
             {
                 "canonical_name": row["canonical_name"],
                 "display_name": row["display_name"],
                 "kind": row["kind"],
                 "line": row["start_line"],
+                "docstring": docstring,
             }
         )
     return out
@@ -600,6 +622,41 @@ def _care_reasons(
     return reasons
 
 
+def _article(text: str) -> str:
+    return "an" if text[:1].lower() in {"a", "e", "i", "o", "u"} else "a"
+
+
+def _count_phrase(count: int, singular: str, plural: str | None = None) -> str:
+    if count == 1:
+        return f"1 {singular}"
+    return f"{count} {plural or singular + 's'}"
+
+
+def _role_purpose(role: str, role_label: str) -> str:
+    purposes = {
+        "schema": "defines the durable SQLite structure that the rest of the system reads and writes",
+        "storage": "owns persistence access for indexed code and Agent Run state",
+        "pipeline": "coordinates indexing work that turns repository files into graph data",
+        "identity": "keeps semantic identities stable enough for symbols and relations to connect",
+        "locking": "protects shared local writes from concurrent agents and commands",
+        "config": "loads the local project settings used by commands, servers, and agents",
+        "cli": "routes user-facing command-line entrypoints into implementation modules",
+        "command": "implements one user-facing command or graph-server surface",
+        "mcp": "exposes indexed context and Agent Run operations to coding agents",
+        "parser": "extracts structured code facts for the semantic spine",
+        "search": "helps locate files, symbols, and text before richer graph context is assembled",
+        "structural": "supports syntax-aware search over parsed code",
+        "embedding": "builds retrieval projections on top of indexed code",
+        "runner": "turns indexed test facts into runnable verification commands",
+        "test": "verifies behavior expected from nearby product code",
+        "docs": "records product, architecture, or workflow context for humans and agents",
+        "benchmark": "measures retrieval or indexing behavior under repeatable workloads",
+        "package": "describes packaging, dependencies, or project metadata",
+        "support": "contributes supporting behavior used by the local code-memory system",
+    }
+    return purposes.get(role, f"contributes {role_label} behavior")
+
+
 def _file_summary(
     *,
     path: str,
@@ -610,18 +667,34 @@ def _file_summary(
     import_names: list[str],
     incoming: int,
     outgoing: int,
+    incoming_file_count: int,
+    outgoing_file_count: int,
     care: str,
     reasons: list[str],
+    module_docstring: str | None = None,
 ) -> str:
     role_label = ROLE_LABELS.get(role, role)
     parser = semantic_source or "unknown parser"
+    purpose = _role_purpose(role, role_label)
     pieces = [
-        f"{path} is a {role_label} file indexed as {language} by {parser}.",
+        (
+            f"In Graph Agent Companion, {path} is {_article(role_label)} "
+            f"{role_label} file that {purpose}."
+        ),
     ]
+    if module_docstring:
+        pieces.append(f"It performs: {module_docstring}")
     if symbols:
         sample = ", ".join(s["canonical_name"] for s in symbols[:5])
         more = "" if len(symbols) <= 5 else f", plus {len(symbols) - 5} more"
-        pieces.append(f"It defines {sample}{more}.")
+        pieces.append(f"Its main indexed definitions are {sample}{more}.")
+        behavior_notes = []
+        for s in symbols[:3]:
+            if s.get("docstring") and s.get("kind") != "module":
+                note = s["docstring"].rstrip(".")
+                behavior_notes.append(f"`{s['canonical_name']}` {note}")
+        if behavior_notes:
+            pieces.append("Key behaviors: " + "; ".join(behavior_notes) + ".")
     else:
         pieces.append("It has no structured symbols in the current index.")
     if import_names:
@@ -629,12 +702,30 @@ def _file_summary(
         more_imports = (
             "" if len(import_names) <= 6 else f", plus {len(import_names) - 6} more"
         )
-        pieces.append(f"Imports include {sample_imports}{more_imports}.")
+        pieces.append(f"It imports {sample_imports}{more_imports}.")
+    relation_notes: list[str] = []
+    if outgoing_file_count:
+        relation_notes.append(
+            f"depends on {_count_phrase(outgoing_file_count, 'other indexed file')}"
+        )
+    if incoming_file_count:
+        relation_notes.append(
+            f"is used by {_count_phrase(incoming_file_count, 'other indexed file')}"
+        )
+    if relation_notes:
+        pieces.append(
+            "In the current graph it "
+            + " and ".join(relation_notes)
+            + "."
+        )
     if incoming or outgoing:
         pieces.append(
-            f"Graph connectivity: {incoming} inbound and {outgoing} outbound cross-file relation(s)."
+            f"The relation index records {incoming} inbound and {outgoing} outbound cross-file relation(s)."
         )
-    pieces.append(f"Care level is {care}: {reasons[0]}.")
+    pieces.append(
+        f"Care level is {care} because {reasons[0][0].lower() + reasons[0][1:] if reasons else 'the graph has limited risk signals'}."
+    )
+    pieces.append(f"The parser source is {parser} for {language}.")
     return " ".join(pieces)
 
 
@@ -794,6 +885,65 @@ def build_graph(
             active_files_from_claims.append(path)
     active_paths = set(focus) | set(active_files_from_runs) | set(active_files_from_claims)
 
+    # Build per-file agent presence from the activity snapshot.
+    presence_by_path: dict[str, list[dict[str, Any]]] = {}
+    for run in activity_snapshot.get("active_runs", []):
+        run_id = run.get("run_id")
+        agent_name = run.get("agent_name") or "Agent"
+        status = run.get("status") or "working"
+        for path in run.get("active_files", []):
+            if not path:
+                continue
+            presence_by_path.setdefault(path, [])
+            if not any(
+                p.get("run_id") == run_id and p.get("presence_type") == "active_file"
+                for p in presence_by_path[path]
+            ):
+                presence_by_path[path].append(
+                    {
+                        "run_id": run_id,
+                        "agent_name": agent_name,
+                        "status": status,
+                        "presence_type": "active_file",
+                    }
+                )
+        metadata = run.get("metadata") or {}
+        for path in metadata.get("selected_paths", []):
+            if not path:
+                continue
+            presence_by_path.setdefault(path, [])
+            if not any(
+                p.get("run_id") == run_id and p.get("presence_type") == "selected"
+                for p in presence_by_path[path]
+            ):
+                presence_by_path[path].append(
+                    {
+                        "run_id": run_id,
+                        "agent_name": agent_name,
+                        "status": status,
+                        "presence_type": "selected",
+                    }
+                )
+    for claim in active_claims:
+        path = claim.get("file_path")
+        if not path:
+            continue
+        presence_by_path.setdefault(path, [])
+        if not any(
+            p.get("claim_id") == claim.get("claim_id")
+            for p in presence_by_path[path]
+        ):
+            presence_by_path[path].append(
+                {
+                    "claim_id": claim.get("claim_id"),
+                    "run_id": claim.get("run_id"),
+                    "agent_name": claim.get("agent_name") or "Agent",
+                    "mode": claim.get("mode"),
+                    "status": claim.get("status"),
+                    "presence_type": "claim",
+                }
+            )
+
     incoming_by_file: dict[str, int] = defaultdict(int)
     outgoing_by_file: dict[str, int] = defaultdict(int)
     relation_neighbors_in: dict[str, set[str]] = defaultdict(set)
@@ -857,8 +1007,11 @@ def build_graph(
             import_names=imports,
             incoming=incoming,
             outgoing=outgoing,
+            incoming_file_count=len(relation_neighbors_in.get(path, set())),
+            outgoing_file_count=len(relation_neighbors_out.get(path, set())),
             care=care,
             reasons=reasons,
+            module_docstring=context.get("docstring_summary"),
         )
         node = {
             "id": _node_id("file", path),
@@ -873,6 +1026,7 @@ def build_graph(
             "care_level": care,
             "freedom": CARE_GUIDANCE[care],
             "active_work": path in active_paths,
+            "agent_presence": presence_by_path.get(path, []),
             "importance": {"score": score, "rank": None, "reasons": reasons},
             "metrics": {
                 "size_bytes": int(row["size_bytes"] or 0),
@@ -1110,6 +1264,13 @@ def build_graph(
             "agent_runs_path": None,
             "agent_events_path": None,
             "agent_board_path": None,
+            "dirs_path": "/api/dirs",
+            "switch_project_path": "/api/switch-project",
+            "init_status_path": "/api/init-status",
+            "active_project": {
+                "name": root.name,
+                "path": root.resolve().as_posix(),
+            },
         },
         "agent": {
             "name": agent_name or (", ".join(active_agent_names) or "Agent"),

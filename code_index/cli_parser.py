@@ -12,6 +12,7 @@ from code_index import agent_providers
 from code_index.commands import (
     agent_adapter_cmd,
     agent_cmd,
+    agent_plugin_cmd,
     ask_cmd,
     branch_cmd,
     context_cmd,
@@ -24,6 +25,7 @@ from code_index.commands import (
     import_scip_cmd,
     init_cmd,
     install_hooks_cmd,
+    mcp_fleet_serve,
     mcp_serve_cmd,
     query_cmd,
     rebuild_fts_cmd,
@@ -292,6 +294,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_context)
     p_context.add_argument("task", nargs="?", help="task or question to package")
     p_context.add_argument(
+        "--scope",
+        help=(
+            "repo-relative starting directory for default selection and retrieval "
+            "(default: whole repo)"
+        ),
+    )
+    p_context.add_argument(
         "--budget-tokens",
         type=int,
         default=1200,
@@ -384,6 +393,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="repo-relative files to highlight as active agent work",
     )
     p_graph.add_argument(
+        "--scope",
+        help=(
+            "repo-relative starting directory to highlight; "
+            "--root still identifies the indexed repo"
+        ),
+    )
+    p_graph.add_argument(
         "--agent-name",
         default="Codex",
         help="agent label shown in the graph status panel (default: Codex)",
@@ -414,6 +430,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_graph_server.add_argument("--host", default="127.0.0.1")
     p_graph_server.add_argument("--port", type=int, default=8767)
     p_graph_server.add_argument(
+        "--scope",
+        help=(
+            "repo-relative starting directory for graph focus, search, and task "
+            "selection (default: whole repo)"
+        ),
+    )
+    p_graph_server.add_argument(
         "--no-code",
         action="store_true",
         help="omit embedded source code from the graph payload",
@@ -439,7 +462,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--event-interval",
         type=float,
         default=1.0,
-        help="seconds between live event checks (default 1.0)",
+        help=(
+            "seconds between live event checks when idle (default 1.0, min 0.05). "
+            "Automatically bursts to 0.05s during active work. "
+            "Override with CODE_INDEX_EVENT_INTERVAL env var."
+        ),
     )
     p_graph_server.add_argument(
         "--quiet",
@@ -582,6 +609,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="task JSON file path or @path; reads stdin when omitted",
     )
     p_agent_adapter.add_argument(
+        "--list-providers",
+        action="store_true",
+        help="print configured agent provider presets and exit",
+    )
+    p_agent_adapter.add_argument(
         "--callback-url",
         help="override task.callback.agent_events_url",
     )
@@ -631,6 +663,78 @@ def build_parser() -> argparse.ArgumentParser:
         help="finish dry-run mode with failed status",
     )
     p_agent_adapter.set_defaults(func=agent_adapter_cmd.run)
+
+    p_agent_plugin = subparsers.add_parser(
+        "agent-plugin",
+        help="start repo-scoped graph agent plugin sessions",
+    )
+    p_agent_plugin_sub = p_agent_plugin.add_subparsers(
+        dest="agent_plugin_action",
+        required=True,
+    )
+    p_agent_plugin_start = p_agent_plugin_sub.add_parser(
+        "start",
+        help="start graph-server with optional local agent dispatch",
+    )
+    p_agent_plugin_start.add_argument("--root", default=".", help="repo root to serve")
+    p_agent_plugin_start.add_argument(
+        "--scope",
+        help="starting directory inside --root for graph focus and task defaults",
+    )
+    p_agent_plugin_start.add_argument("--host", default="127.0.0.1", help="bind host")
+    p_agent_plugin_start.add_argument("--port", default="8767", help="bind port")
+    p_agent_plugin_start.add_argument(
+        "--provider",
+        choices=agent_providers.provider_choices(),
+        default="custom",
+        help="provider preset used when --agent-command is omitted",
+    )
+    p_agent_plugin_start.add_argument(
+        "--agent-command",
+        help="custom local agent command template; overrides --provider",
+    )
+    p_agent_plugin_start.add_argument(
+        "--graph-token",
+        help="optional bearer token required for browser POSTs and callbacks",
+    )
+    p_agent_plugin_start.add_argument(
+        "--command-timeout",
+        help="optional seconds before a local agent command is marked failed",
+    )
+    p_agent_plugin_start.add_argument(
+        "--max-output-events",
+        help="optional max stdout/stderr lines posted as tool events",
+    )
+    p_agent_plugin_start.add_argument(
+        "--ensure-index",
+        action="store_true",
+        default=True,
+        help="initialize .code_index/index.db in --root before starting when missing",
+    )
+    p_agent_plugin_start.add_argument(
+        "--no-ensure-index",
+        dest="ensure_index",
+        action="store_false",
+        help="fail if --root has no existing .code_index/index.db",
+    )
+    p_agent_plugin_start.add_argument(
+        "--refresh-index",
+        action="store_true",
+        help="run `code_index update --all` before starting when an index already exists",
+    )
+    p_agent_plugin_start.add_argument(
+        "--skip-provider-check",
+        action="store_true",
+        help="skip PATH checks for the selected local agent command",
+    )
+    p_agent_plugin_start.add_argument(
+        "--check-only",
+        action="store_true",
+        help="validate configuration and exit without starting graph-server",
+    )
+    p_agent_plugin_start.add_argument("--quiet", action="store_true")
+    p_agent_plugin_start.add_argument("--json", action="store_true")
+    p_agent_plugin_start.set_defaults(func=agent_plugin_cmd.run)
 
     p_run_orchestrator = subparsers.add_parser(
         "run-orchestrator",
@@ -784,6 +888,49 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_mcp.set_defaults(func=mcp_serve_cmd.run)
+
+    p_fleet_mcp = subparsers.add_parser(
+        "fleet-mcp-serve",
+        help="OpenClaw Fleet Controller MCP server with read-heavy fleet tools.",
+    )
+    p_fleet_mcp.add_argument(
+        "--describe",
+        action="store_true",
+        help="print the fleet tool surface as JSON and exit",
+    )
+    p_fleet_mcp.add_argument(
+        "--transport",
+        default="stdio",
+        choices=["stdio", "http"],
+        help="MCP transport for the fleet server (default: stdio)",
+    )
+    p_fleet_mcp.add_argument(
+        "--host",
+        default=None,
+        help="HTTP host (default: 127.0.0.1; requires --allow-remote otherwise)",
+    )
+    p_fleet_mcp.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="HTTP port (default: 8766)",
+    )
+    p_fleet_mcp.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="allow non-loopback HTTP bind",
+    )
+    p_fleet_mcp.add_argument(
+        "--token",
+        default=None,
+        help="bearer token override for HTTP transport",
+    )
+    p_fleet_mcp.add_argument(
+        "--db",
+        default=None,
+        help="optional SQLite context-store path for fumemory queries",
+    )
+    p_fleet_mcp.set_defaults(func=mcp_fleet_serve.run)
 
     # New commands registered via module-level register_parser for cleaner
     # expansion. Existing commands above will migrate to this pattern over time.

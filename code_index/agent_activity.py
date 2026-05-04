@@ -13,6 +13,7 @@ import sqlite3
 import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 
@@ -27,6 +28,7 @@ WORK_EVENT_TYPES = {"read", "edit", "test", "tool", "navigate", "note"}
 SUGGESTION_EVENT_TYPE = "suggestion"
 DEFAULT_ACTIVE_RUN_MAX_AGE_SECONDS = 4 * 60 * 60
 DEFAULT_CLAIM_TTL_SECONDS = 30 * 60
+DEFAULT_DERIVED_REL_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 VALID_CLAIM_MODES = {"read", "edit", "review", "test", "exclusive"}
 WRITE_CLAIM_MODES = ("edit", "exclusive")
 WRITE_CLAIM_PLACEHOLDERS = ",".join("?" for _ in WRITE_CLAIM_MODES)
@@ -326,6 +328,27 @@ def _run_file_claims(
 def _active_files_for_run(
     conn: sqlite3.Connection, run_pk: int, *, limit: int = 5
 ) -> list[str]:
+    files: list[str] = []
+    # Active claims are the strongest signal of current work.
+    claim_rows = conn.execute(
+        """
+        SELECT file_path
+          FROM agent_file_claims
+         WHERE run_pk = ?
+           AND status = 'active'
+           AND (expires_at IS NULL OR expires_at >= ?)
+         ORDER BY updated_at DESC, claim_pk DESC
+         LIMIT 30
+        """,
+        (run_pk, _now_iso()),
+    ).fetchall()
+    for row in claim_rows:
+        path = row["file_path"]
+        if path and path not in files:
+            files.append(path)
+        if len(files) >= limit:
+            return files
+    # Fallback to recent events for files without claims.
     rows = conn.execute(
         """
         SELECT file_path
@@ -337,7 +360,6 @@ def _active_files_for_run(
         """,
         (run_pk,),
     ).fetchall()
-    files: list[str] = []
     for row in rows:
         path = row["file_path"]
         if path and path not in files:
@@ -1089,6 +1111,53 @@ def claim_files(
     return claims
 
 
+def heartbeat_claim(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    file_path: str,
+    mode: str | None = None,
+    ttl_seconds: float | None = DEFAULT_CLAIM_TTL_SECONDS,
+) -> dict[str, Any]:
+    """Refresh heartbeat and extend expiry for an active file claim."""
+    run = get_run(conn, run_id)
+    if run is None:
+        raise ValueError(f"unknown agent run_id: {run_id}")
+    path = _normal_path(file_path)
+    if not path:
+        raise ValueError("file_path is required")
+    now = _now_iso()
+    clauses = [
+        "run_pk = ?",
+        "file_path = ?",
+        "status = 'active'",
+    ]
+    params: list[Any] = [run["run_pk"], path]
+    if mode:
+        clauses.append("mode = ?")
+        params.append(mode.strip().lower())
+    conn.execute(
+        f"""
+        UPDATE agent_file_claims
+           SET heartbeat_at = ?,
+               updated_at = ?,
+               expires_at = COALESCE(?, expires_at)
+         WHERE {" AND ".join(clauses)}
+        """,
+        (now, now, _iso_after(ttl_seconds), *params),
+    )
+    rows = _claim_rows(
+        conn,
+        ["c.run_pk = ?", "c.file_path = ?"] + (["c.mode = ?"] if mode else []),
+        [run["run_pk"], path] + ([mode.strip().lower()] if mode else []),
+        order_by=None,
+        limit=1,
+    )
+    if not rows:
+        raise ValueError(f"no active claim for {path} on run {run_id}")
+    return _row_to_claim(rows[0])
+
+
 def release_claims(
     conn: sqlite3.Connection,
     *,
@@ -1197,6 +1266,7 @@ def record_event(
     message: str | None = None,
     payload: dict[str, Any] | None = None,
     timestamp: str | None = None,
+    root: Path | None = None,
 ) -> dict[str, Any]:
     event = (event_type or "").strip().lower()
     if not event:
@@ -1270,6 +1340,10 @@ def record_event(
         release_claims(conn, run_id=run_id)
         if next_status_text == "completed":
             _sync_blocked_runs(conn)
+    if root is not None:
+        from code_index.agent_collaboration import append_event_jsonl
+
+        append_event_jsonl(root, event_payload)
     return event_payload
 
 
@@ -1344,12 +1418,15 @@ def run_transcript(
     ).fetchall()
     events = [_row_to_event(row) for row in rows]
     decisions = [event for event in events if event["event_type"] == "decision"]
+    edits = _transcript_edits(events)
+    commands = _transcript_commands(events)
     event_types = Counter(event["event_type"] for event in events)
     files_touched: list[str] = []
     for event in events:
         path = event.get("file_path")
         if path and path not in files_touched:
             files_touched.append(path)
+    changed_files = _transcript_changed_files(events)
     active_files: list[str] = []
     for path in run.get("active_files", []):
         if path and path not in active_files:
@@ -1367,16 +1444,125 @@ def run_transcript(
         "last_event_at": events[-1]["timestamp"] if events else None,
         "event_types": dict(sorted(event_types.items())),
         "files_touched": files_touched,
+        "changed_files": changed_files,
+        "edit_count": len(edits),
+        "command_count": len(commands),
     }
     return {
         "run": run,
         "events": events,
         "decisions": decisions,
+        "edits": edits,
+        "commands": commands,
+        "changed_files": changed_files,
         "active_files": active_files,
         "suggestions": build_run_suggestions(conn, run_id),
         "summary": summary,
         "summaries": summary,
     }
+
+
+def _payload_string_list(payload: dict[str, Any], *keys: str) -> list[str]:
+    out: list[str] = []
+    for key in keys:
+        value = payload.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            values = [value]
+        elif isinstance(value, list):
+            values = [str(item) for item in value if item]
+        else:
+            continue
+        for item in values:
+            text = _normal_path(item)
+            if text and text not in out:
+                out.append(text)
+    return out
+
+
+def _event_command(event: dict[str, Any]) -> str | None:
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    raw = None
+    for key in ("command", "cmd", "invocation"):
+        if payload.get(key):
+            raw = payload[key]
+            break
+    if isinstance(raw, list):
+        command = " ".join(str(part) for part in raw if part)
+    elif raw is not None:
+        command = str(raw)
+    elif event.get("event_type") in {"tool", "test"}:
+        command = str(event.get("message") or "")
+    else:
+        command = ""
+    command = command.strip()
+    return command or None
+
+
+def _transcript_commands(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    commands: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for event in events:
+        event_type = str(event.get("event_type") or "").lower()
+        if event_type not in {"tool", "test", "status"}:
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        command = _event_command(event)
+        if not command:
+            continue
+        key = (event_type, str(event.get("timestamp") or ""), command)
+        if key in seen:
+            continue
+        seen.add(key)
+        commands.append(
+            {
+                "event_pk": event.get("event_pk"),
+                "event_type": event_type,
+                "timestamp": event.get("timestamp"),
+                "file_path": event.get("file_path"),
+                "command": command,
+                "message": event.get("message") or "",
+                "status": payload.get("status") or event.get("run_status"),
+                "exit_code": payload.get("exit_code"),
+            }
+        )
+    return commands
+
+
+def _transcript_edits(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    edits: list[dict[str, Any]] = []
+    for event in events:
+        if event.get("event_type") != "edit" or not event.get("file_path"):
+            continue
+        edits.append(
+            {
+                "event_pk": event.get("event_pk"),
+                "timestamp": event.get("timestamp"),
+                "file_path": event.get("file_path"),
+                "symbol_path": event.get("symbol_path"),
+                "message": event.get("message") or "",
+                "payload": event.get("payload") if isinstance(event.get("payload"), dict) else {},
+            }
+        )
+    return edits
+
+
+def _transcript_changed_files(events: list[dict[str, Any]]) -> list[str]:
+    changed: list[str] = []
+
+    def add(path: str | None) -> None:
+        text = _normal_path(path)
+        if text and text not in changed:
+            changed.append(text)
+
+    for event in events:
+        if event.get("event_type") == "edit":
+            add(event.get("file_path"))
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        for path in _payload_string_list(payload, "changed_files", "changed_file"):
+            add(path)
+    return changed
 
 
 def build_run_suggestions(
@@ -1787,6 +1973,76 @@ def recent_events(
     return [_row_to_event(row) for row in rows]
 
 
+def file_presence(
+    conn: sqlite3.Connection, *, limit: int = 200
+) -> dict[str, list[dict[str, Any]]]:
+    """Return a mapping of file_path -> active agent presence indicators.
+
+    Useful for live views that need to show exactly which agents are on
+    which files without recomputing from raw runs and claims.
+    """
+    presence: dict[str, list[dict[str, Any]]] = {}
+    runs = active_runs(conn, limit=50, max_age_seconds=None)
+    for run in runs:
+        run_id = run.get("run_id")
+        agent_name = run.get("agent_name") or "Agent"
+        status = run.get("status") or "working"
+        for path in run.get("active_files", []):
+            if not path:
+                continue
+            presence.setdefault(path, [])
+            if not any(
+                p.get("run_id") == run_id and p.get("presence_type") == "active_file"
+                for p in presence[path]
+            ):
+                presence[path].append(
+                    {
+                        "run_id": run_id,
+                        "agent_name": agent_name,
+                        "status": status,
+                        "presence_type": "active_file",
+                    }
+                )
+        metadata = run.get("metadata") or {}
+        for path in metadata.get("selected_paths", []):
+            if not path:
+                continue
+            presence.setdefault(path, [])
+            if not any(
+                p.get("run_id") == run_id and p.get("presence_type") == "selected"
+                for p in presence[path]
+            ):
+                presence[path].append(
+                    {
+                        "run_id": run_id,
+                        "agent_name": agent_name,
+                        "status": status,
+                        "presence_type": "selected",
+                    }
+                )
+    claims = active_file_claims(conn, limit=limit)
+    for claim in claims:
+        path = claim.get("file_path")
+        if not path:
+            continue
+        presence.setdefault(path, [])
+        if not any(
+            p.get("claim_id") == claim.get("claim_id")
+            for p in presence[path]
+        ):
+            presence[path].append(
+                {
+                    "claim_id": claim.get("claim_id"),
+                    "run_id": claim.get("run_id"),
+                    "agent_name": claim.get("agent_name") or "Agent",
+                    "mode": claim.get("mode"),
+                    "status": claim.get("status"),
+                    "presence_type": "claim",
+                }
+            )
+    return presence
+
+
 def recent_file_activity(
     conn: sqlite3.Connection, *, limit: int = 8, event_limit: int = 200
 ) -> list[dict[str, Any]]:
@@ -1813,7 +2069,8 @@ def recent_file_activity(
             }
             order.append(path)
         item = grouped[path]
-        item["edit_count"] += 1
+        if event["event_type"] == "edit":
+            item["edit_count"] += 1
         item["activity_count"] += 1
         item["change_types"][event["event_type"]] += 1
         if event["agent_name"] not in item["agents"]:
@@ -1982,20 +2239,29 @@ def agent_derived_file_relationships(
     *,
     limit: int = 50,
     min_observations: int = 1,
+    max_age_seconds: float | None = DEFAULT_DERIVED_REL_MAX_AGE_SECONDS,
 ) -> list[dict[str, Any]]:
     """Infer file-to-file relationships from agent navigation patterns.
 
     When agents read or edit file A and then file B within the same run,
     that suggests a dynamic relationship that the static AST index may miss.
     """
+    cutoff = _active_cutoff_iso(max_age_seconds)
+    age_clause = ""
+    params: list[Any] = []
+    if cutoff:
+        age_clause = "AND timestamp >= ?"
+        params.append(cutoff)
     rows = conn.execute(
-        """
+        f"""
         SELECT run_pk, file_path, timestamp, event_pk
           FROM agent_events
          WHERE file_path IS NOT NULL
            AND event_type IN ('read', 'edit', 'test', 'navigate')
+           {age_clause}
          ORDER BY run_pk, timestamp ASC, event_pk ASC
-        """
+        """,
+        params,
     ).fetchall()
 
     run_sequences: dict[int, list[str]] = {}
@@ -2275,4 +2541,5 @@ def activity_snapshot(
             conn, max_age_seconds=active_run_max_age_seconds
         ),
         "derived_relationships": agent_derived_file_relationships(conn, limit=50),
+        "file_presence": file_presence(conn, limit=200),
     }

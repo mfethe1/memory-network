@@ -547,7 +547,63 @@ def test_run_transcript_orders_events_and_includes_decisions(tmp_path: Path):
             "edit": 1,
             "test": 1,
         }
-        assert transcript["active_files"] == ["tests/test_api.py", "pkg/api.py"]
+        # active_files now prioritizes active claims (edit claim created after test claim)
+        assert transcript["active_files"] == ["pkg/api.py", "tests/test_api.py"]
+    finally:
+        db_mod.close(conn)
+
+
+def test_run_transcript_promotes_review_files_commands_and_edits(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(
+            conn,
+            agent_name="Kimi",
+            prompt="Prepare review details",
+            metadata={"selected_paths": ["pkg/api.py"]},
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="tool",
+            message="pytest tests/test_api.py",
+            payload={"command": "pytest tests/test_api.py", "exit_code": 0},
+            timestamp="2026-01-01T00:00:01+00:00",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="edit",
+            file_path="pkg/api.py",
+            message="Updated API review behavior.",
+            timestamp="2026-01-01T00:00:02+00:00",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="status",
+            message="Ready for review.",
+            payload={
+                "status": "review",
+                "command": "python -m pytest tests/test_api.py",
+                "changed_files": ["pkg/api.py"],
+                "exit_code": 0,
+            },
+            timestamp="2026-01-01T00:00:03+00:00",
+        )
+
+        transcript = agent_activity.run_transcript(conn, run["run_id"])
+
+        assert transcript is not None
+        assert transcript["changed_files"] == ["pkg/api.py"]
+        assert transcript["summary"]["changed_files"] == ["pkg/api.py"]
+        assert transcript["summary"]["edit_count"] == 1
+        assert transcript["edits"][0]["file_path"] == "pkg/api.py"
+        assert transcript["edits"][0]["message"] == "Updated API review behavior."
+        assert [item["command"] for item in transcript["commands"]] == [
+            "pytest tests/test_api.py",
+            "python -m pytest tests/test_api.py",
+        ]
     finally:
         db_mod.close(conn)
 
@@ -1195,5 +1251,115 @@ def test_recent_file_activity_includes_overlapping_files(tmp_path: Path):
             # Both files were touched by the same run, so they overlap
             assert len(f["overlapping_files"]) == 1
             assert f["overlapping_files"][0]["file_path"] != f["file_path"]
+    finally:
+        db_mod.close(conn)
+
+
+def test_heartbeat_claim_refreshes_expiry(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(conn, agent_name="Codex", prompt="edit")
+        claim = agent_activity.claim_file(
+            conn,
+            run_id=run["run_id"],
+            file_path="pkg/a.py",
+            mode="edit",
+            ttl_seconds=60,
+        )
+        original_expires = claim["expires_at"]
+
+        # Heartbeat with longer TTL
+        refreshed = agent_activity.heartbeat_claim(
+            conn,
+            run_id=run["run_id"],
+            file_path="pkg/a.py",
+            mode="edit",
+            ttl_seconds=300,
+        )
+        # heartbeat_at may be identical if the call is immediate; expires_at must grow
+        assert refreshed["heartbeat_at"] >= claim["heartbeat_at"]
+        assert refreshed["expires_at"] > original_expires
+        assert refreshed["status"] == "active"
+    finally:
+        db_mod.close(conn)
+
+
+def test_active_files_for_run_includes_claims(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(conn, agent_name="Codex", prompt="edit")
+        agent_activity.claim_file(
+            conn,
+            run_id=run["run_id"],
+            file_path="pkg/claimed.py",
+            mode="edit",
+        )
+        # No events yet; active_files should still surface the claimed file
+        files = agent_activity._active_files_for_run(conn, run["run_pk"])
+        assert "pkg/claimed.py" in files
+    finally:
+        db_mod.close(conn)
+
+
+def test_recent_file_activity_counts_edits_correctly(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(conn, agent_name="Codex", prompt="edit")
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="edit",
+            file_path="pkg/a.py",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="read",
+            file_path="pkg/a.py",
+        )
+        files = agent_activity.recent_file_activity(conn)
+        assert files[0]["edit_count"] == 1
+        assert files[0]["activity_count"] == 2
+        assert files[0]["change_types"] == {"edit": 1, "read": 1}
+    finally:
+        db_mod.close(conn)
+
+
+def test_agent_derived_file_relationships_respects_max_age(tmp_path: Path):
+    _config, conn = _activity_db(tmp_path)
+    try:
+        run = agent_activity.start_run(conn, agent_name="Codex", prompt="refactor")
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="read",
+            file_path="pkg/old.py",
+            timestamp="2000-01-01T00:00:00+00:00",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="edit",
+            file_path="pkg/new_a.py",
+            timestamp="2099-01-01T00:00:01+00:00",
+        )
+        agent_activity.record_event(
+            conn,
+            run_id=run["run_id"],
+            event_type="read",
+            file_path="pkg/new_b.py",
+            timestamp="2099-01-01T00:00:02+00:00",
+        )
+
+        # With a tight window, old event should be excluded
+        rels = agent_activity.agent_derived_file_relationships(
+            conn, max_age_seconds=3600
+        )
+        sources = {r["source"] for r in rels}
+        targets = {r["target"] for r in rels}
+        assert "pkg/old.py" not in sources
+        assert "pkg/old.py" not in targets
+        assert "pkg/new_a.py" in (sources | targets)
+        assert "pkg/new_b.py" in (sources | targets)
     finally:
         db_mod.close(conn)

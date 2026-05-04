@@ -97,6 +97,7 @@ def test_code_index_agent_graph_launcher_help():
     assert result.returncode == 0
     assert "--agent-command" in result.stdout
     assert "--provider" in result.stdout
+    assert "--scope" in result.stdout
     assert "--ensure-index" in result.stdout
     assert "graph-server" in result.stdout
 

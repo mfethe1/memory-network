@@ -9,6 +9,7 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -24,6 +25,8 @@ from code_index import agent_providers
 
 AGENT_COMMAND_ENV_VAR = "CODE_INDEX_AGENT_COMMAND"
 AGENT_PROVIDER_ENV_VAR = "CODE_INDEX_AGENT_PROVIDER"
+KIMI_ISOLATE_SHARE_ENV_VAR = "CODE_INDEX_KIMI_ISOLATE_SHARE_DIR"
+KIMI_SHARE_DIR_ENV_VAR = "KIMI_SHARE_DIR"
 PROVIDER_COMMANDS = agent_providers.PROVIDER_COMMANDS
 STRUCTURED_EVENT_TYPES = {
     "read",
@@ -41,6 +44,13 @@ STRUCTURED_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 JSON_PREFIX_RE = re.compile(r"^(?:CODE_INDEX_EVENT|code_index_event)\s*[: ]\s*(\{.*\})$")
+LOGURU_HANDLER_ERROR_START_RE = re.compile(
+    r"^--- Logging error in Loguru Handler #\d+ ---$"
+)
+LOGURU_HANDLER_ERROR_END = "--- End of logging error ---"
+WINDOWS_SHELL_METACHARS = ("<", ">", "|", "&")
+KIMI_SHARE_SEED_FILES = ("config.toml", "device_id", "mcp.json")
+KIMI_SHARE_SEED_DIRS = ("credentials", "plugins", "bin")
 
 
 def _read_task(raw: str | None) -> dict[str, Any]:
@@ -133,6 +143,24 @@ def _shell_join(values: list[str]) -> str:
     return " ".join(_shell_quote(value) for value in values)
 
 
+def _strip_outer_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _popen_command(formatted: str) -> tuple[str | list[str], bool]:
+    if os.name != "nt" or any(marker in formatted for marker in WINDOWS_SHELL_METACHARS):
+        return formatted, True
+    try:
+        parts = shlex.split(formatted, posix=False)
+    except ValueError:
+        return formatted, True
+    if not parts:
+        return formatted, True
+    return [_strip_outer_quotes(part) for part in parts], False
+
+
 class _FormatValues(dict[str, str]):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
@@ -212,6 +240,12 @@ def _build_provider_prompt(
     selected_paths = _string_list(task.get("selected_paths"))
     message = str(task.get("message") or "")
     run_id = str(task.get("run_id") or "")
+    edit_policy = str(task.get("edit_policy") or "review_before_edit").strip()
+    selected_symbols = (
+        task.get("selected_symbols")
+        if isinstance(task.get("selected_symbols"), list)
+        else []
+    )
     graph_context = (
         task.get("graph_context") if isinstance(task.get("graph_context"), dict) else {}
     )
@@ -273,6 +307,24 @@ def _build_provider_prompt(
         f"overlapping file events: {len(overlapping_events)}; "
         f"overlapping file claims: {len(overlapping_claims)}"
     )
+    symbol_names = [
+        str(symbol.get("canonical_name") or "").strip()
+        for symbol in selected_symbols[:5]
+        if isinstance(symbol, dict) and str(symbol.get("canonical_name") or "").strip()
+    ]
+    symbol_instruction = (
+        "\nSelected symbols: "
+        f"{', '.join(symbol_names)}. "
+        "Call the find_symbol MCP tool for these exact symbols before broad scanning."
+        if symbol_names
+        else ""
+    )
+    edit_policy_instruction = (
+        "\nEdit policy: review_before_edit. Read the context fully and propose edits "
+        "with a short rationale before making file changes."
+        if edit_policy == "review_before_edit"
+        else ""
+    )
     return (
         "You are running from the code_index repo graph UI.\n"
         f"{graph_hint}\n"
@@ -297,10 +349,18 @@ def _build_provider_prompt(
         "posting to callback.agent_events_url with this run_id when you read, "
         "edit, test, navigate, make a decision, or finish.\n"
         "If a code-index MCP server is available, use it for repo-map, symbol, "
-        "context, and impact lookups instead of broad manual scanning.\n"
+        "context, and impact lookups instead of broad manual scanning. "
+        "The context packet includes a Command Reference section with the most "
+        "commonly used CLI commands and MCP tools. Prefer these tools over broad "
+        "manual file scanning: call find_symbol for known symbols before grepping; "
+        "use impact before editing shared infrastructure; use affected_tests before "
+        "changing behavior-critical code; use retrieval_broker or graph_context "
+        "when you need layered context instead of raw file reads.\n"
         "If the request asks for a code change, make the edit in the workspace, "
         "run the most relevant verification you can, and end with changed files, "
         "tests run, and any risk or blocker."
+        + symbol_instruction
+        + edit_policy_instruction
         + continuation
     )
 
@@ -653,7 +713,113 @@ def _tool_call_event_type(tool_calls: list[dict[str, Any]]) -> str:
 
 
 def _provider_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
-    return _codex_jsonl_output_event(payload) or _kimi_jsonl_output_event(payload)
+    return (
+        _cursor_jsonl_output_event(payload)
+        or _codex_jsonl_output_event(payload)
+        or _claude_jsonl_output_event(payload)
+        or _kimi_jsonl_output_event(payload)
+        or _opencode_jsonl_output_event(payload)
+        or _openhands_jsonl_output_event(payload)
+    )
+
+
+def _cursor_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
+    provider = str(
+        payload.get("provider") or payload.get("source") or payload.get("adapter") or ""
+    ).strip().lower()
+    if provider not in {"cursor", "cursor_sidecar", "cursor-sidecar"}:
+        return None
+
+    event_type = str(payload.get("event") or payload.get("type") or "").strip().lower()
+    provider_payload: dict[str, Any] = {
+        "provider_event": f"cursor.{event_type or 'event'}",
+    }
+    run_id = str(payload.get("run_id") or payload.get("cursor_run_id") or "").strip()
+    if run_id:
+        provider_payload["run_id"] = run_id
+
+    message = str(payload.get("message") or payload.get("text") or "").strip()
+    role = str(payload.get("role") or "").strip().lower()
+    status = str(payload.get("status") or "").strip().lower()
+    if role:
+        provider_payload["role"] = role
+
+    if event_type in {"run.started", "started"}:
+        return {
+            "event_type": "status",
+            "message": message or "Cursor run started.",
+            "file_path": None,
+            "symbol_path": None,
+            "status": status or None,
+            "payload": provider_payload,
+        }
+
+    if event_type in {"run.completed", "completed"}:
+        return {
+            "event_type": "status",
+            "message": message or "Cursor run completed.",
+            "file_path": None,
+            "symbol_path": None,
+            "status": "completed",
+            "payload": provider_payload,
+        }
+
+    if event_type in {"run.failed", "failed", "error"}:
+        return {
+            "event_type": "status",
+            "message": message or "Cursor run failed.",
+            "file_path": None,
+            "symbol_path": None,
+            "status": "failed",
+            "payload": provider_payload,
+        }
+
+    if event_type in {"assistant", "assistant.message", "message"} and message:
+        return {
+            "event_type": "decision" if role in {"", "assistant"} else "note",
+            "message": message,
+            "file_path": None,
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+
+    if event_type in {"tool.call", "tool_call"}:
+        tool_name = str(payload.get("tool_name") or payload.get("name") or "tool").strip()
+        arguments = (
+            payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+        )
+        tool_call = {"name": tool_name, "arguments": arguments}
+        provider_payload["tool_calls"] = [
+            {
+                "name": tool_name,
+                "arguments": arguments,
+            }
+        ]
+        tool_message = message or f"Cursor requested tool call: {tool_name}"
+        return {
+            "event_type": _tool_call_event_type([tool_call]),
+            "message": tool_message,
+            "file_path": _tool_call_file_path([tool_call]),
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+
+    if event_type in {"tool.result", "tool_result"}:
+        tool_name = str(payload.get("tool_name") or payload.get("name") or "tool").strip()
+        output = str(payload.get("output") or payload.get("result") or "").strip()
+        provider_payload["tool_name"] = tool_name or "tool"
+        return {
+            "event_type": "tool",
+            "message": message or output or f"Cursor tool returned: {tool_name or 'tool'}",
+            "file_path": None,
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+
+    return None
 
 
 def _codex_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -742,6 +908,123 @@ def _codex_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _claude_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
+    event_type = str(payload.get("type") or "").strip()
+    if event_type not in {"system", "assistant", "user", "result"} and not isinstance(
+        payload.get("message"), dict
+    ):
+        return None
+    if event_type == "result" and not any(
+        key in payload
+        for key in ("session_id", "sessionID", "subtype", "result", "is_error", "usage")
+    ):
+        return None
+    session_id = str(payload.get("session_id") or payload.get("sessionID") or "").strip()
+    provider_payload: dict[str, Any] = {
+        "provider_event": f"claude.{event_type}" if event_type else "claude.event",
+    }
+    if session_id:
+        provider_payload["session_id"] = session_id
+
+    if event_type == "system":
+        subtype = str(payload.get("subtype") or "").strip()
+        if subtype:
+            provider_payload["subtype"] = subtype
+        return {
+            "event_type": "status",
+            "message": f"Claude system event: {subtype or 'system'}.",
+            "file_path": None,
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+
+    if event_type == "result":
+        is_error = bool(payload.get("is_error"))
+        if "usage" in payload:
+            provider_payload["usage"] = payload.get("usage")
+        return {
+            "event_type": "status",
+            "message": (
+                str(payload.get("result") or "Claude completed with an error.")
+                if is_error
+                else "Claude turn completed."
+            ),
+            "file_path": None,
+            "symbol_path": None,
+            "status": "failed" if is_error else "completed",
+            "payload": provider_payload,
+        }
+
+    message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+    role = str(message.get("role") or payload.get("role") or "").strip().lower()
+    content = message.get("content", payload.get("content"))
+    content_items = content if isinstance(content, list) else []
+    tool_calls: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+    for item in content_items:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip()
+        if item_type == "text":
+            text = str(item.get("text") or "").strip()
+            if text:
+                text_parts.append(text)
+        elif item_type == "tool_use":
+            tool_calls.append(
+                {
+                    "id": str(item.get("id") or ""),
+                    "name": str(item.get("name") or "tool"),
+                    "input": item.get("input") if isinstance(item.get("input"), dict) else {},
+                }
+            )
+
+    if role == "assistant" and tool_calls:
+        names = ", ".join(_tool_call_name(item) for item in tool_calls)
+        detail = (
+            f"Claude requested tool call: {names}"
+            if names
+            else "Claude requested a tool call."
+        )
+        if text_parts:
+            detail = "\n".join(text_parts) + "\n" + detail
+        provider_payload["tool_calls"] = [
+            {
+                "id": item.get("id") or "",
+                "name": _tool_call_name(item),
+                "arguments": _tool_call_args(item),
+            }
+            for item in tool_calls
+        ]
+        return {
+            "event_type": _tool_call_event_type(tool_calls),
+            "message": detail,
+            "file_path": _tool_call_file_path(tool_calls),
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+    if role == "assistant" and text_parts:
+        return {
+            "event_type": "decision",
+            "message": "\n".join(text_parts),
+            "file_path": None,
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+    if role == "user" and text_parts:
+        return {
+            "event_type": "note",
+            "message": "\n".join(text_parts),
+            "file_path": None,
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+    return None
+
+
 def _kimi_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
     role = str(payload.get("role") or "").strip().lower()
     if not role:
@@ -812,6 +1095,196 @@ def _kimi_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _opencode_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
+    event_type = str(payload.get("type") or "").strip()
+    session_id = str(payload.get("sessionID") or payload.get("session_id") or "").strip()
+    provider_payload: dict[str, Any] = {
+        "provider_event": f"opencode.{event_type}" if event_type else "opencode.event",
+    }
+    if session_id:
+        provider_payload["session_id"] = session_id
+    part = payload.get("part") if isinstance(payload.get("part"), dict) else {}
+
+    if event_type == "step_start":
+        snapshot = str(part.get("snapshot") or "").strip()
+        if snapshot:
+            provider_payload["snapshot"] = snapshot
+        return {
+            "event_type": "status",
+            "message": "OpenCode step started.",
+            "file_path": None,
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+
+    if event_type == "step_finish":
+        reason = str(part.get("reason") or "").strip()
+        if reason:
+            provider_payload["reason"] = reason
+        for key in ("cost", "tokens"):
+            if key in part:
+                provider_payload[key] = part.get(key)
+        return {
+            "event_type": "status",
+            "message": (
+                "OpenCode completed the turn."
+                if reason == "stop"
+                else f"OpenCode step finished: {reason or 'unknown'}."
+            ),
+            "file_path": None,
+            "symbol_path": None,
+            "status": "completed" if reason == "stop" else None,
+            "payload": provider_payload,
+        }
+
+    if event_type == "text":
+        text = str(part.get("text") or payload.get("text") or "").strip()
+        if not text:
+            return None
+        return {
+            "event_type": "decision",
+            "message": text,
+            "file_path": None,
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+
+    if event_type == "tool_use":
+        tool = str(part.get("tool") or "tool").strip() or "tool"
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        tool_input = state.get("input") if isinstance(state.get("input"), dict) else {}
+        metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+        output = str(state.get("output") or "").strip()
+        title = str(state.get("title") or metadata.get("description") or "").strip()
+        tool_call = {"name": tool, "input": tool_input}
+        message = f"OpenCode used {tool}"
+        if title:
+            message = f"{message}: {title}"
+        if output:
+            message = f"{message}\n{output}"
+        provider_payload.update(
+            {
+                "tool": tool,
+                "status": state.get("status"),
+                "input": tool_input,
+                "metadata": metadata,
+            }
+        )
+        return {
+            "event_type": _tool_call_event_type([tool_call]),
+            "message": message,
+            "file_path": _tool_call_file_path([tool_call]),
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+
+    if event_type == "error":
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        data = error.get("data") if isinstance(error.get("data"), dict) else {}
+        name = str(error.get("name") or "OpenCode error").strip()
+        message = str(data.get("message") or error.get("message") or name).strip()
+        provider_payload["error"] = error
+        return {
+            "event_type": "status",
+            "message": f"{name}: {message}" if message != name else message,
+            "file_path": None,
+            "symbol_path": None,
+            "status": "failed",
+            "payload": provider_payload,
+        }
+
+    return None
+
+
+def _openhands_jsonl_output_event(payload: dict[str, Any]) -> dict[str, Any] | None:
+    event_type = str(payload.get("type") or "").strip().lower()
+    if event_type not in {"action", "observation", "status", "result", "error"}:
+        return None
+
+    provider_payload: dict[str, Any] = {
+        "provider_event": f"openhands.{event_type}",
+    }
+
+    if event_type == "error":
+        message = str(payload.get("content") or payload.get("message") or "OpenHands error").strip()
+        return {
+            "event_type": "status",
+            "message": message or "OpenHands error",
+            "file_path": None,
+            "symbol_path": None,
+            "status": "failed",
+            "payload": provider_payload,
+        }
+
+    if event_type == "status":
+        status = str(payload.get("status") or "").strip().lower() or None
+        message = str(payload.get("content") or payload.get("message") or "OpenHands status update.").strip()
+        return {
+            "event_type": "status",
+            "message": message or "OpenHands status update.",
+            "file_path": None,
+            "symbol_path": None,
+            "status": status,
+            "payload": provider_payload,
+        }
+
+    if event_type == "result":
+        content = str(payload.get("content") or payload.get("message") or "").strip()
+        success = payload.get("success")
+        status = "completed" if success is not False else "failed"
+        return {
+            "event_type": "status",
+            "message": content or f"OpenHands run {status}.",
+            "file_path": None,
+            "symbol_path": None,
+            "status": status,
+            "payload": provider_payload,
+        }
+
+    if event_type == "observation":
+        content = str(payload.get("content") or payload.get("message") or "").strip()
+        return {
+            "event_type": "tool",
+            "message": content or "OpenHands observation.",
+            "file_path": str(payload.get("path") or payload.get("file") or "").strip()
+            or None,
+            "symbol_path": None,
+            "status": None,
+            "payload": provider_payload,
+        }
+
+    action = str(payload.get("action") or "").strip().lower()
+    path = str(payload.get("path") or payload.get("file") or "").strip() or None
+    command = str(payload.get("command") or "").strip()
+    content = str(payload.get("content") or payload.get("message") or "").strip()
+    if action in {"write", "edit", "patch", "replace"}:
+        local_event_type = "edit"
+    elif action in {"read", "open"}:
+        local_event_type = "read"
+    elif action in {"run", "bash", "shell", "test"}:
+        local_event_type = "test" if "pytest" in command or action == "test" else "tool"
+    else:
+        local_event_type = "tool"
+    message = content or f"OpenHands action: {action or 'action'}"
+    if command:
+        message = f"{message}\n$ {command}" if content else f"OpenHands action: {action}\n$ {command}"
+    return {
+        "event_type": local_event_type,
+        "message": message,
+        "file_path": path,
+        "symbol_path": None,
+        "status": None,
+        "payload": {
+            **provider_payload,
+            "action": action,
+            "command": command,
+        },
+    }
+
+
 def _parse_output_event(
     line: str,
     *,
@@ -848,6 +1321,73 @@ def _parse_output_event(
     }
 
 
+def _compact_loguru_handler_event(
+    lines: list[str],
+    *,
+    stream_name: str,
+    command_label: str,
+) -> dict[str, Any]:
+    text = "\n".join(lines)
+    if "PermissionError: [WinError 32]" in text and "kimi.log" in text:
+        reason = "windows_kimi_log_rotation_lock"
+        message = (
+            "Suppressed Loguru handler noise: Windows file locking blocked "
+            "Kimi log rotation."
+        )
+    else:
+        reason = "loguru_handler_error"
+        message = "Suppressed Loguru handler noise from provider stderr."
+    return {
+        "event_type": "tool",
+        "message": message,
+        "file_path": None,
+        "symbol_path": None,
+        "status": None,
+        "payload": {
+            "adapter": "command",
+            "stream": stream_name,
+            "command": command_label,
+            "structured": False,
+            "provider_noise": "loguru_handler_error",
+            "noise_reason": reason,
+            "suppressed_lines": len(lines),
+        },
+    }
+
+
+def _consume_loguru_handler_line(
+    state: dict[str, Any],
+    *,
+    line: str,
+    stream_name: str,
+    command_label: str,
+) -> tuple[bool, dict[str, Any] | None]:
+    pending = state.get("_pending_loguru_handler_error")
+    if isinstance(pending, dict):
+        lines = pending.setdefault("lines", [])
+        if isinstance(lines, list):
+            lines.append(line)
+        else:
+            lines = [line]
+            pending["lines"] = lines
+        if line.strip() == LOGURU_HANDLER_ERROR_END or len(lines) >= 200:
+            state.pop("_pending_loguru_handler_error", None)
+            return True, _compact_loguru_handler_event(
+                [str(item) for item in lines],
+                stream_name=str(pending.get("stream_name") or stream_name),
+                command_label=command_label,
+            )
+        return True, None
+
+    if LOGURU_HANDLER_ERROR_START_RE.match(line.strip()):
+        state["_pending_loguru_handler_error"] = {
+            "stream_name": stream_name,
+            "lines": [line],
+        }
+        return True, None
+    return False, None
+
+
 def _drain_output_events(
     output: "queue.Queue[tuple[str, str]]",
     *,
@@ -866,6 +1406,34 @@ def _drain_output_events(
             break
         if not line:
             continue
+        if state is not None:
+            consumed, compact_event = _consume_loguru_handler_line(
+                state,
+                line=line,
+                stream_name=stream_name,
+                command_label=command_label,
+            )
+            if consumed:
+                if compact_event is not None:
+                    if events_sent >= max_events:
+                        omitted += int(
+                            compact_event["payload"].get("suppressed_lines") or 1
+                        )
+                    else:
+                        _post_json(
+                            callback,
+                            _event_payload(
+                                task,
+                                event_type=compact_event["event_type"],
+                                message=compact_event["message"],
+                                file_path=compact_event.get("file_path"),
+                                symbol_path=compact_event.get("symbol_path"),
+                                status=compact_event.get("status"),
+                                payload=compact_event["payload"],
+                            ),
+                        )
+                        events_sent += 1
+                continue
         if events_sent >= max_events:
             omitted += 1
             continue
@@ -898,14 +1466,15 @@ def _terminate_process_tree(process: subprocess.Popen[str], *, force: bool) -> N
     if os.name == "nt":
         command = ["taskkill", "/PID", str(process.pid), "/T", "/F"]
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 command,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=5,
                 check=False,
             )
-            return
+            if completed.returncode == 0:
+                return
         except (OSError, subprocess.TimeoutExpired):
             pass
     else:
@@ -1039,12 +1608,75 @@ def _read_text_if_present(path: Path, *, max_chars: int = 12000) -> str:
     return text[:max_chars].rstrip() + "\n...[truncated]"
 
 
-def _agent_command_env() -> dict[str, str]:
+def _env_flag_enabled(
+    env: dict[str, str],
+    name: str,
+    *,
+    default: bool = True,
+) -> bool:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _copy_kimi_share_seed(source: Path, target: Path) -> None:
+    if not source.exists():
+        return
+    for filename in KIMI_SHARE_SEED_FILES:
+        source_path = source / filename
+        if source_path.is_file():
+            try:
+                shutil.copy2(source_path, target / filename)
+            except OSError:
+                pass
+    for dirname in KIMI_SHARE_SEED_DIRS:
+        source_path = source / dirname
+        if source_path.is_dir():
+            try:
+                shutil.copytree(source_path, target / dirname)
+            except OSError:
+                pass
+
+
+def _prepare_isolated_kimi_share_dir(
+    env: dict[str, str],
+    *,
+    task: dict[str, Any] | None,
+) -> Path:
+    run_id = _safe_run_id(task or {})
+    target = Path(tempfile.mkdtemp(prefix=f"code-index-kimi-{run_id}-"))
+    source = Path(env.get(KIMI_SHARE_DIR_ENV_VAR) or (Path.home() / ".kimi")).expanduser()
+    _copy_kimi_share_seed(source, target)
+    env[KIMI_SHARE_DIR_ENV_VAR] = str(target)
+    return target
+
+
+def _cleanup_agent_command_env(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        pass
+
+
+def _agent_command_env(
+    *,
+    provider: str = "custom",
+    task: dict[str, Any] | None = None,
+) -> tuple[dict[str, str], Path | None]:
     env = os.environ.copy()
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUNBUFFERED", "1")
-    return env
+    cleanup_dir = None
+    if (
+        agent_providers.normalize_provider_id(provider) == "kimi"
+        and _env_flag_enabled(env, KIMI_ISOLATE_SHARE_ENV_VAR, default=True)
+    ):
+        cleanup_dir = _prepare_isolated_kimi_share_dir(env, task=task)
+    return env, cleanup_dir
 
 
 def _run_command(
@@ -1054,6 +1686,7 @@ def _run_command(
     command: str,
     root: Path,
     task_json_path: Path,
+    provider: str = "custom",
     command_timeout: float | None = None,
     max_output_events: int = 400,
     cancel_event: threading.Event | None = None,
@@ -1145,25 +1778,28 @@ def _run_command(
             "cancelled": True,
         }
 
+    command_env, env_cleanup_dir = _agent_command_env(provider=provider, task=task)
     try:
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs["start_new_session"] = True
-        process = subprocess.Popen(  # noqa: S602 - configured local adapter command.
-            formatted,
+        popen_command, use_shell = _popen_command(formatted)
+        process = subprocess.Popen(  # noqa: S603,S602 - configured local adapter command.
+            popen_command,
             cwd=str(root),
-            shell=True,
+            shell=use_shell,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=_agent_command_env(),
+            env=command_env,
             **popen_kwargs,
         )
     except OSError as exc:
+        _cleanup_agent_command_env(env_cleanup_dir)
         responses.append(
             _post_status(
                 callback,
@@ -1210,6 +1846,7 @@ def _run_command(
                 events_sent += 1
             except OSError:
                 pass
+            _cleanup_agent_command_env(env_cleanup_dir)
             return 1, {
                 "ok": False,
                 "status": "failed",
@@ -1270,11 +1907,11 @@ def _run_command(
                 state=stream_state,
             )
             omitted_output_events += omitted
-            if process.poll() is not None:
-                break
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
                 _terminate_process_tree(process, force=False)
+                break
+            if process.poll() is not None:
                 break
             if deadline is not None and time.monotonic() >= deadline:
                 timed_out = True
@@ -1396,6 +2033,7 @@ def _run_command(
         )
     )
     events_sent += 1
+    _cleanup_agent_command_env(env_cleanup_dir)
     return exit_code, {
         "ok": status == "completed",
         "status": status,
@@ -1467,6 +2105,7 @@ def run_task(
             command=command_value,
             root=root,
             task_json_path=materialized_path,
+            provider=command_provider,
             command_timeout=command_timeout,
             max_output_events=max_output_events,
             cancel_event=cancel_event,
@@ -1494,7 +2133,29 @@ def _print_result(args: argparse.Namespace, payload: dict[str, Any]) -> None:
     )
 
 
+def _provider_registry_result() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "kind": "code_index_agent_provider_registry",
+        "providers": agent_providers.provider_registry_payload(),
+    }
+
+
+def _print_provider_registry(args: argparse.Namespace) -> None:
+    payload = _provider_registry_result()
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return
+    for provider in payload["providers"]:
+        command = provider.get("command_preset") or "custom command required"
+        print(f"{provider['id']}\t{provider['display_name']}\t{command}")
+
+
 def run(args: argparse.Namespace) -> int:
+    if getattr(args, "list_providers", False):
+        _print_provider_registry(args)
+        return 0
+
     try:
         task = _read_task(args.task_json)
     except ValueError as exc:

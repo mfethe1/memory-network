@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,11 +18,307 @@ from code_index import agent_providers
 from code_index import config as cfg_mod
 from code_index import db_router as db_mod
 from code_index import run_orchestrator
+from code_index import scopes
 from code_index.agent_collaboration import append_event_jsonl
 from code_index.commands.graph_model import build_graph
 from code_index.commands.graph_notes import notes_path
 from code_index.commands.graph_server_utils import GRAPH_TOKEN_ENV_VAR
 from code_index.locking import writer_lock
+from code_index.pipeline import reindex
+
+
+def _path_for_client(path: Path) -> str:
+    return path.resolve().as_posix()
+
+
+def _is_indexed_root(path: Path) -> bool:
+    return (path / cfg_mod.CONFIG_DIRNAME).is_dir()
+
+
+def known_projects() -> list[dict[str, Any]]:
+    """Return workspace-registered projects from the global workspace file."""
+
+    try:
+        from code_index.commands.workspace_cmd import (
+            _global_workspace_path,
+            _load_workspace,
+        )
+
+        data = _load_workspace(_global_workspace_path())
+    except Exception:
+        return []
+    members = data.get("members") if isinstance(data, dict) else []
+    if not isinstance(members, list):
+        return []
+    projects: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for member in members:
+        if not isinstance(member, dict):
+            continue
+        raw_path = str(member.get("path") or "").strip()
+        if not raw_path:
+            continue
+        try:
+            path = Path(raw_path).expanduser().resolve()
+        except OSError:
+            continue
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        projects.append(
+            {
+                "name": str(member.get("name") or path.name),
+                "path": _path_for_client(path),
+            }
+        )
+    return sorted(projects, key=lambda item: str(item["name"]).lower())
+
+
+def _sync_global_workspace_member(path: Path) -> None:
+    try:
+        from code_index.commands.workspace_cmd import (
+            _global_workspace_path,
+            _load_workspace,
+            _member_dict,
+            _save_workspace,
+        )
+
+        ws_path = _global_workspace_path()
+        data = _load_workspace(ws_path)
+        members = data.setdefault("members", [])
+        target = path.resolve().as_posix()
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            raw_path = str(member.get("path") or "")
+            try:
+                if Path(raw_path).expanduser().resolve().as_posix() == target:
+                    return
+            except OSError:
+                continue
+        members.append(_member_dict(path, path.name))
+        _save_workspace(ws_path, data)
+    except Exception:
+        return
+
+
+class GraphServerProjectState:
+    """Mutable active-project state for one graph-server instance."""
+
+    def __init__(self, config: cfg_mod.Config) -> None:
+        self._config = config
+        self._lock = threading.RLock()
+        self.active_root = config.root.resolve()
+        self._init_jobs: dict[str, dict[str, Any]] = {}
+
+    def _apply_config(self, next_config: cfg_mod.Config) -> None:
+        self._config.root = next_config.root
+        self._config.extra_ignore = list(next_config.extra_ignore)
+        self._config.include_hidden = next_config.include_hidden
+        self._config.max_file_bytes = next_config.max_file_bytes
+        self._config.languages = list(next_config.languages)
+        self._config.rg_path = next_config.rg_path
+        self._config.enable_jedi = next_config.enable_jedi
+        self.active_root = next_config.root.resolve()
+
+    def active_project(self) -> dict[str, str]:
+        with self._lock:
+            root = self.active_root
+        return {"name": root.name, "path": _path_for_client(root)}
+
+    def directory_listing(self, path: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            browse_root = self.active_root.parent if not path else Path(path).expanduser()
+        try:
+            target = browse_root.resolve()
+        except OSError:
+            target = browse_root.absolute()
+        parent = target.parent if target.parent != target else target
+        payload: dict[str, Any] = {
+            "path": _path_for_client(target),
+            "parent": _path_for_client(parent),
+            "entries": [],
+            "known_projects": known_projects(),
+        }
+        if not target.is_dir():
+            payload["error"] = "not a directory"
+            return payload
+        try:
+            children = sorted(target.iterdir(), key=lambda item: item.name.lower())
+        except PermissionError:
+            payload["error"] = "permission denied"
+            return payload
+        except OSError as exc:
+            payload["error"] = str(exc)
+            return payload
+
+        entries: list[dict[str, Any]] = []
+        for child in children:
+            try:
+                if not child.is_dir():
+                    continue
+            except OSError:
+                continue
+            entry: dict[str, Any] = {
+                "name": child.name,
+                "path": _path_for_client(child),
+                "indexed": _is_indexed_root(child),
+            }
+            try:
+                with os.scandir(child):
+                    pass
+            except PermissionError:
+                entry["error"] = "permission denied"
+            except OSError:
+                pass
+            entries.append(entry)
+        payload["entries"] = entries
+        return payload
+
+    def switch_project(self, path: str) -> dict[str, Any]:
+        raw_path = str(path or "").strip()
+        if not raw_path:
+            return {"error": "path is required"}
+        try:
+            target = Path(raw_path).expanduser().resolve()
+        except OSError as exc:
+            return {"error": str(exc)}
+        if not target.is_dir():
+            return {"error": "not a directory", "path": _path_for_client(target)}
+        if not _is_indexed_root(target):
+            return {"needs_init": True, "path": _path_for_client(target)}
+        with self._lock:
+            if target == self.active_root:
+                return {
+                    "ok": True,
+                    "path": _path_for_client(target),
+                    "current": True,
+                }
+            self._apply_config(cfg_mod.load(target))
+        return {"ok": True, "path": _path_for_client(target)}
+
+    def switch_or_initialize_project(
+        self,
+        path: str,
+        *,
+        initialize: bool = False,
+    ) -> dict[str, Any]:
+        result = self.switch_project(path)
+        if result.get("needs_init") and initialize:
+            init_result = self.start_init(str(result["path"]))
+            init_result["needs_init"] = True
+            return init_result
+        return result
+
+    def start_init(self, path: str) -> dict[str, Any]:
+        target_result = self._resolve_directory(path)
+        if target_result.get("error"):
+            return target_result
+        target = target_result["target"]
+        key = str(target)
+        if _is_indexed_root(target):
+            _sync_global_workspace_member(target)
+            return {
+                "status": "done",
+                "path": _path_for_client(target),
+                "elapsed": 0,
+            }
+        with self._lock:
+            existing = self._init_jobs.get(key)
+            if existing and existing.get("status") == "running":
+                return self._init_job_payload(existing)
+            job = {
+                "status": "running",
+                "path": _path_for_client(target),
+                "started_at": time.monotonic(),
+                "elapsed": 0,
+            }
+            self._init_jobs[key] = job
+            thread = threading.Thread(
+                target=self._run_init_job,
+                args=(target, key),
+                daemon=True,
+            )
+            job["thread"] = thread
+            thread.start()
+            return self._init_job_payload(job)
+
+    def init_status(self, path: str) -> dict[str, Any]:
+        target_result = self._resolve_directory(path)
+        if target_result.get("error"):
+            return target_result
+        target = target_result["target"]
+        key = str(target)
+        with self._lock:
+            job = self._init_jobs.get(key)
+            if job:
+                return self._init_job_payload(job)
+        if _is_indexed_root(target):
+            return {
+                "status": "done",
+                "path": _path_for_client(target),
+                "elapsed": 0,
+            }
+        return {
+            "status": "not_started",
+            "path": _path_for_client(target),
+            "elapsed": 0,
+        }
+
+    def _resolve_directory(self, path: str) -> dict[str, Any]:
+        raw_path = str(path or "").strip()
+        if not raw_path:
+            return {"error": "path is required"}
+        try:
+            target = Path(raw_path).expanduser().resolve()
+        except OSError as exc:
+            return {"error": str(exc)}
+        if not target.is_dir():
+            return {"error": "not a directory", "path": _path_for_client(target)}
+        return {"target": target}
+
+    def _init_job_payload(self, job: dict[str, Any]) -> dict[str, Any]:
+        elapsed = int(time.monotonic() - float(job.get("started_at") or time.monotonic()))
+        payload = {
+            "status": str(job.get("status") or "not_started"),
+            "path": str(job.get("path") or ""),
+            "elapsed": elapsed,
+        }
+        if job.get("message"):
+            payload["message"] = str(job["message"])
+        if job.get("stats") is not None:
+            payload["stats"] = job["stats"]
+        return payload
+
+    def _run_init_job(self, target: Path, key: str) -> None:
+        try:
+            next_config = cfg_mod.load(target)
+            next_config.index_dir.mkdir(parents=True, exist_ok=True)
+            if not next_config.config_path.exists():
+                cfg_mod.save(next_config)
+            conn = db_mod.connect(next_config.db_path)
+            try:
+                db_mod.apply_schema(conn)
+                stats = reindex(
+                    conn,
+                    next_config,
+                    paths=None,
+                    event_source="graph-server-init",
+                    force=False,
+                )
+            finally:
+                db_mod.close(conn)
+            _sync_global_workspace_member(target)
+            with self._lock:
+                job = self._init_jobs[key]
+                job["status"] = "done"
+                job["stats"] = stats.to_dict()
+        except Exception as exc:
+            with self._lock:
+                job = self._init_jobs[key]
+                job["status"] = "error"
+                job["message"] = str(exc)
 
 
 def _latest_event_pk(conn: sqlite3.Connection) -> int:
@@ -52,6 +349,14 @@ def _agent_activity_signature(conn: sqlite3.Connection, event_pk: int) -> str:
             """,
             (datetime.now(timezone.utc).isoformat(timespec="milliseconds"),),
         ).fetchone()
+        process_row = conn.execute(
+            """
+            SELECT COUNT(*) AS process_count,
+                   COALESCE(MAX(heartbeat_at), '') AS heartbeat_at,
+                   COALESCE(MAX(ended_at), '') AS ended_at
+              FROM agent_run_processes
+            """
+        ).fetchone()
     except sqlite3.OperationalError:
         return str(event_pk)
     return ":".join(
@@ -61,6 +366,9 @@ def _agent_activity_signature(conn: sqlite3.Connection, event_pk: int) -> str:
             str(run_row["updated_at"] if run_row else ""),
             str(claim_row["claim_count"] if claim_row else 0),
             str(claim_row["updated_at"] if claim_row else ""),
+            str(process_row["process_count"] if process_row else 0),
+            str(process_row["heartbeat_at"] if process_row else ""),
+            str(process_row["ended_at"] if process_row else ""),
         ]
     )
 
@@ -131,6 +439,7 @@ def _state_signature(config: cfg_mod.Config, *, conn=None) -> dict[str, Any]:
 
 
 def _agent_stream_payload(config: cfg_mod.Config) -> dict[str, Any]:
+    _reconcile_agent_runs(config)
     conn = db_mod.connect(config.db_path)
     try:
         db_mod.ensure_schema(conn, config)
@@ -176,6 +485,8 @@ def _agent_stream_payload(config: cfg_mod.Config) -> dict[str, Any]:
             "agent_events": snapshot["recent_events"],
             "agent_recent_files": snapshot["recent_files"],
             "active_claims": snapshot.get("active_claims", []),
+            "file_presence": snapshot.get("file_presence", {}),
+            "overlapping_runs": snapshot.get("overlapping_runs", []),
         },
     }
 
@@ -201,6 +512,18 @@ def _agent_runtime_payload() -> dict[str, Any]:
             "provider_presets": provider_presets,
         },
     }
+
+
+def _reconcile_agent_runs(config: cfg_mod.Config) -> dict[str, Any]:
+    """Apply deterministic Agent Run lifecycle updates before live snapshots."""
+
+    with writer_lock(config, timeout_s=5.0):
+        conn = db_mod.connect(config.db_path)
+        try:
+            db_mod.apply_schema(conn)
+            return run_orchestrator.apply(conn)
+        finally:
+            db_mod.close(conn)
 
 
 def _record_user_note_event(
@@ -237,22 +560,37 @@ def _record_user_note_event(
 
 
 def _build_payload(config: cfg_mod.Config, args: argparse.Namespace) -> dict[str, Any]:
+    _reconcile_agent_runs(config)
     conn = db_mod.connect(config.db_path)
     try:
         db_mod.ensure_schema(conn, config)
+        scope_selection = scopes.resolve_scope_from_args(config.root, args)
+        focus_paths = list(args.focus or [])
+        if scope_selection.explicit:
+            focus_paths.extend(
+                path
+                for path in scopes.indexed_file_paths_for_scope(
+                    conn,
+                    scope_selection,
+                    limit=200,
+                )
+                if path not in focus_paths
+            )
         payload = build_graph(
             conn,
             config.root,
             include_code=not args.no_code,
             max_code_bytes=max(0, int(args.max_code_bytes)),
-            focus_paths=args.focus or [],
+            focus_paths=focus_paths,
             agent_name=args.agent_name,
         )
+        payload["scope"] = scope_selection.to_dict()
         payload["live"] = {
             "server": True,
             "events_path": "/events",
             "notes_path": "/api/notes",
             "search_path": "/api/search",
+            "symbols_path": "/api/symbols",
             "agent_preflight_path": "/api/agent-task-preflight",
             "agent_runs_path": "/api/agent-runs",
             "agent_events_path": "/api/agent-events",
@@ -260,6 +598,13 @@ def _build_payload(config: cfg_mod.Config, args: argparse.Namespace) -> dict[str
             "agent_providers_path": "/api/agent-providers",
             "agent_providers": agent_providers.provider_registry_payload(),
             "agent_runtime": _agent_runtime_payload(),
+            "dirs_path": "/api/dirs",
+            "switch_project_path": "/api/switch-project",
+            "init_status_path": "/api/init-status",
+            "active_project": {
+                "name": config.root.name,
+                "path": _path_for_client(config.root),
+            },
         }
         return payload
     finally:
