@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "scripts" / "install_openclaw_m1_launchd.py"
+ROSIE_HOST_ID = "host_a23037f43daa41b19d1d441ec514af33"
 
 
 def _load_installer():
@@ -16,6 +17,10 @@ def _load_installer():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _seed_host_identity(path: Path, host_id: str) -> None:
+    path.write_text(json.dumps({"host_id": host_id}) + "\n", encoding="utf-8")
 
 
 def test_launchd_installer_writes_rosie_host_config_for_shared_broker(
@@ -100,3 +105,62 @@ def test_launchd_bootstrap_services_uses_generated_plists(
         ],
         ["launchctl", "kickstart", "-k", f"gui/501/{label}"],
     ]
+
+
+def test_launchd_installer_main_preserves_rosie_identity_and_alias(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    installer = _load_installer()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text("[project]\nname = 'code-index'\n", encoding="utf-8")
+    home_root = tmp_path / "home"
+    install = installer.install_paths(repo, home=home_root)
+    for directory in (
+        install["state_root"],
+        install["hostd_state"],
+        install["config_dir"],
+        install["logs_dir"],
+        install["launch_agents"],
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    _seed_host_identity(install["hostd_state"] / "host-identity.json", ROSIE_HOST_ID)
+
+    original_install_paths = installer.install_paths
+    monkeypatch.setattr(
+        installer,
+        "install_paths",
+        lambda repo_path, *, home=None: original_install_paths(repo_path, home=home_root),
+    )
+
+    exit_code = installer.main(
+        [
+            "--repo",
+            str(repo),
+            "--host-display-name",
+            "rosie",
+            "--host-alias",
+            "rosie",
+            "--nats-url",
+            "nats://canonical-broker.internal:4222",
+            "--no-start",
+        ]
+    )
+
+    assert exit_code == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["host_id"] == ROSIE_HOST_ID
+    assert result["started"] is False
+
+    payload = json.loads(
+        (install["config_dir"] / "memory-claude-openclaw-m1-hostd.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert payload["host_aliases"] == ["rosie"]
+    assert payload["nats_url"] == "nats://canonical-broker.internal:4222"
+    assert json.loads(
+        (install["hostd_state"] / "host-identity.json").read_text(encoding="utf-8")
+    ) == {"host_id": ROSIE_HOST_ID}

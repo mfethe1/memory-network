@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "scripts" / "install_openclaw_m1_systemd.py"
+LENNY_HOST_ID = "host_6a163e09f5744561a0827d30253b3ba8"
 
 
 def _load_installer():
@@ -16,6 +17,10 @@ def _load_installer():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _seed_host_identity(path: Path, host_id: str) -> None:
+    path.write_text(json.dumps({"host_id": host_id}) + "\n", encoding="utf-8")
 
 
 def test_systemd_installer_writes_lenny_host_config_for_rosie_broker(
@@ -110,3 +115,62 @@ def test_systemd_installer_writes_user_units_for_graph_hostd_and_fleet_mcp(
     assert "--probe-graph-server --probe-context" in hostd_unit
     assert "fleet-mcp-serve --transport http --host 127.0.0.1 --port 8766" in fleet_unit
     assert "WantedBy=default.target" in graph_unit
+
+
+def test_systemd_installer_main_preserves_lenny_identity_and_alias(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    installer = _load_installer()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text("[project]\nname = 'code-index'\n", encoding="utf-8")
+    home_root = tmp_path / "home"
+    install = installer.install_paths(repo, home=home_root)
+    for directory in (
+        install["state_root"],
+        install["hostd_state"],
+        install["config_dir"],
+        install["logs_dir"],
+        install["systemd_user"],
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    _seed_host_identity(install["hostd_state"] / "host-identity.json", LENNY_HOST_ID)
+
+    original_install_paths = installer.install_paths
+    monkeypatch.setattr(
+        installer,
+        "install_paths",
+        lambda repo_path, *, home=None: original_install_paths(repo_path, home=home_root),
+    )
+
+    exit_code = installer.main(
+        [
+            "--repo",
+            str(repo),
+            "--host-display-name",
+            "lenny",
+            "--host-alias",
+            "lenny",
+            "--nats-url",
+            "nats://canonical-broker.internal:4222",
+            "--no-start",
+        ]
+    )
+
+    assert exit_code == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["host_id"] == LENNY_HOST_ID
+    assert result["started"] is False
+
+    payload = json.loads(
+        (install["config_dir"] / "memory-claude-openclaw-m1-hostd.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert payload["host_aliases"] == ["lenny"]
+    assert payload["nats_url"] == "nats://canonical-broker.internal:4222"
+    assert json.loads(
+        (install["hostd_state"] / "host-identity.json").read_text(encoding="utf-8")
+    ) == {"host_id": LENNY_HOST_ID}
