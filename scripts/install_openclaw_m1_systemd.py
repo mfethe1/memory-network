@@ -45,7 +45,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("OPENCLAW_NATS_URL"),
         help=(
             "Shared OpenClaw NATS URL, including token auth. "
-            "May also be supplied as OPENCLAW_NATS_URL."
+            "May also be supplied as OPENCLAW_NATS_URL. Overrides --nats-url-file."
+        ),
+    )
+    parser.add_argument(
+        "--nats-url-file",
+        default=os.environ.get("OPENCLAW_HOSTD_NATS_URL_FILE"),
+        help=(
+            "Protected file containing the shared OpenClaw NATS URL. "
+            "May also be supplied as OPENCLAW_HOSTD_NATS_URL_FILE."
         ),
     )
     parser.add_argument("--graph-port", type=int, default=8767)
@@ -72,9 +80,12 @@ def main(argv: list[str] | None = None) -> int:
     repo = Path(args.repo).expanduser().resolve()
     if not (repo / "pyproject.toml").is_file():
         raise SystemExit(f"repo does not look like code_index: {repo}")
-    nats_url = str(args.nats_url or "").strip()
+    nats_url = resolve_nats_url(args)
     if not nats_url:
-        raise SystemExit("--nats-url or OPENCLAW_NATS_URL is required")
+        raise SystemExit(
+            "--nats-url, --nats-url-file, OPENCLAW_NATS_URL, or "
+            "OPENCLAW_HOSTD_NATS_URL_FILE is required"
+        )
 
     install = install_paths(repo)
     for directory in (
@@ -146,6 +157,16 @@ def install_paths(repo: Path, *, home: Path | None = None) -> dict[str, Path]:
         "venv_python": repo / ".venv" / "bin" / "python",
         "hostd_bin": repo / ".venv" / "bin" / "code-index-openclaw-hostd",
     }
+
+
+def resolve_nats_url(args: argparse.Namespace) -> str:
+    nats_url = str(args.nats_url or "").strip()
+    if nats_url:
+        return nats_url
+    nats_url_file = str(args.nats_url_file or "").strip()
+    if not nats_url_file:
+        return ""
+    return Path(nats_url_file).expanduser().read_text(encoding="utf-8").strip()
 
 
 def write_hostd_config(

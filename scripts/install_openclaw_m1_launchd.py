@@ -83,7 +83,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("OPENCLAW_NATS_URL"),
         help=(
             "Shared OpenClaw NATS URL, including token auth. "
-            "May also be supplied as OPENCLAW_NATS_URL. Overrides --nats-conf."
+            "May also be supplied as OPENCLAW_NATS_URL. Overrides "
+            "--nats-url-file and --nats-conf."
+        ),
+    )
+    parser.add_argument(
+        "--nats-url-file",
+        default=os.environ.get("OPENCLAW_HOSTD_NATS_URL_FILE"),
+        help=(
+            "Protected file containing the shared OpenClaw NATS URL. "
+            "May also be supplied as OPENCLAW_HOSTD_NATS_URL_FILE."
         ),
     )
     parser.add_argument("--graph-port", type=int, default=8767)
@@ -121,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     ):
         directory.mkdir(parents=True, exist_ok=True)
 
-    nats_url = str(args.nats_url or "").strip()
+    nats_url = resolve_nats_url(args)
     if not nats_url:
         nats_token = read_nats_token(Path(args.nats_conf).expanduser())
         nats_url = f"nats://{nats_token}@127.0.0.1:4222"
@@ -184,6 +193,16 @@ def install_paths(repo: Path, *, home: Path | None = None) -> dict[str, Path]:
         "venv_python": repo / ".venv" / "bin" / "python",
         "hostd_bin": repo / ".venv" / "bin" / "code-index-openclaw-hostd",
     }
+
+
+def resolve_nats_url(args: argparse.Namespace) -> str:
+    nats_url = str(args.nats_url or "").strip()
+    if nats_url:
+        return nats_url
+    nats_url_file = str(args.nats_url_file or "").strip()
+    if not nats_url_file:
+        return ""
+    return Path(nats_url_file).expanduser().read_text(encoding="utf-8").strip()
 
 
 def read_nats_token(path: Path) -> str:

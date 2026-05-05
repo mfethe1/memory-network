@@ -36,6 +36,16 @@ Use the same broker URL for both hosts:
 
 ```bash
 export OPENCLAW_NATS_URL="nats://<operator-supplied-authenticated-host-endpoint>:4222"
+export OPENCLAW_NATS_URL_FILE="$HOME/.openclaw/secrets/memory-claude-openclaw-m1/hostd/nats-url"
+python3 - <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["OPENCLAW_NATS_URL_FILE"]).expanduser()
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(os.environ["OPENCLAW_NATS_URL"].strip() + "\n", encoding="utf-8")
+path.chmod(0o600)
+PY
 ```
 
 Use a host-reachable authenticated URL here. Do not commit the literal
@@ -85,7 +95,7 @@ print(
     }
 )
 PY
-python3 scripts/check_openclaw_nats_preflight.py --nats-url "$OPENCLAW_NATS_URL"
+python3 scripts/check_openclaw_nats_preflight.py --nats-url-file "$OPENCLAW_NATS_URL_FILE"
 ```
 
 On Lenny, verify the existing host identity, then rewrite the config with
@@ -108,7 +118,7 @@ python3 scripts/install_openclaw_m1_systemd.py \
   --repo "$PWD" \
   --host-display-name lenny \
   --host-alias lenny \
-  --nats-url "$OPENCLAW_NATS_URL" \
+  --nats-url-file "$OPENCLAW_NATS_URL_FILE" \
   --no-start
 python3 - <<'PY'
 import json
@@ -151,7 +161,7 @@ python3 scripts/install_openclaw_m1_launchd.py \
   --repo "$PWD" \
   --host-display-name rosie \
   --host-alias rosie \
-  --nats-url "$OPENCLAW_NATS_URL" \
+  --nats-url-file "$OPENCLAW_NATS_URL_FILE" \
   --no-start
 python3 - <<'PY'
 import json
@@ -185,7 +195,7 @@ without passing the URL through the command line:
 
 ```bash
 python3 scripts/check_openclaw_nats_preflight.py \
-  --nats-url-file "$HOME/.openclaw/secrets/memory-claude-openclaw-m1/hostd/nats-url"
+  --nats-url-file "$OPENCLAW_NATS_URL_FILE"
 ```
 
 ## Lenny Linux Install
@@ -197,7 +207,7 @@ python scripts/install_openclaw_m1_systemd.py \
   --repo "$PWD" \
   --host-display-name lenny \
   --host-alias lenny \
-  --nats-url "$OPENCLAW_NATS_URL"
+  --nats-url-file "$OPENCLAW_NATS_URL_FILE"
 ```
 
 Then verify:
@@ -216,7 +226,7 @@ python scripts/install_openclaw_m1_systemd.py \
   --repo "$PWD" \
   --host-display-name lenny \
   --host-alias lenny \
-  --nats-url "$OPENCLAW_NATS_URL" \
+  --nats-url-file "$OPENCLAW_NATS_URL_FILE" \
   --no-start
 ```
 
@@ -229,7 +239,7 @@ python scripts/install_openclaw_m1_launchd.py \
   --repo "$PWD" \
   --host-display-name rosie \
   --host-alias rosie \
-  --nats-url "$OPENCLAW_NATS_URL"
+  --nats-url-file "$OPENCLAW_NATS_URL_FILE"
 ```
 
 Then verify:
@@ -249,7 +259,7 @@ python scripts/install_openclaw_m1_launchd.py \
   --repo "$PWD" \
   --host-display-name rosie \
   --host-alias rosie \
-  --nats-url "$OPENCLAW_NATS_URL" \
+  --nats-url-file "$OPENCLAW_NATS_URL_FILE" \
   --no-start
 ```
 
@@ -290,7 +300,7 @@ python scripts/install_openclaw_m1_systemd.py \
   --repo "$PWD" \
   --host-display-name lenny \
   --host-alias lenny \
-  --nats-url "$OPENCLAW_NATS_URL" \
+  --nats-url-file "$OPENCLAW_NATS_URL_FILE" \
   --no-start \
   --provision-broker
 ```

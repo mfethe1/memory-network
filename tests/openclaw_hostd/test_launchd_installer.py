@@ -72,6 +72,16 @@ def test_launchd_installer_does_not_provision_broker_by_default() -> None:
     assert args.no_start is False
 
 
+def test_launchd_installer_resolves_nats_url_from_file(tmp_path: Path) -> None:
+    installer = _load_installer()
+    nats_url_file = tmp_path / "nats-url"
+    nats_url_file.write_text("nats://file-token@example.invalid:4222\n", encoding="utf-8")
+
+    args = installer.build_parser().parse_args(["--nats-url-file", str(nats_url_file)])
+
+    assert installer.resolve_nats_url(args) == "nats://file-token@example.invalid:4222"
+
+
 def test_launchd_bootstrap_services_uses_generated_plists(
     tmp_path: Path,
     monkeypatch,
