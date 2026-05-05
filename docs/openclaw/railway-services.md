@@ -32,9 +32,14 @@ Controller:
 
 Optional controller variables:
 
+- `OPENCLAW_TELEGRAM_BOT_TOKEN`
 - `OPENCLAW_TELEGRAM_SECRET_TOKEN`
 - `OPENCLAW_REQUIRE_NATS=1`
 - `OPENCLAW_BIND_HOST=::`
+
+For the production Telegram control-plane runbook, including private
+supergroup policy and webhook secret handling, see
+[production-telegram-configuration.md](/home/agent/workspace/docs/openclaw/production-telegram-configuration.md:1).
 
 Fleet MCP:
 
