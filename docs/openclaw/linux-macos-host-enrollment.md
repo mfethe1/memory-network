@@ -15,7 +15,9 @@ On each host:
 
 1. Clone or sync this repo.
 2. Create `.venv` and install the package with `python -m pip install -e .`.
-3. Make the persistent NATS broker reachable over the private network.
+3. Make the canonical broker reachable from the host. When Railway NATS is the
+   canonical broker, this means its authenticated public TCP endpoint, not
+   `*.railway.internal`.
 4. Use a controller signing secret and Telegram tokens only in controller-side
    service config; do not place Telegram secrets on host daemons.
 5. Provision NATS streams, KV buckets, and host consumers from an admin
@@ -33,8 +35,12 @@ loginctl show-user "$USER" -p Linger
 Use the same broker URL for both hosts:
 
 ```bash
-export OPENCLAW_NATS_URL="nats://openclaw-m1-broker-01.internal:4222"
+export OPENCLAW_NATS_URL="nats://<operator-supplied-authenticated-host-endpoint>:4222"
 ```
+
+Use a host-reachable authenticated URL here. Do not commit the literal
+credential. The controller may use a different Railway-internal NATS URL when
+it runs on Railway.
 
 ## Lenny Linux Install
 

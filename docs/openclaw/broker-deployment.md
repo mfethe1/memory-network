@@ -1,13 +1,23 @@
 # OpenClaw Broker Deployment
 
-Slice 0 decision: the first real OpenClaw broker test uses a persistent VM
-running NATS with JetStream file storage. Railway is not the NATS target until
-JetStream persistence has been proven across restarts, deploys, and network
-interruptions.
+Slice 0 decision: Railway NATS is the canonical Telegram control-plane broker
+only after the deployment proves three things:
 
-## Selected Target
+1. The controller can use a Railway-internal NATS path.
+2. Enrolled hosts can reach an authenticated public TCP endpoint from outside
+   Railway.
+3. JetStream persistence survives restarts, deploys, and network interruptions.
 
-Use one provider-neutral persistent VM target named `openclaw-m1-broker-01`:
+Until those checks pass, keep using another authenticated persistent broker for
+controller and host traffic.
+
+## Canonical Target
+
+Preferred target when the checks above pass: Railway-hosted NATS with one
+internal controller path and one authenticated public TCP path for hosts.
+
+Fallback target when Railway does not yet satisfy those checks: one
+provider-neutral persistent VM target named `openclaw-m1-broker-01`:
 
 - Region: same cloud region as the first Fleet Controller test deployment; if
   the controller region is not chosen yet, use the closest US region to the
@@ -29,13 +39,21 @@ Use one provider-neutral persistent VM target named `openclaw-m1-broker-01`:
 
 Managed NATS is acceptable later if it provides the same JetStream persistence,
 NKey/account controls, monitoring, and restart evidence. Railway may host
-`fumemory` and control APIs, but it is not the broker for Milestone 1 until the
-restart verification below passes on Railway.
+`fumemory`, control APIs, and the canonical NATS broker only after the
+authenticated public host path and the restart verification below both pass on
+Railway.
 
-Railway-hosted controller, Messaging API, Fleet MCP, and fumemory-compatible
-services should therefore point at this external or otherwise restart-verified
-persistent broker. Do not treat a Railway NATS deployment as production-ready
-for M1 until the JetStream restart and deploy checks below have been completed.
+When Railway is canonical:
+
+- The controller, Messaging API, Fleet MCP, and other Railway-local services
+  may point at the Railway-internal NATS URL.
+- Enrolled Linux/macOS hosts must use an operator-supplied authenticated
+  external NATS URL.
+- Do not publish or commit literal NATS credentials.
+- Do not expose a public unauthenticated NATS listener.
+
+If Railway is not yet canonical, point both controller and hosts at the same
+authenticated persistent fallback broker instead.
 
 This satisfies the plan because the first broker has explicit JetStream file
 storage, a disk lifecycle independent from the VM lifecycle, private-only
@@ -141,7 +159,7 @@ any canary is missing, do not use that deployment target for Milestone 1.
 Runnable-ish `nats` CLI shape for the same check:
 
 ```powershell
-$env:NATS_URL = "nats://openclaw-m1-broker-01.internal:4222"
+$env:NATS_URL = "nats://<operator-supplied-admin-endpoint>:4222"
 $creds = ".\creds\openclaw-admin.creds"
 
 nats --server $env:NATS_URL --creds $creds stream add OPENCLAW_TASKS `
@@ -165,7 +183,7 @@ nats --server $env:NATS_URL --creds $creds kv put openclaw_agent_states oclh_can
   '{"run_id":"run_canary","state":"canary"}'
 ```
 
-Restart the NATS service and VM, then verify:
+Restart the NATS service and its host platform, then verify:
 
 ```powershell
 nats --server $env:NATS_URL --creds $creds stream info OPENCLAW_TASKS
