@@ -552,6 +552,46 @@ def test_task_ack_is_reserved_before_publish_so_reentrant_replay_does_not_ack_tw
     ]
 
 
+@pytest.mark.parametrize(
+    ("host_id", "task_id", "expected_subject"),
+    [
+        (
+            "host_6a163e09f5744561a0827d30253b3ba8",
+            "task-lenny-smoke",
+            "openclaw.task.host_6a163e09f5744561a0827d30253b3ba8.ack",
+        ),
+        (
+            "host_a23037f43daa41b19d1d441ec514af33",
+            "task-rosie-smoke",
+            "openclaw.task.host_a23037f43daa41b19d1d441ec514af33.ack",
+        ),
+    ],
+)
+def test_task_inbox_publishes_expected_ack_subject_for_stable_openclaw_hosts(
+    tmp_path: Path,
+    host_id: str,
+    task_id: str,
+    expected_subject: str,
+) -> None:
+    transport = FakeNatsTransport()
+    nats = NatsClient(transport=transport)
+    nats.connect()
+    inbox = TaskInbox(
+        tmp_path / f"{task_id}.db",
+        host_id=host_id,
+        graph_client=FakeGraphClient(),
+        nats_client=nats,
+    )
+
+    result = inbox.handle_task_assignment(
+        _assignment(host_id=host_id, task_id=task_id)
+    )
+
+    assert result.status == "accepted"
+    assert [subject for subject, _ in transport.published] == [expected_subject]
+    assert transport.published[0][1]["host_id"] == host_id
+
+
 def test_unpublished_task_ack_is_retried_on_replay(tmp_path: Path) -> None:
     db_path = tmp_path / "inbox.db"
     inbox = TaskInbox(db_path, host_id="host-a", graph_client=FakeGraphClient())
