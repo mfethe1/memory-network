@@ -66,7 +66,8 @@ These checks are safe to run before cutover. They do not restart services,
 provision broker resources, or print broker credentials.
 
 On either host, first confirm the shared canonical broker URL is set and points
-at the expected host and port:
+at the expected host and port, then authenticate to it without printing the
+credential:
 
 ```bash
 test -n "$OPENCLAW_NATS_URL"
@@ -84,6 +85,7 @@ print(
     }
 )
 PY
+python3 scripts/check_openclaw_nats_preflight.py --nats-url "$OPENCLAW_NATS_URL"
 ```
 
 On Lenny, verify the existing host identity, then rewrite the config with
@@ -116,12 +118,15 @@ from pathlib import Path
 path = Path.home() / ".openclaw/config/memory-claude-openclaw-m1-hostd.json"
 payload = json.loads(path.read_text(encoding="utf-8"))
 assert payload["host_aliases"] == [os.environ["OPENCLAW_EXPECTED_ALIAS"]], payload
-assert payload["nats_url"] == os.environ["OPENCLAW_NATS_URL"], "nats_url mismatch"
+nats_url_file = Path(payload["nats_url_file"])
+assert "nats_url" not in payload, "NATS credential must not be stored in JSON config"
+assert nats_url_file.read_text(encoding="utf-8").strip() == os.environ["OPENCLAW_NATS_URL"], "nats_url_file mismatch"
 print(
     {
         "config_path": str(path),
         "host_aliases": payload["host_aliases"],
-        "nats_url_matches_env": True,
+        "nats_url_file": str(nats_url_file),
+        "nats_url_file_matches_env": True,
     }
 )
 PY
@@ -156,12 +161,15 @@ from pathlib import Path
 path = Path.home() / ".openclaw/config/memory-claude-openclaw-m1-hostd.json"
 payload = json.loads(path.read_text(encoding="utf-8"))
 assert payload["host_aliases"] == [os.environ["OPENCLAW_EXPECTED_ALIAS"]], payload
-assert payload["nats_url"] == os.environ["OPENCLAW_NATS_URL"], "nats_url mismatch"
+nats_url_file = Path(payload["nats_url_file"])
+assert "nats_url" not in payload, "NATS credential must not be stored in JSON config"
+assert nats_url_file.read_text(encoding="utf-8").strip() == os.environ["OPENCLAW_NATS_URL"], "nats_url_file mismatch"
 print(
     {
         "config_path": str(path),
         "host_aliases": payload["host_aliases"],
-        "nats_url_matches_env": True,
+        "nats_url_file": str(nats_url_file),
+        "nats_url_file_matches_env": True,
     }
 )
 PY
@@ -169,7 +177,16 @@ PY
 
 If those checks pass on both machines, the cutover can proceed to the live
 service restart window with stable host IDs, stable aliases, and a shared
-canonical broker URL already staged in config.
+canonical broker URL already staged in a protected host secret file referenced
+by config.
+
+After `--no-start` writes the protected secret file, the same preflight can run
+without passing the URL through the command line:
+
+```bash
+python3 scripts/check_openclaw_nats_preflight.py \
+  --nats-url-file "$HOME/.openclaw/secrets/memory-claude-openclaw-m1/hostd/nats-url"
+```
 
 ## Lenny Linux Install
 

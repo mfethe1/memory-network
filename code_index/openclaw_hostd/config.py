@@ -19,6 +19,7 @@ GRAPH_SERVER_TOKEN_ENV = "OPENCLAW_HOSTD_GRAPH_SERVER_TOKEN"
 SSH_HOSTNAME_ENV = "OPENCLAW_HOSTD_SSH_HOSTNAME"
 HEARTBEAT_INTERVAL_ENV = "OPENCLAW_HOSTD_HEARTBEAT_INTERVAL_SECONDS"
 NATS_URL_ENV = "OPENCLAW_HOSTD_NATS_URL"
+NATS_URL_FILE_ENV = "OPENCLAW_HOSTD_NATS_URL_FILE"
 HOST_ALIASES_ENV = "OPENCLAW_HOSTD_HOST_ALIASES"
 FLEET_LEASE_STORE_PATH_ENV = "OPENCLAW_HOSTD_FLEET_LEASE_STORE_PATH"
 CONTEXT_STORE_PATH_ENV = "OPENCLAW_HOSTD_CONTEXT_STORE_PATH"
@@ -97,6 +98,12 @@ def _text_or_none(value: Any) -> str | None:
     if not isinstance(value, str):
         raise ValueError("expected a string value")
     return value.strip() or None
+
+
+def _read_text_secret(path: Path) -> str | None:
+    if not path.is_file():
+        raise FileNotFoundError(f"OpenClaw host daemon secret file not found: {path}")
+    return _text_or_none(path.read_text(encoding="utf-8"))
 
 
 def normalize_host_aliases(
@@ -198,7 +205,15 @@ def load_config(
         ),
         default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
     )
-    nats_url = _text_or_none(environ.get(NATS_URL_ENV, data.get("nats_url")))
+    nats_url = _text_or_none(environ.get(NATS_URL_ENV))
+    if nats_url is None:
+        nats_url_file = _optional_path(environ.get(NATS_URL_FILE_ENV))
+        if nats_url_file is None:
+            nats_url_file = _optional_path(data.get("nats_url_file"))
+        if nats_url_file is not None:
+            nats_url = _read_text_secret(nats_url_file)
+    if nats_url is None:
+        nats_url = _text_or_none(data.get("nats_url"))
     fleet_lease_store_path = _optional_path(
         environ.get(FLEET_LEASE_STORE_PATH_ENV)
     )

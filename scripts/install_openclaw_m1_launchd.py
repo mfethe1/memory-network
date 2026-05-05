@@ -115,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         install["state_root"],
         install["hostd_state"],
         install["config_dir"],
+        install["secrets_dir"],
         install["logs_dir"],
         install["launch_agents"],
     ):
@@ -177,6 +178,7 @@ def install_paths(repo: Path, *, home: Path | None = None) -> dict[str, Path]:
         "hostd_state": state_root / "hostd",
         "context_store": state_root / "context-store.db",
         "config_dir": root / ".openclaw" / "config",
+        "secrets_dir": root / ".openclaw" / "secrets" / "memory-claude-openclaw-m1" / "hostd",
         "logs_dir": root / ".openclaw" / "logs",
         "launch_agents": root / "Library" / "LaunchAgents",
         "venv_python": repo / ".venv" / "bin" / "python",
@@ -204,6 +206,7 @@ def write_hostd_config(
     heartbeat_seconds: int,
 ) -> Path:
     config_path = install["config_dir"] / "memory-claude-openclaw-m1-hostd.json"
+    nats_url_file = write_nats_url_secret(install, nats_url)
     payload = {
         "state_dir": str(install["hostd_state"]),
         "host_identity_path": str(identity_path),
@@ -211,7 +214,7 @@ def write_hostd_config(
         "graph_server_url": f"http://127.0.0.1:{graph_port}",
         "ssh_hostname": host_display_name,
         "heartbeat_interval_seconds": heartbeat_seconds,
-        "nats_url": str(nats_url).strip(),
+        "nats_url_file": str(nats_url_file),
         "fleet_lease_store_path": str(install["hostd_state"] / "fleet-leases.db"),
         "context_store_path": str(install["context_store"]),
     }
@@ -224,6 +227,14 @@ def write_hostd_config(
     )
     os.chmod(config_path, 0o600)
     return config_path
+
+
+def write_nats_url_secret(install: dict[str, Path], nats_url: str) -> Path:
+    path = install["secrets_dir"] / "nats-url"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(nats_url).strip() + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    return path
 
 
 async def provision_nats(

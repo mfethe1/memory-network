@@ -54,7 +54,10 @@ def test_systemd_installer_writes_lenny_host_config_for_rosie_broker(
     assert payload["ssh_hostname"] == "lenny"
     assert payload["repo_roots"] == [str(repo)]
     assert payload["graph_server_url"] == "http://127.0.0.1:8767"
-    assert payload["nats_url"] == "nats://openclaw-system-2026@100.72.176.67:4222"
+    assert "nats_url" not in payload
+    assert Path(payload["nats_url_file"]).read_text(encoding="utf-8").strip() == (
+        "nats://openclaw-system-2026@100.72.176.67:4222"
+    )
     assert payload["context_store_path"] == str(
         tmp_path / "home/.openclaw/state/memory-claude-openclaw-m1/context-store.db"
     )
@@ -170,7 +173,10 @@ def test_systemd_installer_main_preserves_lenny_identity_and_alias(
         )
     )
     assert payload["host_aliases"] == ["lenny"]
-    assert payload["nats_url"] == "nats://canonical-broker.internal:4222"
+    assert "nats_url" not in payload
+    assert Path(payload["nats_url_file"]).read_text(encoding="utf-8").strip() == (
+        "nats://canonical-broker.internal:4222"
+    )
     assert json.loads(
         (install["hostd_state"] / "host-identity.json").read_text(encoding="utf-8")
     ) == {"host_id": LENNY_HOST_ID}

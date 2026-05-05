@@ -16,6 +16,7 @@ from code_index.openclaw_hostd.config import (
     HOST_ALIASES_ENV,
     HOST_IDENTITY_PATH_ENV,
     HostDaemonConfig,
+    NATS_URL_FILE_ENV,
     NATS_URL_ENV,
     REPO_ROOTS_ENV,
     load_config,
@@ -213,6 +214,60 @@ def test_config_loads_json_file_with_environment_overrides(tmp_path: Path) -> No
     assert config.context_store_path == tmp_path / "context-from-env.db"
     assert config.ssh_hostname == "file-host"
     assert config.heartbeat_interval_seconds == 45
+
+
+def test_config_loads_nats_url_from_protected_file(tmp_path: Path) -> None:
+    nats_url_file = tmp_path / "nats-url"
+    nats_url_file.write_text(
+        "nats://user:nats-secret@example.invalid:4222\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "openclaw-hostd.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "repo_roots": [str(tmp_path)],
+                "nats_url_file": str(nats_url_file),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path, env={}, cwd=tmp_path)
+
+    assert config.nats_url == "nats://user:nats-secret@example.invalid:4222"
+    assert "nats-secret" not in repr(config)
+
+
+def test_config_env_nats_url_overrides_nats_url_file(tmp_path: Path) -> None:
+    nats_url_file = tmp_path / "nats-url"
+    nats_url_file.write_text(
+        "nats://user:file-secret@example.invalid:4222\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "openclaw-hostd.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "repo_roots": [str(tmp_path)],
+                "nats_url_file": str(nats_url_file),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(
+        config_path,
+        env={
+            NATS_URL_ENV: "nats://user:env-secret@example.invalid:4222",
+            NATS_URL_FILE_ENV: str(nats_url_file),
+        },
+        cwd=tmp_path,
+    )
+
+    assert config.nats_url == "nats://user:env-secret@example.invalid:4222"
+    assert "file-secret" not in repr(config)
+    assert "env-secret" not in repr(config)
 
 
 @pytest.mark.parametrize(

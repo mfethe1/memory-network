@@ -54,7 +54,8 @@ def test_launchd_installer_writes_rosie_host_config_for_shared_broker(
     assert payload["ssh_hostname"] == "rosie"
     assert payload["repo_roots"] == [str(repo)]
     assert payload["graph_server_url"] == "http://127.0.0.1:8767"
-    assert payload["nats_url"] == (
+    assert "nats_url" not in payload
+    assert Path(payload["nats_url_file"]).read_text(encoding="utf-8").strip() == (
         "nats://openclaw-system-2026@openclaw-m1-broker-01.internal:4222"
     )
     assert payload["context_store_path"] == str(
@@ -160,7 +161,10 @@ def test_launchd_installer_main_preserves_rosie_identity_and_alias(
         )
     )
     assert payload["host_aliases"] == ["rosie"]
-    assert payload["nats_url"] == "nats://canonical-broker.internal:4222"
+    assert "nats_url" not in payload
+    assert Path(payload["nats_url_file"]).read_text(encoding="utf-8").strip() == (
+        "nats://canonical-broker.internal:4222"
+    )
     assert json.loads(
         (install["hostd_state"] / "host-identity.json").read_text(encoding="utf-8")
     ) == {"host_id": ROSIE_HOST_ID}
