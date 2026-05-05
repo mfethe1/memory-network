@@ -35,6 +35,32 @@ That app-level handoff keeps scheduling and leases in the Fleet Controller
 while allowing one Telegram intake chat to submit work without a second manual
 API call. The same handoff runs for webhook ingestion and long-poll ingestion.
 
+## First-Launch Telegram Posture
+
+Inbound Telegram is the Milestone 1 launch requirement. The implemented success
+path is:
+
+1. Accept webhook or long-poll Telegram updates.
+2. Normalize and persist one canonical OpenClaw message.
+3. Create a signed command ref only when adapter identity and route policy
+   allow promotion.
+4. Hand eligible `assign_task` command refs to the Fleet Controller for the
+   normal lease and assignment flow.
+
+Outbound Telegram completion or status notifications are not required for first
+launch. The current repo already supports explicit Telegram notification targets
+and durable adapter delivery rows, but it does not include a controller worker
+or API route that dequeues queued Telegram adapter deliveries and sends them to
+the Bot API.
+
+`TelegramAdapter.render_outbound()` is therefore a payload-shaping contract,
+not a launch-critical runtime path. A future sender must remain controller-side:
+it should read queued `recipient_kind=adapter` and `recipient_id=telegram`
+delivery rows, use delivery metadata such as `platform_room_id` plus
+`render_outbound()` to build the Bot API request, send with controller-owned
+credentials, and reconcile results back through `ack_delivery()`. Hosts must
+not send Telegram messages directly.
+
 ## Storage
 
 The SQLite schema is created by `code_index.openclaw_messaging.store`:

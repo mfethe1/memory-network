@@ -132,6 +132,14 @@ Outbound rendering returns a Bot API-shaped payload:
 }
 ```
 
+For first launch, that outbound payload is a deferred controller contract, not
+an active runtime requirement. The repo currently implements Telegram ingress,
+delivery-row persistence, and payload rendering, but it does not run a
+production Telegram sender loop. Any future sender must stay controller-side,
+consume queued adapter deliveries generated from explicit notification targets,
+use controller-owned bot credentials, and reconcile delivery state through the
+canonical messaging store. Hosts do not send Telegram messages directly.
+
 ## Webhook Posture
 
 The generic webhook adapter can create inbound messages for audit and room
