@@ -1,6 +1,9 @@
 # OpenClaw Railway Services
 
-This slice makes the controller plus embedded Messaging API, the Fleet MCP HTTP surface, and the local fumemory-compatible SQLite store usable as Railway services without making Railway the default M1 NATS broker.
+This slice makes the controller plus embedded Messaging API, the Fleet MCP HTTP surface, and the local fumemory-compatible SQLite store usable as Railway services. Railway NATS becomes the canonical Telegram control-plane broker only when it provides both:
+
+- a Railway-internal NATS path for the controller service, and
+- an authenticated public TCP endpoint that enrolled hosts can reach from outside Railway.
 
 ## Service Layout
 
@@ -16,9 +19,10 @@ This slice makes the controller plus embedded Messaging API, the Fleet MCP HTTP 
   Not required for M1 completion durability in this repo because the durable local path is `SQLiteContextStore`.
   If you add one later, keep it private on Railway and point it at a volume-backed SQLite path.
   This slice documents the wiring contract but does not add a dedicated fumemory HTTP entry point.
-- External or restart-verified persistent NATS broker
+- Canonical NATS broker
   Required for controller task assignment and fleet coordination.
-  Do not treat Railway as the default M1 broker until the restart and deploy verification in [broker-deployment.md](/home/agent/workspace/docs/openclaw/broker-deployment.md:1) passes.
+  Treat Railway NATS as canonical only after the operator verifies the authenticated public host path plus the restart and deploy checks in [broker-deployment.md](/home/agent/workspace/docs/openclaw/broker-deployment.md:1).
+  If Railway cannot satisfy that, keep using another authenticated persistent broker for both controller and hosts until it can.
 
 ## Required Variables
 
@@ -84,7 +88,10 @@ Startup fails before serving traffic when:
 - Use Railway private DNS names such as `http://openclaw-controller.railway.internal`.
 - Bind internal listeners to `::` so the service is reachable on Railway private networking.
 - Use `http://`, not public domains, for controller-to-Fleet MCP or future fumemory calls inside the Railway environment.
-- Do not assume Linux/macOS fleet hosts can reach `*.railway.internal` directly. Hosts still need a reachable external broker/API path or a VPN/private overlay that you operate.
+- Do not assume Linux/macOS fleet hosts can reach `*.railway.internal` directly.
+- The controller may use Railway internal NATS when the broker runs on Railway.
+- Hosts still need an authenticated external NATS URL that resolves to a reachable public TCP endpoint or another operator-managed path outside Railway private DNS.
+- Never expose the external host endpoint without authentication.
 
 ## Start Commands
 
@@ -121,7 +128,7 @@ Controller service:
 OPENCLAW_DEPLOYMENT_MODE=railway
 OPENCLAW_BIND_HOST=::
 OPENCLAW_REQUIRE_NATS=1
-OPENCLAW_NATS_URL=nats://<external-or-proven-broker>:4222
+OPENCLAW_NATS_URL=nats://<railway-internal-or-other-proven-controller-broker>:4222
 OPENCLAW_CONTROLLER_DB_PATH=${RAILWAY_VOLUME_MOUNT_PATH}/openclaw/controller-state.db
 OPENCLAW_MESSAGING_DB_PATH=${RAILWAY_VOLUME_MOUNT_PATH}/openclaw/messaging.db
 OPENCLAW_CONTEXT_STORE_PATH=${RAILWAY_VOLUME_MOUNT_PATH}/openclaw/context-store.db
@@ -138,5 +145,13 @@ OPENCLAW_MESSAGING_DB_PATH=${RAILWAY_VOLUME_MOUNT_PATH}/openclaw/messaging.db
 OPENCLAW_CONTEXT_STORE_PATH=${RAILWAY_VOLUME_MOUNT_PATH}/openclaw/context-store.db
 OPENCLAW_FLEET_MCP_TOKEN=<bearer-token>
 ```
+
+Host enrollment uses a different value shape from the controller when Railway is canonical:
+
+```text
+OPENCLAW_NATS_URL=nats://<operator-supplied-authenticated-public-host-endpoint>:4222
+```
+
+Do not commit the literal host credential. The controller-side Railway config may use a Railway-internal NATS URL, while host installers must receive an operator-supplied authenticated external URL.
 
 If you split controller and Fleet MCP into different Railway services, attach a volume to both only when they truly need separate local SQLite state. If they must share one context store file, keep them on the same persistent service boundary or move the context layer behind a dedicated service before enabling concurrent writers.
