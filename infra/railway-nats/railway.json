@@ -1,9 +1,10 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "build": {
-    "dockerfilePath": "infra/railway-nats/Dockerfile"
+    "dockerfilePath": "Dockerfile"
   },
   "deploy": {
+    "startCommand": "/usr/local/bin/start-nats.sh",
     "healthcheckPath": "/healthz",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE",

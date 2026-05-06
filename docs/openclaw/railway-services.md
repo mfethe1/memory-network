@@ -174,5 +174,11 @@ PORT=8222
 The NATS Docker entrypoint writes the token into a private runtime config file
 instead of passing it as a process argument, stores JetStream under the Railway
 volume, and exposes the NATS monitoring `/healthz` endpoint on `PORT`.
+Deploy it from the NATS service directory so Railway reads
+`infra/railway-nats/railway.json` as the service-root config:
+
+```bash
+railway up infra/railway-nats --path-as-root --service nats-jetstream --environment production
+```
 
 If you split controller and Fleet MCP into different Railway services, attach a volume to both only when they truly need separate local SQLite state. If they must share one context store file, keep them on the same persistent service boundary or move the context layer behind a dedicated service before enabling concurrent writers.

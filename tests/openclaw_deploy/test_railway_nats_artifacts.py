@@ -14,6 +14,7 @@ def test_railway_nats_service_fails_closed_with_persistent_jetstream() -> None:
     manifest = json.loads((NATS_DIR / "railway.json").read_text(encoding="utf-8"))
 
     assert "FROM nats:" in dockerfile
+    assert "COPY start-nats.sh /usr/local/bin/start-nats.sh" in dockerfile
     assert "CMD [\"/usr/local/bin/start-nats.sh\"]" in dockerfile
 
     assert "NATS_TOKEN is required" in start_script
@@ -28,6 +29,8 @@ def test_railway_nats_service_fails_closed_with_persistent_jetstream() -> None:
     assert "jetstream {" in start_script
     assert "store_dir:" in start_script
 
+    assert manifest["build"]["dockerfilePath"] == "Dockerfile"
+    assert manifest["deploy"]["startCommand"] == "/usr/local/bin/start-nats.sh"
     assert manifest["deploy"]["healthcheckPath"] == "/healthz"
     assert manifest["deploy"]["restartPolicyType"] == "ON_FAILURE"
     assert manifest["deploy"]["restartPolicyMaxRetries"] == 10
