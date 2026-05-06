@@ -98,15 +98,13 @@ identity lookup or command promotion.
 
 ## Automation Status
 
-`scripts/bootstrap_openclaw_telegram.py` is not present in this worktree.
-Repository-side Telegram bootstrap automation remains a dependency on Issue #13.
+`scripts/bootstrap_openclaw_telegram.py` bootstraps the controller-side room
+mapping, adapter policy, and trusted Telegram operator identity links. Run it
+only against the controller messaging DB path and reuse the existing controller
+signing secret.
 
-Until that automation lands:
-
-- Do not add ad-hoc host-side bootstrap logic.
-- Do not create a second signing secret for Telegram bootstrap.
-- Any future bootstrap command must point at `OPENCLAW_MESSAGING_DB_PATH`.
-- Any future bootstrap command must use `OPENCLAW_CONTROLLER_SIGNING_SECRET`.
+Do not add ad-hoc host-side bootstrap logic or create a second signing secret
+for Telegram bootstrap.
 
 That keeps Telegram room policy, identity links, and signed command behavior on
 the same controller-owned trust boundary as the live webhook path.

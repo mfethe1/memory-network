@@ -23,6 +23,8 @@ This slice makes the controller plus embedded Messaging API, the Fleet MCP HTTP 
   Required for controller task assignment and fleet coordination.
   Treat Railway NATS as canonical only after the operator verifies the authenticated public host path plus the restart and deploy checks in [broker-deployment.md](/home/agent/workspace/docs/openclaw/broker-deployment.md:1).
   If Railway cannot satisfy that, keep using another authenticated persistent broker for both controller and hosts until it can.
+  The repo-owned Railway NATS service files live under `infra/railway-nats/` and
+  intentionally refuse to start without `NATS_TOKEN` and a Railway volume mount.
 
 ## Required Variables
 
@@ -120,6 +122,7 @@ Use per-service Railway config files instead of one shared root config:
 
 - `/deploy/railway/controller.railway.json`
 - `/deploy/railway/fleet-mcp.railway.json`
+- `/infra/railway-nats/railway.json`
 
 Set each Railway service to use its matching config file path from the dashboard.
 If you later add a dedicated fumemory HTTP wrapper, give it its own config file instead of reusing the controller file.
@@ -158,5 +161,18 @@ OPENCLAW_NATS_URL=nats://<operator-supplied-authenticated-public-host-endpoint>:
 ```
 
 Do not commit the literal host credential. The controller-side Railway config may use a Railway-internal NATS URL, while host installers must receive an operator-supplied authenticated external URL.
+
+NATS service:
+
+```text
+NATS_TOKEN=<url-safe-shared-token>
+RAILWAY_TCP_APPLICATION_PORT=<Railway TCP proxy application port>
+RAILWAY_VOLUME_MOUNT_PATH=/data
+PORT=8222
+```
+
+The NATS Docker entrypoint writes the token into a private runtime config file
+instead of passing it as a process argument, stores JetStream under the Railway
+volume, and exposes the NATS monitoring `/healthz` endpoint on `PORT`.
 
 If you split controller and Fleet MCP into different Railway services, attach a volume to both only when they truly need separate local SQLite state. If they must share one context store file, keep them on the same persistent service boundary or move the context layer behind a dedicated service before enabling concurrent writers.

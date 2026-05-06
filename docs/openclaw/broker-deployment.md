@@ -51,6 +51,8 @@ When Railway is canonical:
   external NATS URL.
 - Do not publish or commit literal NATS credentials.
 - Do not expose a public unauthenticated NATS listener.
+- Deploy the Railway NATS service from `infra/railway-nats/`; it fails closed
+  unless `NATS_TOKEN` is present and JetStream can use the Railway volume.
 
 If Railway is not yet canonical, point both controller and hosts at the same
 authenticated persistent fallback broker instead.
