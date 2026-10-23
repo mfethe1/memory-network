@@ -18,6 +18,7 @@ GRAPH_SERVER_URL_ENV = "OPENCLAW_HOSTD_GRAPH_SERVER_URL"
 GRAPH_SERVER_TOKEN_ENV = "OPENCLAW_HOSTD_GRAPH_SERVER_TOKEN"
 SSH_HOSTNAME_ENV = "OPENCLAW_HOSTD_SSH_HOSTNAME"
 HEARTBEAT_INTERVAL_ENV = "OPENCLAW_HOSTD_HEARTBEAT_INTERVAL_SECONDS"
+MAX_PARALLEL_RUNS_ENV = "OPENCLAW_HOSTD_MAX_PARALLEL_RUNS"
 NATS_URL_ENV = "OPENCLAW_HOSTD_NATS_URL"
 NATS_URL_FILE_ENV = "OPENCLAW_HOSTD_NATS_URL_FILE"
 HOST_ALIASES_ENV = "OPENCLAW_HOSTD_HOST_ALIASES"
@@ -26,6 +27,18 @@ CONTEXT_STORE_PATH_ENV = "OPENCLAW_HOSTD_CONTEXT_STORE_PATH"
 
 DEFAULT_GRAPH_SERVER_URL = "http://127.0.0.1:8767/health"
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30
+DEFAULT_MAX_PARALLEL_RUNS = 1
+
+
+@dataclass(frozen=True)
+class RecoveryTarget:
+    host_id: str
+    ssh_host: str
+    platform: str
+    repo_root: str
+    service_name: str | None = None
+    ssh_user: str | None = None
+    python: str | None = None
 
 
 @dataclass(frozen=True)
@@ -38,9 +51,11 @@ class HostDaemonConfig:
     graph_server_token: str | None = field(default=None, repr=False)
     ssh_hostname: str | None = None
     heartbeat_interval_seconds: int = DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+    max_parallel_runs: int = DEFAULT_MAX_PARALLEL_RUNS
     nats_url: str | None = field(default=None, repr=False)
     fleet_lease_store_path: Path | None = None
     context_store_path: Path | None = None
+    recovery_targets: tuple[RecoveryTarget, ...] = ()
     config_path: Path | None = None
 
 
@@ -80,6 +95,62 @@ def _path_tuple(value: Any, *, default: tuple[Path, ...]) -> tuple[Path, ...]:
             raise ValueError("repo_roots entries must be non-empty strings")
         paths.append(Path(item).expanduser())
     return tuple(paths)
+
+
+def _recovery_targets(value: Any) -> tuple[RecoveryTarget, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, Mapping):
+        items = []
+        for host_id, raw in value.items():
+            if not isinstance(raw, Mapping):
+                raise ValueError("recovery_targets entries must be objects")
+            item = dict(raw)
+            item.setdefault("host_id", host_id)
+            items.append(item)
+    elif isinstance(value, list):
+        items = value
+    else:
+        raise ValueError("recovery_targets must be a list or object mapping")
+    targets: list[RecoveryTarget] = []
+    seen: set[str] = set()
+    for raw in items:
+        if not isinstance(raw, Mapping):
+            raise ValueError("recovery_targets entries must be objects")
+        host_id = _required_text(raw.get("host_id"), "recovery_targets.host_id")
+        if host_id in seen:
+            raise ValueError(f"duplicate recovery target host_id: {host_id}")
+        seen.add(host_id)
+        platform = _required_text(
+            raw.get("platform"),
+            "recovery_targets.platform",
+        ).lower()
+        if platform not in {"linux", "darwin"}:
+            raise ValueError("recovery_targets.platform must be linux or darwin")
+        targets.append(
+            RecoveryTarget(
+                host_id=host_id,
+                ssh_host=_required_text(
+                    raw.get("ssh_host"),
+                    "recovery_targets.ssh_host",
+                ),
+                platform=platform,
+                repo_root=_required_text(
+                    raw.get("repo_root"),
+                    "recovery_targets.repo_root",
+                ),
+                service_name=_text_or_none(raw.get("service_name")),
+                ssh_user=_text_or_none(raw.get("ssh_user")),
+                python=_text_or_none(raw.get("python")),
+            )
+        )
+    return tuple(targets)
+
+
+def _required_text(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value.strip()
 
 
 def _positive_int(value: Any, *, default: int) -> int:
@@ -126,7 +197,7 @@ def normalize_host_aliases(
                 ) from exc
             return normalize_host_aliases(parsed, field_name=field_name)
         values: list[Any] = text.split(",")
-    elif isinstance(value, list | tuple):
+    elif isinstance(value, (list, tuple)):
         values = list(value)
     else:
         raise ValueError(f"{field_name} must be a string or list of strings")
@@ -205,6 +276,13 @@ def load_config(
         ),
         default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
     )
+    max_parallel_runs = _positive_int(
+        environ.get(
+            MAX_PARALLEL_RUNS_ENV,
+            data.get("max_parallel_runs", DEFAULT_MAX_PARALLEL_RUNS),
+        ),
+        default=DEFAULT_MAX_PARALLEL_RUNS,
+    )
     nats_url = _text_or_none(environ.get(NATS_URL_ENV))
     if nats_url is None:
         nats_url_file = _optional_path(environ.get(NATS_URL_FILE_ENV))
@@ -223,6 +301,7 @@ def load_config(
     context_store_path = _optional_path(environ.get(CONTEXT_STORE_PATH_ENV))
     if context_store_path is None:
         context_store_path = _optional_path(data.get("context_store_path"))
+    recovery_targets = _recovery_targets(data.get("recovery_targets"))
 
     return HostDaemonConfig(
         state_dir=state_dir,
@@ -233,8 +312,10 @@ def load_config(
         graph_server_token=graph_server_token,
         ssh_hostname=ssh_hostname,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
+        max_parallel_runs=max_parallel_runs,
         nats_url=nats_url,
         fleet_lease_store_path=fleet_lease_store_path,
         context_store_path=context_store_path,
+        recovery_targets=recovery_targets,
         config_path=selected_config_path,
     )

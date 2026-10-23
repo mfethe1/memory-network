@@ -376,7 +376,7 @@ def _is_secret_name(name: str) -> bool:
 
 
 def _is_attribute_value(value: Any) -> bool:
-    return value is None or isinstance(value, bool | int | float | str)
+    return value is None or isinstance(value, (bool, int, float, str))
 
 
 def _start_otel_span(span_name: str, attributes: Mapping[str, Any]) -> Any | None:

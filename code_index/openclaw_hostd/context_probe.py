@@ -196,7 +196,7 @@ def _mapping_list(value: Any) -> list[Mapping[str, Any]]:
         return []
     if isinstance(value, str):
         return list(mapping_tuple(value))
-    if not isinstance(value, list | tuple):
+    if not isinstance(value, (list, tuple)):
         return []
     return [item for item in value if isinstance(item, Mapping)]
 

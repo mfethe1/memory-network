@@ -27,9 +27,14 @@ STREAMS = {
     "OPENCLAW_RUN_EVENTS": [
         "openclaw.run.*.*.events",
         "openclaw.run.*.*.status",
+        "openclaw.run.*.*.messages",
         "openclaw.run.*.*.verification",
     ],
     "OPENCLAW_AUDIT": ["openclaw.audit.*", "openclaw.context.audit"],
+    "OPENCLAW_RECOVERY": [
+        "openclaw.recovery.*.authorized",
+        "openclaw.recovery.*.results",
+    ],
     "OPENCLAW_MESSAGES": [
         "openclaw.message.>",
         "openclaw.room.*.events",
@@ -99,6 +104,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fleet-mcp-port", type=int, default=8766)
     parser.add_argument("--heartbeat-seconds", type=int, default=30)
     parser.add_argument(
+        "--max-parallel-runs",
+        type=int,
+        default=2,
+        help="Maximum concurrent Agent Runs this host should advertise.",
+    )
+    parser.add_argument(
+        "--recovery-targets-json",
+        help=(
+            "JSON list or object mapping of peer recovery targets to write into "
+            "hostd config."
+        ),
+    )
+    parser.add_argument(
+        "--recovery-targets-file",
+        help="Path to a JSON file containing peer recovery targets.",
+    )
+    parser.add_argument(
         "--no-start",
         action="store_true",
         help="Write config and plist files without bootstrapping launchd services.",
@@ -145,6 +167,11 @@ def main(argv: list[str] | None = None) -> int:
         host_alias=args.host_alias,
         graph_port=args.graph_port,
         heartbeat_seconds=args.heartbeat_seconds,
+        max_parallel_runs=args.max_parallel_runs,
+        recovery_targets=parse_recovery_targets(
+            json_text=args.recovery_targets_json,
+            json_file=args.recovery_targets_file,
+        ),
     )
     if args.provision_broker:
         asyncio.run(
@@ -223,6 +250,8 @@ def write_hostd_config(
     host_alias: str | None = None,
     graph_port: int,
     heartbeat_seconds: int,
+    max_parallel_runs: int = 2,
+    recovery_targets: list[dict[str, Any]] | None = None,
 ) -> Path:
     config_path = install["config_dir"] / "memory-claude-openclaw-m1-hostd.json"
     nats_url_file = write_nats_url_secret(install, nats_url)
@@ -233,6 +262,7 @@ def write_hostd_config(
         "graph_server_url": f"http://127.0.0.1:{graph_port}",
         "ssh_hostname": host_display_name,
         "heartbeat_interval_seconds": heartbeat_seconds,
+        "max_parallel_runs": max(1, int(max_parallel_runs)),
         "nats_url_file": str(nats_url_file),
         "fleet_lease_store_path": str(install["hostd_state"] / "fleet-leases.db"),
         "context_store_path": str(install["context_store"]),
@@ -240,12 +270,68 @@ def write_hostd_config(
     aliases = normalize_host_aliases(host_alias)
     if aliases:
         payload["host_aliases"] = list(aliases)
+    if recovery_targets:
+        payload["recovery_targets"] = normalize_recovery_targets(recovery_targets)
     config_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     os.chmod(config_path, 0o600)
     return config_path
+
+
+def parse_recovery_targets(
+    *,
+    json_text: str | None = None,
+    json_file: str | None = None,
+) -> list[dict[str, Any]]:
+    if json_text and json_file:
+        raise ValueError("pass only one of --recovery-targets-json or --recovery-targets-file")
+    if json_file:
+        json_text = Path(json_file).expanduser().read_text(encoding="utf-8")
+    if not json_text:
+        return []
+    payload = json.loads(json_text)
+    if isinstance(payload, dict):
+        items: list[dict[str, Any]] = []
+        for host_id, value in payload.items():
+            if not isinstance(value, dict):
+                raise ValueError("recovery target mapping values must be objects")
+            item = dict(value)
+            item.setdefault("host_id", host_id)
+            items.append(item)
+        return normalize_recovery_targets(items)
+    if isinstance(payload, list):
+        return normalize_recovery_targets(payload)
+    raise ValueError("recovery targets JSON must be a list or object mapping")
+
+
+def normalize_recovery_targets(targets: list[Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in targets:
+        if not isinstance(raw, dict):
+            raise ValueError("recovery target entries must be objects")
+        item = {
+            key: str(value).strip()
+            for key, value in raw.items()
+            if value is not None and str(value).strip()
+        }
+        host_id = item.get("host_id", "")
+        if not host_id:
+            raise ValueError("recovery target host_id is required")
+        if host_id in seen:
+            raise ValueError(f"duplicate recovery target host_id: {host_id}")
+        seen.add(host_id)
+        platform = item.get("platform", "").lower()
+        if platform not in {"linux", "darwin"}:
+            raise ValueError("recovery target platform must be linux or darwin")
+        item["platform"] = platform
+        for field in ("ssh_host", "repo_root"):
+            if not item.get(field):
+                raise ValueError(f"recovery target {field} is required")
+        normalized.append(item)
+    return normalized
 
 
 def write_nats_url_secret(install: dict[str, Path], nats_url: str) -> Path:

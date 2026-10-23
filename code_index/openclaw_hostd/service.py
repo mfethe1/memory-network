@@ -30,10 +30,12 @@ from code_index.openclaw_hostd.nats_client import NatsUnavailableError
 from code_index.openclaw_hostd.nats_client import create_nats_transport
 from code_index.openclaw_hostd.nats_client import publish_agent_state_entries
 from code_index.openclaw_hostd.outbox import EventOutbox
+from code_index.openclaw_hostd.recovery import RecoveryRunner
 
 
 ActiveRunProvider = Callable[[], Iterable[AgentRunState | Mapping[str, Any]]]
 NatsTransportFactory = Callable[[str], Any]
+TerminalRunReleaseCallback = Callable[[Mapping[str, Any], Any], None]
 _STOPPED_ACTIVE_RUN_STATUSES = frozenset(
     {
         "completed",
@@ -66,6 +68,7 @@ class HostDaemonNatsRuntime:
     host_inbox: HostInbox
     lease_store: Any | None = None
     dispatcher: NatsMessageDispatcher | None = None
+    recovery_runner: RecoveryRunner | None = None
 
     def close(self) -> None:
         if self.dispatcher is not None:
@@ -250,6 +253,7 @@ def graph_server_active_run_provider(
     *,
     logger: Any | None = None,
     terminal_task_inbox: TaskInbox | None = None,
+    terminal_release_callback: TerminalRunReleaseCallback | None = None,
 ) -> ActiveRunProvider:
     def _provider() -> tuple[AgentRunState, ...]:
         if graph_client is None:
@@ -280,6 +284,7 @@ def graph_server_active_run_provider(
                 terminal_task_inbox,
                 payload,
                 logger=logger,
+                on_release=terminal_release_callback,
             )
         return tuple(_agent_run_states_from_graph_payload(payload))
 
@@ -341,6 +346,7 @@ def release_terminal_task_leases_from_graph_payload(
     payload: Mapping[str, Any],
     *,
     logger: Any | None = None,
+    on_release: TerminalRunReleaseCallback | None = None,
 ) -> list[Any]:
     released: list[Any] = []
     for run in _graph_payload_all_runs(payload):
@@ -354,13 +360,18 @@ def release_terminal_task_leases_from_graph_payload(
             or metadata.get("task_id")
             or metadata.get("openclaw_task_id")
         )
-        if not task_id:
-            continue
         try:
+            run_id = _run_text(run.get("run_id") or run.get("id"))
+            if not task_id and run_id:
+                task_lookup = getattr(task_inbox, "task_id_for_run_id", None)
+                if callable(task_lookup):
+                    task_id = _run_text(task_lookup(run_id))
+            if not task_id:
+                continue
             result = task_inbox.release_task_lease_on_terminal_status(
                 task_id,
                 terminal_status=status,
-                run_id=_run_text(run.get("run_id") or run.get("id")) or None,
+                run_id=run_id or None,
             )
         except Exception as exc:
             _logger_warning(
@@ -371,6 +382,16 @@ def release_terminal_task_leases_from_graph_payload(
             )
             continue
         if result is not None:
+            if on_release is not None:
+                try:
+                    on_release(run, result)
+                except Exception as exc:
+                    _logger_warning(
+                        logger,
+                        "OpenClaw terminal run event enqueue failed for %s: %s",
+                        task_id,
+                        exc,
+                    )
             released.append(result)
     return released
 
@@ -541,6 +562,52 @@ def _logger_error(logger: Any | None, message: str, *args: object) -> None:
         error(message, *args)
 
 
+def _enqueue_terminal_run_status_event(
+    outbox: Any,
+    *,
+    host_id: str,
+    run: Mapping[str, Any],
+    released: Any,
+) -> None:
+    run_id = _run_text(
+        run.get("run_id")
+        or run.get("id")
+        or getattr(released, "owner_run_id", None)
+    )
+    metadata = run.get("metadata") if isinstance(run.get("metadata"), Mapping) else {}
+    assert isinstance(metadata, Mapping)
+    task_id = _run_text(
+        run.get("task_id")
+        or metadata.get("task_id")
+        or metadata.get("openclaw_task_id")
+    )
+    if not task_id:
+        task_id = _run_text(getattr(released, "resource_id", None))
+    if not run_id:
+        run_id = _run_text(getattr(released, "owner_run_id", None))
+    status = _run_text(run.get("status")).lower()
+    if not task_id or not run_id or not status:
+        return
+    payload: dict[str, Any] = {
+        "kind": "openclaw.run_status",
+        "schema_version": 1,
+        "host_id": host_id,
+        "task_id": task_id,
+        "run_id": run_id,
+        "status": status,
+        "event_type": "run_status",
+    }
+    summary = _run_text(
+        run.get("message")
+        or run.get("status_message")
+        or run.get("summary")
+        or run.get("final_message")
+    )
+    if summary:
+        payload["message"] = summary
+    outbox.enqueue(f"openclaw.run.{host_id}.{run_id}.status", payload)
+
+
 def _active_graph_run(run: Mapping[str, Any]) -> bool:
     status = _run_text(run.get("status")).lower()
     if status in _STOPPED_ACTIVE_RUN_STATUSES:
@@ -616,6 +683,20 @@ def setup_nats_runtime(
             nats_client=nats_client,
         ),
     )
+    recovery_runner = RecoveryRunner(
+        config,
+        runner_host_id=identity.host_id,
+        nats_client=nats_client,
+    )
+    nats_client.subscribe(
+        f"openclaw.recovery.{identity.host_id}.authorized",
+        lambda message: _dispatch_nats_message(
+            dispatcher,
+            message,
+            recovery_runner.handle_and_publish,
+            nats_client=nats_client,
+        ),
+    )
     outbox.drain(nats_client)
     return HostDaemonNatsRuntime(
         nats_client=nats_client,
@@ -624,6 +705,7 @@ def setup_nats_runtime(
         host_inbox=host_inbox,
         lease_store=lease_store,
         dispatcher=dispatcher,
+        recovery_runner=recovery_runner,
     )
 
 
@@ -665,6 +747,14 @@ def run_daemon_loop(
             provider_graph_client,
             logger=logger,
             terminal_task_inbox=runtime.task_inbox,
+            terminal_release_callback=lambda run, released: (
+                _enqueue_terminal_run_status_event(
+                    runtime.outbox,
+                    host_id=identity.host_id,
+                    run=run,
+                    released=released,
+                )
+            ),
         )
     if active_run_provider is None:
         active_run_provider = empty_active_run_provider
@@ -730,11 +820,19 @@ def _ack_nats_delivery(message: Any, *, nats_client: Any) -> Any:
     reply = str(getattr(message, "reply", "") or "").strip()
     ack_result: Any = None
     if callable(ack):
-        ack_result = ack()
+        try:
+            ack_result = ack()
+        except Exception as exc:
+            if not _is_non_jetstream_ack_error(exc):
+                raise
     if inspect.isawaitable(ack_result):
 
         async def _ack_and_reply() -> None:
-            await ack_result
+            try:
+                await ack_result
+            except Exception as exc:
+                if not _is_non_jetstream_ack_error(exc):
+                    raise
             await asyncio.to_thread(
                 _publish_nats_reply,
                 reply,
@@ -743,6 +841,11 @@ def _ack_nats_delivery(message: Any, *, nats_client: Any) -> Any:
 
         return _ack_and_reply()
     _publish_nats_reply(reply, nats_client=nats_client)
+
+
+def _is_non_jetstream_ack_error(exc: Exception) -> bool:
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    return "notjsmessageerror" in text or "not a jetstream message" in text
 
 
 def _publish_nats_reply(reply: str, *, nats_client: Any) -> None:
@@ -795,13 +898,14 @@ def run_once(
             url,
             bearer_token=config.graph_server_token,
         )
+    active_agent_runs = tuple(active_agent_runs)
     payload = build_heartbeat_payload(
         config,
         identity,
         graph_server_probe=graph_server_probe,
         probe_graph_server=probe_graph_server,
+        active_run_count=len(active_agent_runs),
     )
-    active_agent_runs = tuple(active_agent_runs)
     if context_probe is not None:
         payload["context"] = _context_probe_payload(
             context_probe,

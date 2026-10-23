@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -17,7 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-from install_openclaw_m1_launchd import provision_nats
+from install_openclaw_m1_launchd import parse_recovery_targets, provision_nats
 
 from code_index.openclaw_hostd.config import normalize_host_aliases
 from code_index.openclaw_hostd.identity import load_or_create_host_identity
@@ -59,6 +60,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--graph-port", type=int, default=8767)
     parser.add_argument("--fleet-mcp-port", type=int, default=8766)
     parser.add_argument("--heartbeat-seconds", type=int, default=30)
+    parser.add_argument(
+        "--max-parallel-runs",
+        type=int,
+        default=2,
+        help="Maximum concurrent Agent Runs this host should advertise.",
+    )
+    parser.add_argument(
+        "--recovery-targets-json",
+        help=(
+            "JSON list or object mapping of peer recovery targets to write into "
+            "hostd config."
+        ),
+    )
+    parser.add_argument(
+        "--recovery-targets-file",
+        help="Path to a JSON file containing peer recovery targets.",
+    )
     parser.add_argument(
         "--no-start",
         action="store_true",
@@ -109,6 +127,11 @@ def main(argv: list[str] | None = None) -> int:
         host_alias=args.host_alias,
         graph_port=args.graph_port,
         heartbeat_seconds=args.heartbeat_seconds,
+        max_parallel_runs=args.max_parallel_runs,
+        recovery_targets=parse_recovery_targets(
+            json_text=args.recovery_targets_json,
+            json_file=args.recovery_targets_file,
+        ),
     )
     if args.provision_broker:
         asyncio.run(
@@ -179,6 +202,8 @@ def write_hostd_config(
     host_alias: str | None = None,
     graph_port: int,
     heartbeat_seconds: int,
+    max_parallel_runs: int = 2,
+    recovery_targets: list[dict[str, Any]] | None = None,
 ) -> Path:
     config_path = install["config_dir"] / "memory-claude-openclaw-m1-hostd.json"
     nats_url_file = write_nats_url_secret(install, nats_url)
@@ -189,6 +214,7 @@ def write_hostd_config(
         "graph_server_url": f"http://127.0.0.1:{graph_port}",
         "ssh_hostname": host_display_name,
         "heartbeat_interval_seconds": heartbeat_seconds,
+        "max_parallel_runs": max(1, int(max_parallel_runs)),
         "nats_url_file": str(nats_url_file),
         "fleet_lease_store_path": str(install["hostd_state"] / "fleet-leases.db"),
         "context_store_path": str(install["context_store"]),
@@ -196,6 +222,10 @@ def write_hostd_config(
     aliases = normalize_host_aliases(host_alias)
     if aliases:
         payload["host_aliases"] = list(aliases)
+    if recovery_targets:
+        payload["recovery_targets"] = parse_recovery_targets(
+            json_text=json.dumps(recovery_targets),
+        )
     config_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

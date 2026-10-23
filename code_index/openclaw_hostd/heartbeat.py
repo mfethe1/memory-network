@@ -72,7 +72,7 @@ def detect_capabilities(
         graph_server_checked = True
         graph_server_available = bool(probe(config.graph_server_url))
 
-    return {
+    capabilities = {
         "os": {
             "system": platform.system(),
             "release": platform.release(),
@@ -86,6 +86,15 @@ def detect_capabilities(
             "available": graph_server_available,
         },
     }
+    if config.recovery_targets:
+        capabilities["recovery_targets"] = [
+            {
+                "host_id": target.host_id,
+                "platform": target.platform,
+            }
+            for target in config.recovery_targets
+        ]
+    return capabilities
 
 
 def build_heartbeat_payload(
@@ -95,6 +104,7 @@ def build_heartbeat_payload(
     now: datetime | None = None,
     graph_server_probe: GraphServerProbe | None = None,
     probe_graph_server: bool = False,
+    active_run_count: int = 0,
 ) -> dict[str, Any]:
     generated_at = now or datetime.now(timezone.utc)
     if generated_at.tzinfo is None:
@@ -108,9 +118,28 @@ def build_heartbeat_payload(
         "host_aliases": list(config.host_aliases),
         "ssh_hostname": _ssh_hostname(config),
         "heartbeat_interval_seconds": config.heartbeat_interval_seconds,
+        "capacity": _capacity_payload(
+            active_run_count=active_run_count,
+            max_parallel_runs=config.max_parallel_runs,
+        ),
         "capabilities": detect_capabilities(
             config,
             graph_server_probe=graph_server_probe,
             probe_graph_server=probe_graph_server,
         ),
+    }
+
+
+def _capacity_payload(
+    *,
+    active_run_count: int,
+    max_parallel_runs: int,
+) -> dict[str, int]:
+    active_runs = max(0, int(active_run_count))
+    max_runs = max(1, int(max_parallel_runs))
+    return {
+        "schema_version": 1,
+        "active_run_count": active_runs,
+        "max_parallel_runs": max_runs,
+        "available_run_slots": max(0, max_runs - active_runs),
     }
